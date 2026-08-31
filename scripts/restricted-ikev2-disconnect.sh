@@ -5,8 +5,10 @@ CONN_NAME=milmit-surfshark-restricted
 STATE_FILE=/run/milmit-surfshark/restricted.state
 NM_MARKER="Surfshark IKEv2 (Connected)"
 XFRM_IF=milmitxfrm0
+XFRM_IF_ID=42
 ROUTE_TABLE=220
 HOTSPOT_RULE_PREF=179
+HOTSPOT_XFRM_PRIORITY=383614
 
 if [[ $EUID -ne 0 ]]; then echo "This helper must run as root." >&2; exit 77; fi
 
@@ -46,6 +48,13 @@ HOTSPOT_IFACE="$(state_get HOTSPOT_IFACE)"
 HOTSPOT_SUBNET="$(state_get HOTSPOT_SUBNET)"
 HOTSPOT_DNS="$(state_get HOTSPOT_DNS)"
 RECOVER_NETWORK="$(state_get RECOVER_NETWORK)"
+SERVER_IP="$(state_get SERVER_IP)"
+
+# Remove our auxiliary hotspot policy before strongSwan removes the negotiated
+# policy/state, otherwise a stale policy can survive a failed or interrupted run.
+if [[ -n "$HOTSPOT_SUBNET" ]]; then
+  ip xfrm policy delete src "$HOTSPOT_SUBNET" dst 0.0.0.0/0 dir out priority "$HOTSPOT_XFRM_PRIORITY" if_id "$XFRM_IF_ID" >/dev/null 2>&1 || true
+fi
 
 swanctl --terminate --ike "$CONN_NAME" >/dev/null 2>&1 || true
 swanctl --terminate --ike surfshark-tr >/dev/null 2>&1 || true
@@ -73,7 +82,7 @@ if [[ -n "$HOTSPOT_SUBNET" ]]; then
 fi
 
 ip route del default dev "$XFRM_IF" table "$ROUTE_TABLE" >/dev/null 2>&1 || true
-ip route del throw "$(state_get SERVER_IP)" table "$ROUTE_TABLE" >/dev/null 2>&1 || true
+[[ -z "$SERVER_IP" ]] || ip route del throw "$SERVER_IP" table "$ROUTE_TABLE" >/dev/null 2>&1 || true
 ip link del "$XFRM_IF" >/dev/null 2>&1 || true
 
 if [[ -n "$VIRTUAL_IP" ]]; then
@@ -109,4 +118,4 @@ if command -v nmcli >/dev/null 2>&1; then
 fi
 
 rm -f "$STATE_FILE"
-echo "Restricted Surfshark IKEv2 disconnected. XFRM interface, stale hotspot NAT/conntrack state, VPN routes, DNS and physical-link state were restored."
+echo "Restricted Surfshark IKEv2 disconnected. XFRM interface/policies, stale hotspot NAT/conntrack state, VPN routes, DNS and physical-link state were restored."
