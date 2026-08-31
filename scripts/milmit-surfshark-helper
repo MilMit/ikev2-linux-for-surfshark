@@ -14,9 +14,19 @@ case "$cmd" in
   connect)
     endpoint="${2:-}"
     username="${3:-}"
+    mss="${4:-1200}"
+    dns_csv="${5:-162.252.172.57,149.154.159.92}"
+    hotspot_vpn="${6:-1}"
+    recover_network="${7:-1}"
+
     [[ "$endpoint" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || { echo "invalid IPv4 endpoint" >&2; exit 64; }
     [[ -n "$username" && ${#username} -le 128 && "$username" != *$'\n'* ]] || { echo "invalid service username" >&2; exit 64; }
-    exec "$CONNECT" "$endpoint" "$username"
+    [[ "$mss" =~ ^[0-9]+$ && "$mss" -ge 900 && "$mss" -le 1400 ]] || { echo "invalid MSS (900-1400)" >&2; exit 64; }
+    [[ "$dns_csv" =~ ^[0-9.,]+$ ]] || { echo "invalid DNS list" >&2; exit 64; }
+    [[ "$hotspot_vpn" == 0 || "$hotspot_vpn" == 1 ]] || { echo "invalid hotspot mode" >&2; exit 64; }
+    [[ "$recover_network" == 0 || "$recover_network" == 1 ]] || { echo "invalid recovery mode" >&2; exit 64; }
+
+    exec "$CONNECT" "$endpoint" "$username" "$mss" "$dns_csv" "$hotspot_vpn" "$recover_network"
     ;;
   disconnect)
     exec "$DISCONNECT"
@@ -25,7 +35,7 @@ case "$cmd" in
     exec /usr/sbin/swanctl --list-sas
     ;;
   *)
-    echo "usage: $0 {connect <ipv4> <service-user>|disconnect|status}" >&2
+    echo "usage: $0 {connect <ipv4> <service-user> [mss] [dns-csv] [hotspot-vpn 0|1] [recover 0|1]|disconnect|status}" >&2
     exit 64
     ;;
 esac
