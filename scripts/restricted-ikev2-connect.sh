@@ -3,8 +3,9 @@ set -euo pipefail
 
 # Direct strongSwan backend modeled on Surfshark Android's IKEv2 handshake.
 # Usage (root): restricted-ikev2-connect.sh <server-ip> <service-user> [password-file]
-# The GUI passes a short-lived 0600 file path instead of putting the password
-# in argv. If omitted/empty, the root-only saved credential is reused.
+# Preferred GUI handoff is a short-lived 0600 password file. For compatibility
+# with older GUI builds, stdin is also accepted when no password-file is passed.
+# If neither provides a password, the root-only saved credential is reused.
 
 SERVER_IP="${1:-}"
 SERVICE_USER="${2:-}"
@@ -39,6 +40,13 @@ if [[ -n "$PASSWORD_FILE" ]]; then
   fi
   SERVICE_PASS="$(cat -- "$PASSWORD_FILE")"
   rm -f -- "$PASSWORD_FILE" || true
+else
+  # Compatibility path for GUI builds that pipe the password to pkexec/bash.
+  # Only attempt a read when stdin is not a terminal so command-line use does
+  # not unexpectedly block waiting for input.
+  if [[ ! -t 0 ]]; then
+    IFS= read -r SERVICE_PASS || true
+  fi
 fi
 
 install -d -m 0700 "$CRED_DIR"
