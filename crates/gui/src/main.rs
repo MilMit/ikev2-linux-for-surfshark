@@ -11,7 +11,9 @@ fn run(cmd: &str, args: &[&str]) -> String {
                 text.push_str(&String::from_utf8_lossy(&out.stdout));
             }
             if !out.stderr.is_empty() {
-                if !text.is_empty() { text.push('\n'); }
+                if !text.is_empty() {
+                    text.push('\n');
+                }
                 text.push_str(&String::from_utf8_lossy(&out.stderr));
             }
             if text.trim().is_empty() {
@@ -96,16 +98,18 @@ fn build_ui(app: &adw::Application) {
     content.append(&actions);
     content.append(&scroller);
 
-    let toolbar = adw::ToolbarView::new();
-    toolbar.add_top_bar(&header);
-    toolbar.set_content(Some(&content));
+    // libadwaita 0.8 does not expose ToolbarView. Keep the UI compatible
+    // with Ubuntu's packaged libadwaita by using a simple vertical root.
+    let root = gtk::Box::new(Orientation::Vertical, 0);
+    root.append(&header);
+    root.append(&content);
 
     let window = adw::ApplicationWindow::builder()
         .application(app)
         .title("Surfshark IKEv2 for Linux")
         .default_width(820)
         .default_height(620)
-        .content(&toolbar)
+        .content(&root)
         .build();
 
     let status = Rc::new(status);
@@ -116,8 +120,15 @@ fn build_ui(app: &adw::Application) {
         let status = Rc::clone(&status);
         connect.connect_clicked(move |_| {
             status.set_label("Connecting…");
-            append_log(&buffer, "CONNECT", "Running: pkexec swanctl --initiate --child surfshark");
-            let out = run("pkexec", &["/usr/sbin/swanctl", "--initiate", "--child", "surfshark"]);
+            append_log(
+                &buffer,
+                "CONNECT",
+                "Running: pkexec swanctl --initiate --child surfshark",
+            );
+            let out = run(
+                "pkexec",
+                &["/usr/sbin/swanctl", "--initiate", "--child", "surfshark"],
+            );
             append_log(&buffer, "CONNECT RESULT", &out);
             let sas = run("pkexec", &["/usr/sbin/swanctl", "--list-sas"]);
             if sas.contains("ESTABLISHED") && sas.contains("INSTALLED") {
@@ -133,7 +144,10 @@ fn build_ui(app: &adw::Application) {
         let buffer = Rc::clone(&buffer);
         let status = Rc::clone(&status);
         disconnect.connect_clicked(move |_| {
-            let out = run("pkexec", &["/usr/sbin/swanctl", "--terminate", "--ike", "surfshark-tr"]);
+            let out = run(
+                "pkexec",
+                &["/usr/sbin/swanctl", "--terminate", "--ike", "surfshark-tr"],
+            );
             append_log(&buffer, "DISCONNECT", &out);
             status.set_label("Disconnected");
         });
@@ -156,7 +170,10 @@ fn build_ui(app: &adw::Application) {
     {
         let buffer = Rc::clone(&buffer);
         logs.connect_clicked(move |_| {
-            let out = run("journalctl", &["-u", "strongswan", "-n", "120", "--no-pager", "-o", "cat"]);
+            let out = run(
+                "journalctl",
+                &["-u", "strongswan", "-n", "120", "--no-pager", "-o", "cat"],
+            );
             append_log(&buffer, "STRONGSWAN JOURNAL", &out);
         });
     }
