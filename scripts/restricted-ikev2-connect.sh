@@ -73,68 +73,58 @@ detect_hotspot() {
 }
 
 flush_hotspot_conntrack() {
-  local hs_subnet="${1:-}"
-  [[ -n "$hs_subnet" ]] || return 0
-  if command -v conntrack >/dev/null 2>&1; then
-    conntrack -D -s "$hs_subnet" >/dev/null 2>&1 || true
-    conntrack -D -d "$hs_subnet" >/dev/null 2>&1 || true
-  fi
+  local subnet="${1:-}"
+  [[ -n "$subnet" ]] || return 0
+  command -v conntrack >/dev/null 2>&1 || return 0
+  conntrack -D -s "$subnet" >/dev/null 2>&1 || true
+  conntrack -D -d "$subnet" >/dev/null 2>&1 || true
 }
 
-remove_hotspot_xfrm_policy() {
-  local hs_subnet="${1:-}"
-  [[ -n "$hs_subnet" ]] || return 0
-  ip xfrm policy delete src "$hs_subnet" dst 0.0.0.0/0 dir out priority "$HOTSPOT_XFRM_PRIORITY" if_id "$XFRM_IF_ID" >/dev/null 2>&1 || true
+remove_hotspot_policy() {
+  local subnet="${1:-}"
+  [[ -n "$subnet" ]] || return 0
+  ip xfrm policy delete src "$subnet" dst 0.0.0.0/0 dir out priority "$HOTSPOT_XFRM_PRIORITY" if_id "$XFRM_IF_ID" >/dev/null 2>&1 || true
 }
 
-purge_legacy_hotspot_rules() {
-  local hs_iface="${1:-}" hs_subnet="${2:-}"
-  [[ -n "$hs_subnet" ]] || return 0
+purge_hotspot_rules() {
+  local vip="${1:-}" iface="${2:-}" subnet="${3:-}" old_mss="${4:-1200}" dns="${5:-}"
+  [[ -n "$subnet" ]] || return 0
+  remove_hotspot_policy "$subnet"
+  while ip rule del pref "$HOTSPOT_RULE_PREF" from "$subnet" lookup "$ROUTE_TABLE" >/dev/null 2>&1; do :; done
+
   while IFS= read -r rule; do
-    [[ "$rule" == *"-s $hs_subnet"* && "$rule" == *"-j SNAT --to-source 10.6."* ]] || continue
+    [[ "$rule" == *"-s $subnet"* && "$rule" == *"-j SNAT --to-source 10.6."* ]] || continue
     # shellcheck disable=SC2086
     iptables -t nat -D POSTROUTING ${rule#-A POSTROUTING } >/dev/null 2>&1 || true
   done < <(iptables -t nat -S POSTROUTING 2>/dev/null || true)
-  if [[ -n "$hs_iface" ]]; then
-    while iptables -D FORWARD -i "$hs_iface" -s "$hs_subnet" -j ACCEPT 2>/dev/null; do :; done
-    while iptables -D FORWARD -o "$hs_iface" -d "$hs_subnet" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null; do :; done
-  fi
-}
 
-remove_hotspot_rules() {
-  local vip="${1:-}" hs_iface="${2:-}" hs_subnet="${3:-}" old_mss="${4:-1200}" hs_dns="${5:-}"
-  [[ -n "$hs_subnet" ]] || return 0
-  remove_hotspot_xfrm_policy "$hs_subnet"
-  while ip rule del pref "$HOTSPOT_RULE_PREF" from "$hs_subnet" lookup "$ROUTE_TABLE" >/dev/null 2>&1; do :; done
-  [[ -z "$vip" ]] || while iptables -t nat -D POSTROUTING -s "$hs_subnet" ! -d "$hs_subnet" -o "$XFRM_IF" -j SNAT --to-source "$vip" 2>/dev/null; do :; done
-  if [[ -n "$hs_iface" ]]; then
-    while iptables -t mangle -D FORWARD -i "$hs_iface" -s "$hs_subnet" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$old_mss" 2>/dev/null; do :; done
-    while iptables -D FORWARD -i "$hs_iface" -o "$XFRM_IF" -s "$hs_subnet" -j ACCEPT 2>/dev/null; do :; done
-    while iptables -D FORWARD -i "$XFRM_IF" -o "$hs_iface" -d "$hs_subnet" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null; do :; done
-    if [[ -n "$hs_dns" ]]; then
-      while iptables -t nat -D PREROUTING -i "$hs_iface" -s "$hs_subnet" -p udp --dport 53 -j DNAT --to-destination "$hs_dns" 2>/dev/null; do :; done
-      while iptables -t nat -D PREROUTING -i "$hs_iface" -s "$hs_subnet" -p tcp --dport 53 -j DNAT --to-destination "$hs_dns" 2>/dev/null; do :; done
+  if [[ -n "$iface" ]]; then
+    while iptables -t mangle -D FORWARD -i "$iface" -s "$subnet" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$old_mss" 2>/dev/null; do :; done
+    while iptables -D FORWARD -i "$iface" -o "$XFRM_IF" -s "$subnet" -j ACCEPT 2>/dev/null; do :; done
+    while iptables -D FORWARD -i "$XFRM_IF" -o "$iface" -d "$subnet" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null; do :; done
+    while iptables -D FORWARD -i "$iface" -s "$subnet" -j ACCEPT 2>/dev/null; do :; done
+    while iptables -D FORWARD -o "$iface" -d "$subnet" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null; do :; done
+    if [[ -n "$dns" ]]; then
+      while iptables -t nat -D PREROUTING -i "$iface" -s "$subnet" -p udp --dport 53 -j DNAT --to-destination "$dns" 2>/dev/null; do :; done
+      while iptables -t nat -D PREROUTING -i "$iface" -s "$subnet" -p tcp --dport 53 -j DNAT --to-destination "$dns" 2>/dev/null; do :; done
     fi
   fi
-  purge_legacy_hotspot_rules "$hs_iface" "$hs_subnet"
-  flush_hotspot_conntrack "$hs_subnet"
+  flush_hotspot_conntrack "$subnet"
 }
 
-remove_route_state() {
-  local vip="${1:-}"
-  ip route del throw "$SERVER_IP" table "$ROUTE_TABLE" >/dev/null 2>&1 || true
+cleanup_old() {
+  local vip iface old_mss hs_iface hs_subnet hs_dns server
+  vip="$(state_get VIRTUAL_IP)"; iface="$(state_get IFACE)"; old_mss="$(state_get MSS_VALUE)"
+  hs_iface="$(state_get HOTSPOT_IFACE)"; hs_subnet="$(state_get HOTSPOT_SUBNET)"; hs_dns="$(state_get HOTSPOT_DNS)"; server="$(state_get SERVER_IP)"
+  [[ -z "$vip" ]] || iptables -t mangle -D OUTPUT -s "$vip/32" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "${old_mss:-1200}" 2>/dev/null || true
+  purge_hotspot_rules "$vip" "$hs_iface" "$hs_subnet" "${old_mss:-1200}" "$hs_dns"
+  [[ -z "$server" ]] || ip route del throw "$server" table "$ROUTE_TABLE" >/dev/null 2>&1 || true
   ip route del default dev "$XFRM_IF" table "$ROUTE_TABLE" >/dev/null 2>&1 || true
-  if [[ -n "$vip" ]]; then
-    while IFS= read -r route; do
-      [[ "$route" == *"src $vip"* ]] || continue
-      # shellcheck disable=SC2086
-      ip route del table "$ROUTE_TABLE" $route >/dev/null 2>&1 || true
-    done < <(ip route show table "$ROUTE_TABLE" 2>/dev/null || true)
-  fi
-  ip route flush cache >/dev/null 2>&1 || true
+  ip link del "$XFRM_IF" >/dev/null 2>&1 || true
+  if [[ -n "$iface" ]] && command -v resolvectl >/dev/null 2>&1; then resolvectl revert "$iface" >/dev/null 2>&1 || true; fi
+  [[ -z "$vip" || -z "$iface" ]] || ip addr del "$vip/32" dev "$iface" >/dev/null 2>&1 || true
+  rm -f "$STATE_FILE"
 }
-
-remove_xfrm_interface() { ip link del "$XFRM_IF" >/dev/null 2>&1 || true; }
 
 recover_interface() {
   local iface="${1:-}" enabled="${2:-0}"
@@ -147,19 +137,6 @@ recover_interface() {
     sleep 1
     nmcli device connect "$iface" >/dev/null 2>&1 || true
   fi
-}
-
-cleanup_old() {
-  local vip iface old_mss hs_iface hs_subnet hs_dns
-  vip="$(state_get VIRTUAL_IP)"; iface="$(state_get IFACE)"; old_mss="$(state_get MSS_VALUE)"
-  hs_iface="$(state_get HOTSPOT_IFACE)"; hs_subnet="$(state_get HOTSPOT_SUBNET)"; hs_dns="$(state_get HOTSPOT_DNS)"
-  [[ -z "$vip" ]] || iptables -t mangle -D OUTPUT -s "$vip/32" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "${old_mss:-1200}" 2>/dev/null || true
-  remove_hotspot_rules "$vip" "$hs_iface" "$hs_subnet" "${old_mss:-1200}" "$hs_dns"
-  remove_route_state "$vip"
-  remove_xfrm_interface
-  if [[ -n "$iface" ]] && command -v resolvectl >/dev/null 2>&1; then resolvectl revert "$iface" >/dev/null 2>&1 || true; fi
-  [[ -z "$vip" || -z "$iface" ]] || ip addr del "$vip/32" dev "$iface" >/dev/null 2>&1 || true
-  rm -f "$STATE_FILE"
 }
 
 SERVICE_PASS=""
@@ -198,8 +175,7 @@ detect_hotspot
 ROUTE_BASED=0
 if [[ "$HOTSPOT_VPN" == 1 && -n "$HOTSPOT_IFACE" && -n "$HOTSPOT_SUBNET" ]]; then
   ROUTE_BASED=1
-  purge_legacy_hotspot_rules "$HOTSPOT_IFACE" "$HOTSPOT_SUBNET"
-  flush_hotspot_conntrack "$HOTSPOT_SUBNET"
+  purge_hotspot_rules "" "$HOTSPOT_IFACE" "$HOTSPOT_SUBNET" "$MSS" "$HOTSPOT_DNS"
   if ! ip link add "$XFRM_IF" type xfrm if_id "$XFRM_IF_ID" 2>/dev/null; then
     echo "Kernel/iproute2 could not create XFRM interface $XFRM_IF." >&2
     exit 70
@@ -263,13 +239,13 @@ swanctl --load-conns
 swanctl --load-creds
 if ! swanctl --initiate --child "$CHILD_NAME"; then
   swanctl --terminate --ike "$CONN_NAME" >/dev/null 2>&1 || true
-  remove_xfrm_interface
+  ip link del "$XFRM_IF" >/dev/null 2>&1 || true
   exit 69
 fi
 
 SA_TEXT="$(swanctl --list-sas 2>&1 || true)"
 VIRTUAL_IP="$(printf '%s\n' "$SA_TEXT" | sed -nE 's/.*local .*\[([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)\].*/\1/p' | head -n1)"
-[[ -n "$VIRTUAL_IP" ]] || { swanctl --terminate --ike "$CONN_NAME" >/dev/null 2>&1 || true; remove_xfrm_interface; echo "$SA_TEXT"; echo "No virtual IPv4 was found." >&2; exit 67; }
+[[ -n "$VIRTUAL_IP" ]] || { swanctl --terminate --ike "$CONN_NAME" >/dev/null 2>&1 || true; ip link del "$XFRM_IF" >/dev/null 2>&1 || true; echo "$SA_TEXT"; echo "No virtual IPv4 was found." >&2; exit 67; }
 IFACE="$(ip -4 route get "$SERVER_IP" 2>/dev/null | sed -nE 's/.* dev ([^ ]+).*/\1/p' | head -n1)"
 
 iptables -t mangle -D OUTPUT -s "$VIRTUAL_IP/32" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$MSS" 2>/dev/null || true
@@ -282,6 +258,7 @@ if command -v resolvectl >/dev/null 2>&1 && [[ -n "$IFACE" ]]; then
 fi
 
 HOTSPOT_XFRM_POLICY=0
+HOTSPOT_XFRM_SPI=""
 if [[ "$ROUTE_BASED" == 1 ]]; then
   sysctl -w net.ipv4.ip_forward=1 >/dev/null
   ip route replace throw "$SERVER_IP" table "$ROUTE_TABLE"
@@ -289,35 +266,28 @@ if [[ "$ROUTE_BASED" == 1 ]]; then
   while ip rule del pref "$HOTSPOT_RULE_PREF" from "$HOTSPOT_SUBNET" lookup "$ROUTE_TABLE" >/dev/null 2>&1; do :; done
   ip rule add pref "$HOTSPOT_RULE_PREF" from "$HOTSPOT_SUBNET" lookup "$ROUTE_TABLE"
 
-  # XFRM interfaces perform a policy check before the packet reaches the
-  # POSTROUTING SNAT hook. Surfshark narrows the negotiated local selector to
-  # the assigned VIP (/32), so forwarded 10.42.x.x packets otherwise die at
-  # the interface with zero FORWARD/NAT counters. Install a local-only helper
-  # policy that admits the hotspot subnet to the existing SA. POSTROUTING then
-  # statefully translates it to the Surfshark VIP before encryption, so the
-  # peer still sees only the negotiated VIP.
-  read -r OUTER_SRC OUTER_DST OUT_REQID <<< "$(ip xfrm state | awk '
-    /^src / {s=$2; d=$4; r=""}
-    /^[[:space:]]+proto esp/ {for (i=1;i<=NF;i++) if ($i=="reqid") r=$(i+1)}
-    /^[[:space:]]+dir out/ {print s, d, r; exit}
+  # Bind the helper selector to the exact outbound CHILD_SA. A wildcard SPI
+  # leaves the manually-added policy without a concrete state on some kernels,
+  # which shows up as TX errors/drops on the XFRM interface even though the
+  # normal VIP traffic is healthy.
+  read -r OUTER_SRC OUTER_DST OUT_SPI OUT_REQID <<< "$(ip xfrm state | awk '
+    /^src / {s=$2; d=$4; spi=""; req=""}
+    /^[[:space:]]+proto esp/ {
+      for (i=1;i<=NF;i++) {
+        if ($i=="spi") spi=$(i+1)
+        if ($i=="reqid") req=$(i+1)
+      }
+    }
+    /^[[:space:]]+dir out/ {print s, d, spi, req; exit}
   ')"
-  if [[ -n "${OUTER_SRC:-}" && -n "${OUTER_DST:-}" && -n "${OUT_REQID:-}" ]]; then
-    remove_hotspot_xfrm_policy "$HOTSPOT_SUBNET"
-    if ip xfrm policy add src "$HOTSPOT_SUBNET" dst 0.0.0.0/0 dir out priority "$HOTSPOT_XFRM_PRIORITY" if_id "$XFRM_IF_ID" \
-      tmpl src "$OUTER_SRC" dst "$OUTER_DST" proto esp reqid "$OUT_REQID" mode tunnel; then
-      HOTSPOT_XFRM_POLICY=1
-    fi
-  fi
 
-  remove_hotspot_rules "$VIRTUAL_IP" "$HOTSPOT_IFACE" "$HOTSPOT_SUBNET" "$MSS" "$HOTSPOT_DNS"
-  # remove_hotspot_rules also removes the helper policy, so re-add it after the
-  # stale firewall cleanup using the just-discovered SA parameters.
-  if [[ -n "${OUTER_SRC:-}" && -n "${OUTER_DST:-}" && -n "${OUT_REQID:-}" ]]; then
+  purge_hotspot_rules "$VIRTUAL_IP" "$HOTSPOT_IFACE" "$HOTSPOT_SUBNET" "$MSS" "$HOTSPOT_DNS"
+
+  if [[ -n "${OUTER_SRC:-}" && -n "${OUTER_DST:-}" && -n "${OUT_SPI:-}" && -n "${OUT_REQID:-}" ]]; then
     if ip xfrm policy add src "$HOTSPOT_SUBNET" dst 0.0.0.0/0 dir out priority "$HOTSPOT_XFRM_PRIORITY" if_id "$XFRM_IF_ID" \
-      tmpl src "$OUTER_SRC" dst "$OUTER_DST" proto esp reqid "$OUT_REQID" mode tunnel 2>/dev/null; then
+      tmpl src "$OUTER_SRC" dst "$OUTER_DST" proto esp spi "$OUT_SPI" reqid "$OUT_REQID" mode tunnel; then
       HOTSPOT_XFRM_POLICY=1
-    else
-      HOTSPOT_XFRM_POLICY=0
+      HOTSPOT_XFRM_SPI="$OUT_SPI"
     fi
   fi
 
@@ -336,9 +306,10 @@ PUBLIC_IP="$(printf '%s\n' "$TRACE" | sed -n 's/^ip=//p' | head -n1)"
 EXIT_COUNTRY="$(printf '%s\n' "$TRACE" | sed -n 's/^loc=//p' | head -n1)"
 if [[ -z "$PUBLIC_IP" ]]; then
   swanctl --terminate --ike "$CONN_NAME" >/dev/null 2>&1 || true
-  remove_hotspot_rules "$VIRTUAL_IP" "$HOTSPOT_IFACE" "$HOTSPOT_SUBNET" "$MSS" "$HOTSPOT_DNS"
-  remove_route_state "$VIRTUAL_IP"
-  remove_xfrm_interface
+  purge_hotspot_rules "$VIRTUAL_IP" "$HOTSPOT_IFACE" "$HOTSPOT_SUBNET" "$MSS" "$HOTSPOT_DNS"
+  ip route del throw "$SERVER_IP" table "$ROUTE_TABLE" >/dev/null 2>&1 || true
+  ip route del default dev "$XFRM_IF" table "$ROUTE_TABLE" >/dev/null 2>&1 || true
+  ip link del "$XFRM_IF" >/dev/null 2>&1 || true
   [[ "$RECOVER_NETWORK" == 1 ]] && recover_interface "$IFACE" 1
   printf '\nData-path test: FAILED\n'
   exit 68
@@ -371,6 +342,7 @@ HOTSPOT_DNS=$HOTSPOT_DNS
 HOTSPOT_RULE_PREF=$HOTSPOT_RULE_PREF
 HOTSPOT_XFRM_POLICY=$HOTSPOT_XFRM_POLICY
 HOTSPOT_XFRM_PRIORITY=$HOTSPOT_XFRM_PRIORITY
+HOTSPOT_XFRM_SPI=$HOTSPOT_XFRM_SPI
 ROUTE_BASED=$ROUTE_BASED
 XFRM_IF=$([[ "$ROUTE_BASED" == 1 ]] && echo "$XFRM_IF" || true)
 XFRM_IF_ID=$([[ "$ROUTE_BASED" == 1 ]] && echo "$XFRM_IF_ID" || true)
@@ -384,7 +356,7 @@ printf 'Ubuntu marker: %s\n' "$([[ "$NM_MARKER_ACTIVE" == 1 ]] && echo active ||
 if [[ "$ROUTE_BASED" == 1 ]]; then
   printf 'Hotspot VPN   : ON · route-based XFRM · %s · %s\n' "$HOTSPOT_IFACE" "$HOTSPOT_SUBNET"
   printf 'XFRM interface: %s · if_id %s · MTU 1280\n' "$XFRM_IF" "$XFRM_IF_ID"
-  printf 'Hotspot policy: %s\n' "$([[ "$HOTSPOT_XFRM_POLICY" == 1 ]] && echo armed || echo unavailable)"
+  printf 'Hotspot policy: %s%s\n' "$([[ "$HOTSPOT_XFRM_POLICY" == 1 ]] && echo armed || echo unavailable)" "$([[ -n "$HOTSPOT_XFRM_SPI" ]] && printf ' · SPI %s' "$HOTSPOT_XFRM_SPI" || true)"
 elif [[ "$HOTSPOT_VPN" == 1 ]]; then
   printf 'Hotspot VPN   : enabled · no hotspot interface detected\n'
 else
