@@ -73,8 +73,12 @@ secrets {
 EOF
 chmod 0600 "$CONF"
 
-# Remove only our previous restricted SA before loading the new endpoint.
+# Remove both our previous restricted SA and the old hostname-based test SA.
+# Leaving surfshark-tr in CONNECTING state creates noise and can interfere with
+# route/MOBIKE diagnostics on poisoned DNS networks.
 swanctl --terminate --ike "$CONN_NAME" >/dev/null 2>&1 || true
+swanctl --terminate --ike surfshark-tr >/dev/null 2>&1 || true
+
 swanctl --load-conns
 swanctl --load-creds
 
