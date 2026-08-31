@@ -19,12 +19,34 @@ const CA_CERT: &str = "/etc/swanctl/x509ca/surfshark_ikev2.crt";
 const RESTRICTED_CONNECT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../scripts/restricted-ikev2-connect.sh");
 const RESTRICTED_DISCONNECT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../scripts/restricted-ikev2-disconnect.sh");
 const RESTRICTED_STATE: &str = "/run/milmit-surfshark/restricted.state";
+const DEFAULT_DNS: &str = "162.252.172.57,149.154.159.92";
+
+#[derive(Clone)]
+struct AppSettings {
+    restricted: bool,
+    mss: u32,
+    dns: String,
+    hotspot_vpn: bool,
+    recover_network: bool,
+}
+
+impl Default for AppSettings {
+    fn default() -> Self {
+        Self {
+            restricted: true,
+            mss: 1200,
+            dns: DEFAULT_DNS.to_string(),
+            hotspot_vpn: true,
+            recover_network: true,
+        }
+    }
+}
 
 #[derive(Debug)]
 enum Event {
     Busy(String),
     Log(String, String),
-    Connected(String, String),
+    Connected(String, String, String),
     Disconnected,
     Failed(String),
     Refreshed(bool, String),
@@ -36,9 +58,7 @@ fn run(cmd: &str, args: &[&str]) -> String {
     match Command::new(cmd).args(args).output() {
         Ok(out) => {
             let mut text = String::new();
-            if !out.stdout.is_empty() {
-                text.push_str(&String::from_utf8_lossy(&out.stdout));
-            }
+            if !out.stdout.is_empty() { text.push_str(&String::from_utf8_lossy(&out.stdout)); }
             if !out.stderr.is_empty() {
                 if !text.is_empty() { text.push('\n'); }
                 text.push_str(&String::from_utf8_lossy(&out.stderr));
@@ -61,22 +81,31 @@ fn profile_exists() -> bool {
         .lines().any(|line| line == PROFILE)
 }
 
+fn state_value(key: &str) -> Option<String> {
+    let state = fs::read_to_string(RESTRICTED_STATE).ok()?;
+    state.lines().find_map(|line| {
+        let (k, v) = line.split_once('=')?;
+        (k == key).then(|| v.trim().to_string())
+    }).filter(|v| !v.is_empty())
+}
+
 fn restricted_active() -> bool {
-    let Ok(state) = fs::read_to_string(RESTRICTED_STATE) else { return false; };
-    let vip = state.lines().find_map(|line| line.strip_prefix("VIRTUAL_IP="));
-    let Some(vip) = vip else { return false; };
-    run("ip", &["-4", "addr", "show"]).contains(vip)
+    let Some(vip) = state_value("VIRTUAL_IP") else { return false; };
+    run("ip", &["-4", "addr", "show"]).contains(&vip)
 }
 
 fn any_vpn_active() -> bool { restricted_active() || nm_active() }
 
-fn username_path() -> PathBuf {
-    let base = std::env::var("XDG_CONFIG_HOME")
+fn config_dir() -> PathBuf {
+    std::env::var("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .or_else(|_| std::env::var("HOME").map(|h| PathBuf::from(h).join(".config")))
-        .unwrap_or_else(|_| PathBuf::from("."));
-    base.join("milmit-surfshark").join("username")
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join("milmit-surfshark")
 }
+
+fn username_path() -> PathBuf { config_dir().join("username") }
+fn settings_path() -> PathBuf { config_dir().join("settings.conf") }
 
 fn saved_username() -> Option<String> {
     fs::read_to_string(username_path()).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
@@ -88,9 +117,38 @@ fn save_username(value: &str) {
     let _ = fs::write(path, value);
 }
 
-fn public_ip() -> String {
-    run("curl", &["-4", "--max-time", "8", "-sS", "https://api.ipify.org"])
+fn load_settings() -> AppSettings {
+    let mut settings = AppSettings::default();
+    let Ok(text) = fs::read_to_string(settings_path()) else { return settings; };
+    for line in text.lines() {
+        let Some((key, value)) = line.split_once('=') else { continue; };
+        match key {
+            "restricted" => settings.restricted = value == "1",
+            "mss" => if let Ok(v) = value.parse::<u32>() { if (900..=1400).contains(&v) { settings.mss = v; } },
+            "dns" => if !value.trim().is_empty() { settings.dns = value.trim().to_string(); },
+            "hotspot_vpn" => settings.hotspot_vpn = value == "1",
+            "recover_network" => settings.recover_network = value == "1",
+            _ => {}
+        }
+    }
+    settings
 }
+
+fn save_settings(settings: &AppSettings) {
+    let path = settings_path();
+    if let Some(parent) = path.parent() { let _ = fs::create_dir_all(parent); }
+    let text = format!(
+        "restricted={}\nmss={}\ndns={}\nhotspot_vpn={}\nrecover_network={}\n",
+        settings.restricted as u8,
+        settings.mss,
+        settings.dns,
+        settings.hotspot_vpn as u8,
+        settings.recover_network as u8,
+    );
+    let _ = fs::write(path, text);
+}
+
+fn public_ip() -> String { run("curl", &["-4", "--max-time", "8", "-sS", "https://api.ipify.org"]) }
 
 fn configure_nm_profile(address: &str, identity: &str, username: &str, password: Option<&str>) -> String {
     let mut log = String::new();
@@ -101,9 +159,7 @@ fn configure_nm_profile(address: &str, identity: &str, username: &str, password:
     let data = format!("address = {address}, server-identity = {identity}, certificate = {CA_CERT}, encap = yes, ipcomp = no, method = eap, proposal = no, user = {username}, virtual = yes");
     let mut cmd = Command::new("nmcli");
     cmd.args(["connection", "modify", PROFILE, "vpn.data", &data, "ipv4.never-default", "no", "ipv6.method", "disabled"]);
-    if let Some(password) = password {
-        cmd.args(["vpn.secrets", &format!("password={password}")]);
-    }
+    if let Some(password) = password { cmd.args(["vpn.secrets", &format!("password={password}")]); }
     match cmd.output() {
         Ok(out) => {
             log.push_str(&String::from_utf8_lossy(&out.stdout));
@@ -117,29 +173,33 @@ fn configure_nm_profile(address: &str, identity: &str, username: &str, password:
 fn standard_connect(host: &str, username: &str, password: Option<&str>) -> (bool, String) {
     if nm_active() { let _ = nm(&["--wait", "5", "connection", "down", PROFILE]); }
     let mut log = configure_nm_profile(host, host, username, password);
-    log.push_str("\n");
+    log.push('\n');
     log.push_str(&nm(&["--wait", "15", "connection", "up", PROFILE]));
     (nm_active(), log)
 }
 
 fn restricted_candidates(host: &str) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    // Verified from the official Android app's live IKEv2 log on Estonia/Tallinn.
-    if host == "ee-tll.prod.surfshark.com" {
-        out.push("185.174.159.123".to_string());
-    }
+    let mut out = Vec::new();
+    if host == "ee-tll.prod.surfshark.com" { out.push("185.174.159.123".to_string()); }
     for ip in bundled_for_host(host) {
         if !out.iter().any(|v| v == ip) { out.push((*ip).to_string()); }
     }
     out
 }
 
-fn restricted_connect(endpoint: &str, username: &str, password: &str) -> (bool, String) {
+fn restricted_connect(endpoint: &str, username: &str, password: &str, settings: &AppSettings) -> (bool, String) {
+    let mss = settings.mss.to_string();
+    let hotspot = if settings.hotspot_vpn { "1" } else { "0" };
+    let recover = if settings.recover_network { "1" } else { "0" };
     let mut child = match Command::new("pkexec")
         .arg("bash")
         .arg(RESTRICTED_CONNECT)
         .arg(endpoint)
         .arg(username)
+        .arg(&mss)
+        .arg(&settings.dns)
+        .arg(hotspot)
+        .arg(recover)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -148,9 +208,7 @@ fn restricted_connect(endpoint: &str, username: &str, password: &str) -> (bool, 
         Ok(child) => child,
         Err(e) => return (false, format!("Could not start restricted helper: {e}")),
     };
-    if let Some(stdin) = child.stdin.as_mut() {
-        let _ = writeln!(stdin, "{password}");
-    }
+    if let Some(stdin) = child.stdin.as_mut() { let _ = writeln!(stdin, "{password}"); }
     match child.wait_with_output() {
         Ok(out) => {
             let mut text = String::from_utf8_lossy(&out.stdout).to_string();
@@ -164,9 +222,7 @@ fn restricted_connect(endpoint: &str, username: &str, password: &str) -> (bool, 
     }
 }
 
-fn restricted_disconnect() -> String {
-    run("pkexec", &["bash", RESTRICTED_DISCONNECT])
-}
+fn restricted_disconnect() -> String { run("pkexec", &["bash", RESTRICTED_DISCONNECT]) }
 
 fn parse_helper_value(text: &str, key: &str) -> Option<String> {
     text.lines().find_map(|line| {
@@ -176,11 +232,7 @@ fn parse_helper_value(text: &str, key: &str) -> Option<String> {
 }
 
 fn ping_ms(host: &str) -> Option<u32> {
-    let target = if host == "ee-tll.prod.surfshark.com" {
-        "185.174.159.123"
-    } else {
-        bundled_for_host(host).first().copied().unwrap_or(host)
-    };
+    let target = if host == "ee-tll.prod.surfshark.com" { "185.174.159.123" } else { bundled_for_host(host).first().copied().unwrap_or(host) };
     let output = Command::new("ping").args(["-n", "-c", "1", "-W", "1", target]).output().ok()?;
     if !output.status.success() { return None; }
     let text = String::from_utf8_lossy(&output.stdout);
@@ -218,14 +270,17 @@ fn append_log(buffer: &gtk::TextBuffer, title: &str, body: &str) {
 fn install_css() {
     let provider = gtk::CssProvider::new();
     provider.load_from_data(
-        ".hero { padding: 28px; border-radius: 22px; background: linear-gradient(135deg, rgba(65,83,255,.18), rgba(40,190,155,.12)); }\n\
-         .hero-title { font-size: 28px; font-weight: 800; }\n\
-         .status-pill { padding: 7px 12px; border-radius: 999px; background: alpha(@accent_bg_color, .14); }\n\
-         .panel { padding: 14px; border-radius: 14px; }\n\
-         .compat-box { padding: 12px; border-radius: 14px; background: alpha(@warning_bg_color, .08); }\n\
-         .primary-connect { min-height: 44px; padding-left: 30px; padding-right: 30px; }\n\
+        ".hero { padding: 28px; border-radius: 24px; background: linear-gradient(135deg, alpha(@accent_bg_color,.20), rgba(35,190,155,.11)); }\n\
+         .hero-title { font-size: 29px; font-weight: 800; }\n\
+         .hero-subtitle { font-size: 13px; }\n\
+         .status-pill { padding: 8px 13px; border-radius: 999px; background: alpha(@accent_bg_color, .14); font-weight: 700; }\n\
+         .vpn-orb { padding: 13px; border-radius: 999px; background: alpha(@accent_bg_color,.12); }\n\
+         .panel { padding: 15px; border-radius: 16px; background: alpha(@card_bg_color,.45); }\n\
+         .settings-box { padding: 14px; border-radius: 16px; background: alpha(@view_bg_color,.35); }\n\
+         .primary-connect { min-height: 48px; padding-left: 38px; padding-right: 38px; font-weight: 700; }\n\
          .small-note { font-size: 11px; }\n\
-         .diag-box { font-size: 12px; }"
+         .diag-box { font-size: 12px; }\n\
+         .connection-progress { min-height: 5px; }"
     );
     if let Some(display) = gtk::gdk::Display::default() {
         gtk::style_context_add_provider_for_display(&display, &provider, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
@@ -240,20 +295,25 @@ fn main() -> glib::ExitCode {
 
 fn build_ui(app: &adw::Application) {
     install_css();
+    let settings = load_settings();
+    let initially_active = any_vpn_active();
 
     let header = adw::HeaderBar::new();
     header.set_title_widget(Some(&adw::WindowTitle::new("Surfshark IKEv2", "Unofficial Linux client by MilMit")));
 
-    let status = gtk::Label::builder()
-        .label(if any_vpn_active() { "🟢 Connected" } else { "Ready" })
-        .css_classes(["status-pill"]).build();
+    let status_icon = gtk::Image::from_icon_name(if initially_active { "network-vpn-symbolic" } else { "network-offline-symbolic" });
+    status_icon.set_pixel_size(28); status_icon.add_css_class("vpn-orb");
+    let status = gtk::Label::builder().label(if initially_active { "Connected" } else { "Ready to connect" }).css_classes(["status-pill"]).build();
+    let hero_detail = gtk::Label::builder().label(if initially_active { "Encrypted tunnel is active" } else { "Choose a location and connect securely" }).halign(gtk::Align::Start).css_classes(["dim-label", "hero-subtitle"]).build();
     let spinner = gtk::Spinner::new();
+    let progress = gtk::ProgressBar::new(); progress.add_css_class("connection-progress"); progress.set_visible(false); progress.set_pulse_step(0.09);
+
     let hero_top = gtk::Box::new(Orientation::Horizontal, 12);
-    hero_top.append(&status); hero_top.append(&spinner);
-    let hero = gtk::Box::new(Orientation::Vertical, 10);
-    hero.add_css_class("hero"); hero.append(&hero_top);
+    hero_top.append(&status_icon); hero_top.append(&status); hero_top.append(&spinner);
+    let hero = gtk::Box::new(Orientation::Vertical, 11); hero.add_css_class("hero");
+    hero.append(&hero_top);
     hero.append(&gtk::Label::builder().label("Private. Fast. Native IKEv2.").halign(gtk::Align::Start).css_classes(["hero-title"]).build());
-    hero.append(&gtk::Label::builder().label("Restricted mode uses direct strongSwan, IP-based Surfshark endpoints, Android-matched IKE proposals, DNS repair and MSS=1200 for filtered/mobile networks.").halign(gtk::Align::Start).wrap(true).css_classes(["dim-label"]).build());
+    hero.append(&hero_detail); hero.append(&progress);
 
     let location = gtk::ComboBoxText::new(); location.set_hexpand(true);
     for item in LOCATIONS { location.append(Some(item.id), item.label); }
@@ -265,47 +325,88 @@ fn build_ui(app: &adw::Application) {
     location_box.append(&location_row);
     location_box.append(&gtk::Label::builder().label("🟢 fast · 🟡 medium · 🟠 slow · ⚪ no ICMP reply").halign(gtk::Align::Start).css_classes(["dim-label", "small-note"]).build());
 
-    let restricted_mode = gtk::CheckButton::with_label("Restricted network / Iran compatibility mode"); restricted_mode.set_active(true);
-    let restricted_box = gtk::Box::new(Orientation::Vertical, 5); restricted_box.add_css_class("compat-box"); restricted_box.append(&restricted_mode);
-    restricted_box.append(&gtk::Label::builder().label("Direct strongSwan backend: AES-256-GCM/ECP521 → EAP-MSCHAPv2 → ESP AES-256/SHA1 → Surfshark DNS → MSS clamp. Estonia endpoint is verified from the official Android client; other locations rotate bundled candidates until one passes the real data-path test.").halign(gtk::Align::Start).wrap(true).css_classes(["dim-label", "small-note"]).build());
-
+    let restricted_mode = gtk::CheckButton::with_label("Restricted network / Iran compatibility mode"); restricted_mode.set_active(settings.restricted);
     let user = gtk::Entry::builder().placeholder_text("Surfshark service username").hexpand(true).build();
     if let Some(name) = saved_username() { user.set_text(&name); }
-    let pass = gtk::PasswordEntry::builder().placeholder_text("Service password · blank reuses saved restricted credential").show_peek_icon(true).hexpand(true).build();
-    let creds_note = gtk::Label::builder().label("Restricted mode saves the Surfshark service secret root-only after the first successful setup.").halign(gtk::Align::Start).wrap(true).css_classes(["dim-label", "small-note"]).build();
-    let credentials = gtk::Box::new(Orientation::Vertical, 8); credentials.append(&user); credentials.append(&pass); credentials.append(&creds_note);
+    let pass = gtk::PasswordEntry::builder().placeholder_text("Service password · blank = use saved password").show_peek_icon(true).hexpand(true).build();
+    let mss = gtk::SpinButton::with_range(900.0, 1400.0, 10.0); mss.set_value(settings.mss as f64); mss.set_tooltip_text(Some("1200 is the verified safe value for filtered/mobile Iranian networks. Increase only if you have tested the path."));
+    let dns = gtk::Entry::builder().text(&settings.dns).placeholder_text(DEFAULT_DNS).hexpand(true).build();
+    let hotspot_vpn = gtk::CheckButton::with_label("Route active Ubuntu hotspot/shared connection through VPN"); hotspot_vpn.set_active(settings.hotspot_vpn);
+    let recover_network = gtk::CheckButton::with_label("Auto-recover Internet after failed connect / disconnect"); recover_network.set_active(settings.recover_network);
+    let reset_tuning = gtk::Button::with_label("Reset Iran tuning");
 
-    let connect = gtk::Button::with_label("Connect"); connect.add_css_class("suggested-action"); connect.add_css_class("primary-connect");
-    let disconnect = gtk::Button::with_label("Disconnect"); disconnect.add_css_class("destructive-action");
+    let mss_row = gtk::Box::new(Orientation::Horizontal, 10);
+    mss_row.append(&gtk::Label::builder().label("TCP MSS").width_chars(18).halign(gtk::Align::Start).build()); mss_row.append(&mss);
+    let dns_row = gtk::Box::new(Orientation::Horizontal, 10);
+    dns_row.append(&gtk::Label::builder().label("Surfshark DNS").width_chars(18).halign(gtk::Align::Start).build()); dns_row.append(&dns);
+    let settings_box = gtk::Box::new(Orientation::Vertical, 9); settings_box.add_css_class("settings-box");
+    settings_box.append(&restricted_mode);
+    settings_box.append(&gtk::Separator::new(Orientation::Horizontal));
+    settings_box.append(&gtk::Label::builder().label("Surfshark credentials").halign(gtk::Align::Start).css_classes(["heading"]).build());
+    settings_box.append(&user); settings_box.append(&pass);
+    settings_box.append(&gtk::Label::builder().label("The username is stored in your user config. The service password is stored root-only by the privileged helper after first use.").halign(gtk::Align::Start).wrap(true).css_classes(["dim-label", "small-note"]).build());
+    settings_box.append(&gtk::Separator::new(Orientation::Horizontal));
+    settings_box.append(&gtk::Label::builder().label("Iran / restricted-network tuning").halign(gtk::Align::Start).css_classes(["heading"]).build());
+    settings_box.append(&mss_row); settings_box.append(&dns_row); settings_box.append(&hotspot_vpn); settings_box.append(&recover_network); settings_box.append(&reset_tuning);
+    settings_box.append(&gtk::Label::builder().label("Recommended: MSS 1200 + Surfshark DNS. Hotspot routing is optional. Network recovery removes stale table-220 routes, virtual IP/DNS state and automatically resets the physical link only if Internet is still unavailable.").halign(gtk::Align::Start).wrap(true).css_classes(["dim-label", "small-note"]).build());
+    let settings_expander = gtk::Expander::new(Some("Settings & Iran tuning")); settings_expander.set_child(Some(&settings_box));
+
+    let connect = gtk::Button::with_label("Connect securely"); connect.add_css_class("suggested-action"); connect.add_css_class("primary-connect"); connect.set_visible(!initially_active);
+    let disconnect = gtk::Button::with_label("Disconnect"); disconnect.add_css_class("destructive-action"); disconnect.add_css_class("primary-connect"); disconnect.set_visible(initially_active);
     let refresh = gtk::Button::with_label("Refresh status");
     let actions = gtk::Box::new(Orientation::Horizontal, 8); actions.set_halign(gtk::Align::Center); actions.append(&connect); actions.append(&disconnect); actions.append(&refresh);
 
-    let ip_label = gtk::Label::builder().label("Public IP: —").halign(gtk::Align::Center).css_classes(["dim-label"]).build();
+    let ip_label = gtk::Label::builder().label(state_value("PUBLIC_IP").map(|ip| format!("Public IP: {ip}")).unwrap_or_else(|| "Public IP: —".into())).halign(gtk::Align::Center).css_classes(["dim-label"]).build();
+    let hotspot_label = gtk::Label::builder().label(if state_value("HOTSPOT_IFACE").is_some() { "Hotspot: routed through VPN" } else { "Hotspot: normal route / inactive" }).halign(gtk::Align::Center).css_classes(["dim-label", "small-note"]).build();
     let text_view = gtk::TextView::builder().editable(false).monospace(true).wrap_mode(gtk::WrapMode::WordChar).top_margin(12).bottom_margin(12).left_margin(12).right_margin(12).css_classes(["diag-box"]).build();
     let buffer = text_view.buffer(); buffer.set_text("Surfshark IKEv2 diagnostic log\n");
-    let scroller = gtk::ScrolledWindow::builder().vexpand(true).hexpand(true).min_content_height(240).child(&text_view).build();
+    let scroller = gtk::ScrolledWindow::builder().vexpand(true).hexpand(true).min_content_height(230).child(&text_view).build();
     let expander = gtk::Expander::new(Some("Advanced diagnostics")); expander.set_child(Some(&scroller));
 
     let content = gtk::Box::new(Orientation::Vertical, 16); content.set_margin_top(18); content.set_margin_bottom(18); content.set_margin_start(22); content.set_margin_end(22);
-    for w in [&hero, &location_box, &restricted_box, &credentials, &actions] { content.append(w); }
-    content.append(&ip_label); content.append(&expander);
+    for w in [&hero, &location_box] { content.append(w); }
+    content.append(&settings_expander); content.append(&actions); content.append(&ip_label); content.append(&hotspot_label); content.append(&expander);
     let root = gtk::Box::new(Orientation::Vertical, 0); root.append(&header); root.append(&content);
-    let window = adw::ApplicationWindow::builder().application(app).title("Surfshark IKEv2 for Linux").default_width(760).default_height(790).content(&root).build();
+    let window = adw::ApplicationWindow::builder().application(app).title("Surfshark IKEv2 for Linux").default_width(780).default_height(820).content(&root).build();
 
     let (tx, rx) = mpsc::channel::<Event>();
-    let status = Rc::new(status); let spinner = Rc::new(spinner); let connect = Rc::new(connect); let disconnect = Rc::new(disconnect); let refresh = Rc::new(refresh); let ping_button = Rc::new(ping_button); let buffer = Rc::new(buffer); let ip_label = Rc::new(ip_label); let pass = Rc::new(pass); let user = Rc::new(user); let location = Rc::new(location); let restricted_mode = Rc::new(restricted_mode);
+    let status = Rc::new(status); let status_icon = Rc::new(status_icon); let hero_detail = Rc::new(hero_detail); let spinner = Rc::new(spinner); let progress = Rc::new(progress);
+    let connect = Rc::new(connect); let disconnect = Rc::new(disconnect); let refresh = Rc::new(refresh); let ping_button = Rc::new(ping_button); let buffer = Rc::new(buffer); let ip_label = Rc::new(ip_label); let hotspot_label = Rc::new(hotspot_label);
+    let pass = Rc::new(pass); let user = Rc::new(user); let location = Rc::new(location); let restricted_mode = Rc::new(restricted_mode); let mss = Rc::new(mss); let dns = Rc::new(dns); let hotspot_vpn = Rc::new(hotspot_vpn); let recover_network = Rc::new(recover_network);
 
     {
-        let status = Rc::clone(&status); let spinner = Rc::clone(&spinner); let connect = Rc::clone(&connect); let disconnect = Rc::clone(&disconnect); let refresh = Rc::clone(&refresh); let ping_button = Rc::clone(&ping_button); let buffer = Rc::clone(&buffer); let ip_label = Rc::clone(&ip_label); let pass = Rc::clone(&pass); let location = Rc::clone(&location);
-        glib::timeout_add_local(Duration::from_millis(80), move || {
+        let mss = Rc::clone(&mss); let dns = Rc::clone(&dns); let hotspot_vpn = Rc::clone(&hotspot_vpn); let recover_network = Rc::clone(&recover_network); let restricted_mode = Rc::clone(&restricted_mode);
+        reset_tuning.connect_clicked(move |_| {
+            mss.set_value(1200.0); dns.set_text(DEFAULT_DNS); hotspot_vpn.set_active(true); recover_network.set_active(true); restricted_mode.set_active(true);
+        });
+    }
+
+    {
+        let status = Rc::clone(&status); let status_icon = Rc::clone(&status_icon); let hero_detail = Rc::clone(&hero_detail); let spinner = Rc::clone(&spinner); let progress = Rc::clone(&progress);
+        let connect = Rc::clone(&connect); let disconnect = Rc::clone(&disconnect); let refresh = Rc::clone(&refresh); let ping_button = Rc::clone(&ping_button); let buffer = Rc::clone(&buffer); let ip_label = Rc::clone(&ip_label); let hotspot_label = Rc::clone(&hotspot_label); let pass = Rc::clone(&pass); let location = Rc::clone(&location);
+        glib::timeout_add_local(Duration::from_millis(90), move || {
+            if spinner.is_spinning() { progress.pulse(); }
             while let Ok(event) = rx.try_recv() {
                 match event {
-                    Event::Busy(message) => { status.set_label(&message); spinner.start(); connect.set_sensitive(false); disconnect.set_sensitive(false); refresh.set_sensitive(false); }
+                    Event::Busy(message) => {
+                        status.set_label(&message); hero_detail.set_label("Negotiating secure IKEv2 tunnel…"); status_icon.set_icon_name(Some("network-transmit-receive-symbolic")); spinner.start(); progress.set_visible(true);
+                        connect.set_sensitive(false); disconnect.set_sensitive(false); refresh.set_sensitive(false);
+                    }
                     Event::Log(title, body) => append_log(&buffer, &title, &body),
-                    Event::Connected(ip, label) => { spinner.stop(); status.set_label("🟢 Connected"); ip_label.set_label(&format!("{label} · Public IP: {ip}")); connect.set_sensitive(true); disconnect.set_sensitive(true); refresh.set_sensitive(true); pass.set_text(""); }
-                    Event::Disconnected => { spinner.stop(); status.set_label("Disconnected"); ip_label.set_label("Public IP: —"); connect.set_sensitive(true); disconnect.set_sensitive(true); refresh.set_sensitive(true); }
-                    Event::Failed(message) => { spinner.stop(); status.set_label("Connection failed"); connect.set_sensitive(true); disconnect.set_sensitive(true); refresh.set_sensitive(true); append_log(&buffer, "ERROR", &message); }
-                    Event::Refreshed(active, text) => { spinner.stop(); status.set_label(if active { "🟢 Connected" } else { "Disconnected" }); connect.set_sensitive(true); disconnect.set_sensitive(true); refresh.set_sensitive(true); append_log(&buffer, "STATUS", &text); }
+                    Event::Connected(ip, label, hotspot) => {
+                        spinner.stop(); progress.set_visible(false); status.set_label("Connected"); hero_detail.set_label(&format!("Protected · {label}")); status_icon.set_icon_name(Some("network-vpn-symbolic")); ip_label.set_label(&format!("Public IP: {ip}")); hotspot_label.set_label(&format!("Hotspot: {hotspot}"));
+                        connect.set_visible(false); disconnect.set_visible(true); connect.set_sensitive(true); disconnect.set_sensitive(true); refresh.set_sensitive(true); pass.set_text("");
+                    }
+                    Event::Disconnected => {
+                        spinner.stop(); progress.set_visible(false); status.set_label("Disconnected"); hero_detail.set_label("Network restored · ready to connect"); status_icon.set_icon_name(Some("network-offline-symbolic")); ip_label.set_label("Public IP: —"); hotspot_label.set_label("Hotspot: normal route / inactive");
+                        connect.set_visible(true); disconnect.set_visible(false); connect.set_sensitive(true); disconnect.set_sensitive(true); refresh.set_sensitive(true);
+                    }
+                    Event::Failed(message) => {
+                        spinner.stop(); progress.set_visible(false); status.set_label("Connection failed"); hero_detail.set_label("Tunnel was not established. Network recovery has been requested."); status_icon.set_icon_name(Some("dialog-warning-symbolic")); connect.set_visible(true); disconnect.set_visible(false); connect.set_sensitive(true); disconnect.set_sensitive(true); refresh.set_sensitive(true); append_log(&buffer, "ERROR", &message);
+                    }
+                    Event::Refreshed(active, text) => {
+                        spinner.stop(); progress.set_visible(false); status.set_label(if active { "Connected" } else { "Disconnected" }); status_icon.set_icon_name(Some(if active { "network-vpn-symbolic" } else { "network-offline-symbolic" })); connect.set_visible(!active); disconnect.set_visible(active); connect.set_sensitive(true); disconnect.set_sensitive(true); refresh.set_sensitive(true); append_log(&buffer, "STATUS", &text);
+                    }
                     Event::PingStarted => { ping_button.set_sensitive(false); ping_button.set_label("Testing…"); }
                     Event::PingResults(results) => { ping_button.set_sensitive(true); ping_button.set_label("Test latency"); repopulate_locations(&location, &results); append_log(&buffer, "LATENCY SCAN", &format!("{} of {} locations replied.", results.iter().filter(|(_, ms)| ms.is_some()).count(), results.len())); }
                 }
@@ -315,38 +416,48 @@ fn build_ui(app: &adw::Application) {
     }
 
     {
-        let tx = tx.clone(); let user = Rc::clone(&user); let pass = Rc::clone(&pass); let location = Rc::clone(&location); let restricted_mode = Rc::clone(&restricted_mode);
+        let tx = tx.clone(); let user = Rc::clone(&user); let pass = Rc::clone(&pass); let location = Rc::clone(&location); let restricted_mode = Rc::clone(&restricted_mode); let mss = Rc::clone(&mss); let dns = Rc::clone(&dns); let hotspot_vpn = Rc::clone(&hotspot_vpn); let recover_network = Rc::clone(&recover_network);
         connect.connect_clicked(move |_| {
             let id = location.active_id().map(|s| s.to_string()).unwrap_or_else(|| "ee-tll".to_string());
             let Some(selected) = by_id(&id) else { return; };
-            let username = user.text().trim().to_string(); let password = pass.text().to_string(); let restricted = restricted_mode.is_active(); let tx = tx.clone();
-            if username.is_empty() { let _ = tx.send(Event::Failed("Surfshark service username is required.".into())); return; }
-            save_username(&username);
+            let username = user.text().trim().to_string(); let password = pass.text().to_string();
+            if username.is_empty() { let _ = tx.send(Event::Failed("Surfshark service username is required in Settings.".into())); return; }
+            let current = AppSettings {
+                restricted: restricted_mode.is_active(),
+                mss: mss.value_as_int().clamp(900, 1400) as u32,
+                dns: if dns.text().trim().is_empty() { DEFAULT_DNS.to_string() } else { dns.text().trim().to_string() },
+                hotspot_vpn: hotspot_vpn.is_active(),
+                recover_network: recover_network.is_active(),
+            };
+            save_username(&username); save_settings(&current);
+            let tx = tx.clone();
             thread::spawn(move || {
                 let _ = tx.send(Event::Busy(format!("Connecting to {}…", selected.city)));
-                if restricted {
+                if current.restricted {
                     if nm_active() { let _ = nm(&["--wait", "5", "connection", "down", PROFILE]); }
                     let candidates = restricted_candidates(selected.host);
-                    let _ = tx.send(Event::Log("RESTRICTED ENDPOINTS".into(), format!("{} candidate(s):\n{}", candidates.len(), candidates.join("\n"))));
+                    let _ = tx.send(Event::Log("RESTRICTED ENDPOINTS".into(), format!("{} candidate(s):\n{}\nMSS={}\nDNS={}\nHotspot through VPN={}\nAuto recovery={}", candidates.len(), candidates.join("\n"), current.mss, current.dns, current.hotspot_vpn, current.recover_network)));
                     if candidates.is_empty() { let _ = tx.send(Event::Failed("No bundled restricted endpoint exists for this location yet.".into())); return; }
                     for (i, endpoint) in candidates.iter().enumerate() {
-                        let _ = tx.send(Event::Busy(format!("{} · endpoint {}/{}…", selected.city, i + 1, candidates.len())));
-                        let (ok, log) = restricted_connect(endpoint, &username, &password);
+                        let _ = tx.send(Event::Busy(format!("{} · secure route {}/{}…", selected.city, i + 1, candidates.len())));
+                        let (ok, log) = restricted_connect(endpoint, &username, &password, &current);
                         let _ = tx.send(Event::Log(format!("RESTRICTED ATTEMPT {}/{}", i + 1, candidates.len()), log.clone()));
                         if ok {
                             let ip = parse_helper_value(&log, "Public IPv4").unwrap_or_else(|| "connected".into());
                             let country = parse_helper_value(&log, "Exit country").unwrap_or_default();
+                            let hotspot = parse_helper_value(&log, "Hotspot VPN").unwrap_or_else(|| if current.hotspot_vpn { "enabled".into() } else { "normal route".into() });
                             let label = if country.is_empty() { selected.label.to_string() } else { format!("{} · {}", selected.label, country) };
-                            let _ = tx.send(Event::Connected(ip, label)); return;
+                            let _ = tx.send(Event::Connected(ip, label, hotspot)); return;
                         }
                     }
+                    let _ = restricted_disconnect();
                     let _ = tx.send(Event::Failed(format!("All {} restricted endpoint candidate(s) failed.", candidates.len())));
                 } else {
                     if restricted_active() { let _ = restricted_disconnect(); }
                     let pass_opt = if password.is_empty() { None } else { Some(password.as_str()) };
                     let (ok, log) = standard_connect(selected.host, &username, pass_opt);
                     let _ = tx.send(Event::Log("NETWORKMANAGER CONNECT".into(), log));
-                    if ok { let _ = tx.send(Event::Connected(public_ip().trim().to_string(), selected.label.to_string())); }
+                    if ok { let _ = tx.send(Event::Connected(public_ip().trim().to_string(), selected.label.to_string(), "normal route".into())); }
                     else { let _ = tx.send(Event::Failed("NetworkManager IKEv2 activation failed.".into())); }
                 }
             });
@@ -358,12 +469,12 @@ fn build_ui(app: &adw::Application) {
         disconnect.connect_clicked(move |_| {
             let tx = tx.clone();
             thread::spawn(move || {
-                let _ = tx.send(Event::Busy("Disconnecting…".into()));
+                let _ = tx.send(Event::Busy("Disconnecting & restoring network…".into()));
                 let mut log = String::new();
-                if restricted_active() { log.push_str(&restricted_disconnect()); log.push('\n'); }
+                if restricted_active() || fs::metadata(RESTRICTED_STATE).is_ok() { log.push_str(&restricted_disconnect()); log.push('\n'); }
                 if nm_active() { log.push_str(&nm(&["--wait", "5", "connection", "down", PROFILE])); }
                 let _ = tx.send(Event::Log("DISCONNECT".into(), log));
-                let _ = tx.send(if any_vpn_active() { Event::Failed("VPN still appears active.".into()) } else { Event::Disconnected });
+                let _ = tx.send(if any_vpn_active() { Event::Failed("VPN still appears active after cleanup.".into()) } else { Event::Disconnected });
             });
         });
     }
@@ -373,9 +484,9 @@ fn build_ui(app: &adw::Application) {
         refresh.connect_clicked(move |_| {
             let tx = tx.clone();
             thread::spawn(move || {
-                let _ = tx.send(Event::Busy("Refreshing…".into()));
+                let _ = tx.send(Event::Busy("Refreshing status…".into()));
                 let active = any_vpn_active();
-                let text = format!("restricted_active={}\nnetworkmanager_active={}\npublic_ip={}", restricted_active(), nm_active(), if active { public_ip() } else { "—".into() });
+                let text = format!("restricted_active={}\nnetworkmanager_active={}\nvirtual_ip={}\npublic_ip={}\nhotspot_iface={}", restricted_active(), nm_active(), state_value("VIRTUAL_IP").unwrap_or_else(|| "—".into()), state_value("PUBLIC_IP").unwrap_or_else(|| if active { public_ip() } else { "—".into() }), state_value("HOTSPOT_IFACE").unwrap_or_else(|| "—".into()));
                 let _ = tx.send(Event::Refreshed(active, text));
             });
         });
