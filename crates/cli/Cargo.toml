@@ -1,0 +1,9 @@
+[package]
+name = "surfshark-ikev2-cli"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+surfshark-ikev2-core = { path = "../core" }
+serde_json = "1"
+rpassword = "7"

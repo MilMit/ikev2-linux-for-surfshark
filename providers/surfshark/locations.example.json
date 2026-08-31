@@ -1,0 +1,13 @@
+[
+  {
+    "id": "tr-istanbul-example",
+    "country": "Türkiye",
+    "city": "Istanbul",
+    "endpoint": {
+      "hostname": "replace-with-current-surfshark-hostname.invalid",
+      "fallback_ips": [],
+      "ike_port": 4500
+    },
+    "certificate_id": "surfshark-ikev2-ca"
+  }
+]
