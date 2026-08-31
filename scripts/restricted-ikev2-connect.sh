@@ -20,6 +20,7 @@ NM_MARKER_IF=milmitvpn0
 XFRM_IF=milmitxfrm0
 XFRM_IF_ID=42
 ROUTE_TABLE=220
+# Must run before strongSwan's catch-all rule at priority 220.
 HOTSPOT_RULE_PREF=179
 
 if [[ $EUID -ne 0 ]]; then echo "This helper must run as root." >&2; exit 77; fi
@@ -71,6 +72,33 @@ detect_hotspot() {
   done < <(ip -4 -o addr show scope global 2>/dev/null | awk '{print $2, $4}')
 }
 
+flush_hotspot_conntrack() {
+  local hs_subnet="${1:-}"
+  [[ -n "$hs_subnet" ]] || return 0
+  if command -v conntrack >/dev/null 2>&1; then
+    conntrack -D -s "$hs_subnet" >/dev/null 2>&1 || true
+    conntrack -D -d "$hs_subnet" >/dev/null 2>&1 || true
+  fi
+}
+
+purge_legacy_hotspot_rules() {
+  local hs_iface="${1:-}" hs_subnet="${2:-}"
+  [[ -n "$hs_subnet" ]] || return 0
+
+  # Remove MilMit SNAT rules left by pre-XFRM builds. Keep NetworkManager's
+  # own nm-shared MASQUERADE rule untouched.
+  while IFS= read -r rule; do
+    [[ "$rule" == *"-s $hs_subnet"* && "$rule" == *"-j SNAT --to-source 10.6."* ]] || continue
+    # shellcheck disable=SC2086
+    iptables -t nat -D POSTROUTING ${rule#-A POSTROUTING } >/dev/null 2>&1 || true
+  done < <(iptables -t nat -S POSTROUTING 2>/dev/null || true)
+
+  if [[ -n "$hs_iface" ]]; then
+    while iptables -D FORWARD -i "$hs_iface" -s "$hs_subnet" -j ACCEPT 2>/dev/null; do :; done
+    while iptables -D FORWARD -o "$hs_iface" -d "$hs_subnet" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null; do :; done
+  fi
+}
+
 remove_hotspot_rules() {
   local vip="${1:-}" hs_iface="${2:-}" hs_subnet="${3:-}" old_mss="${4:-1200}" hs_dns="${5:-}"
   [[ -n "$hs_subnet" ]] || return 0
@@ -85,6 +113,8 @@ remove_hotspot_rules() {
       while iptables -t nat -D PREROUTING -i "$hs_iface" -s "$hs_subnet" -p tcp --dport 53 -j DNAT --to-destination "$hs_dns" 2>/dev/null; do :; done
     fi
   fi
+  purge_legacy_hotspot_rules "$hs_iface" "$hs_subnet"
+  flush_hotspot_conntrack "$hs_subnet"
 }
 
 remove_route_state() {
@@ -165,6 +195,8 @@ detect_hotspot
 ROUTE_BASED=0
 if [[ "$HOTSPOT_VPN" == 1 && -n "$HOTSPOT_IFACE" && -n "$HOTSPOT_SUBNET" ]]; then
   ROUTE_BASED=1
+  purge_legacy_hotspot_rules "$HOTSPOT_IFACE" "$HOTSPOT_SUBNET"
+  flush_hotspot_conntrack "$HOTSPOT_SUBNET"
   if ! ip link add "$XFRM_IF" type xfrm if_id "$XFRM_IF_ID" 2>/dev/null; then
     echo "Kernel/iproute2 could not create XFRM interface $XFRM_IF." >&2
     exit 70
@@ -260,6 +292,7 @@ if [[ "$ROUTE_BASED" == 1 ]]; then
   iptables -I FORWARD 1 -i "$XFRM_IF" -o "$HOTSPOT_IFACE" -d "$HOTSPOT_SUBNET" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
   iptables -t nat -I PREROUTING 1 -i "$HOTSPOT_IFACE" -s "$HOTSPOT_SUBNET" -p udp --dport 53 -j DNAT --to-destination "$HOTSPOT_DNS"
   iptables -t nat -I PREROUTING 1 -i "$HOTSPOT_IFACE" -s "$HOTSPOT_SUBNET" -p tcp --dport 53 -j DNAT --to-destination "$HOTSPOT_DNS"
+  flush_hotspot_conntrack "$HOTSPOT_SUBNET"
   ip route flush cache >/dev/null 2>&1 || true
 fi
 
