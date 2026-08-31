@@ -9,6 +9,7 @@ HOTSPOT_VPN="${5:-1}"
 RECOVER_NETWORK="${6:-1}"
 HOTSPOT_IFACE_REQUEST="${7:-auto}"
 KILL_SWITCH="${8:-0}"
+ROUTING_MODE="${9:-vpn_all}"
 
 CONF=/etc/swanctl/conf.d/milmit-surfshark-restricted.conf
 CONN_NAME=milmit-surfshark-restricted
@@ -17,6 +18,10 @@ STATE_DIR=/run/milmit-surfshark
 STATE_FILE="$STATE_DIR/restricted.state"
 CRED_DIR=/etc/milmit-surfshark
 CRED_FILE="$CRED_DIR/credentials"
+DATA_DIR=/var/lib/milmit-surfshark
+IRAN_CACHE="$DATA_DIR/iran-ipv4.txt"
+IRAN_SOURCE=https://raw.githubusercontent.com/ravenscourt/xylem-ip-db/main/lists/ir.ipv4.txt
+IRAN_SET=MILMIT_IRAN
 NM_MARKER="Surfshark IKEv2 (Connected)"
 NM_MARKER_IF=milmitvpn0
 XFRM_IF=milmitxfrm0
@@ -33,12 +38,13 @@ CHAIN_MSS=MILMIT_VPN_MSS
 CHAIN_KILL=MILMIT_VPN_KILL
 
 [[ $EUID -eq 0 ]] || { echo "This helper must run as root." >&2; exit 77; }
-[[ -n "$SERVER_IP" && -n "$SERVICE_USER" ]] || { echo "usage: $0 <server-ip> <service-user> [mss] [dns-csv] [hotspot-vpn] [recover] [hotspot-iface|auto] [kill-switch]" >&2; exit 64; }
+[[ -n "$SERVER_IP" && -n "$SERVICE_USER" ]] || { echo "usage: $0 <server-ip> <service-user> [mss] [dns-csv] [hotspot-vpn] [recover] [hotspot-iface|auto] [kill-switch] [vpn_all|iran_direct]" >&2; exit 64; }
 [[ "$SERVER_IP" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || { echo "invalid server IPv4" >&2; exit 64; }
 [[ "$MSS" =~ ^[0-9]+$ && "$MSS" -ge 900 && "$MSS" -le 1400 ]] || { echo "MSS must be 900-1400" >&2; exit 64; }
 [[ "$HOTSPOT_VPN" == 0 || "$HOTSPOT_VPN" == 1 ]] || exit 64
 [[ "$RECOVER_NETWORK" == 0 || "$RECOVER_NETWORK" == 1 ]] || exit 64
 [[ "$KILL_SWITCH" == 0 || "$KILL_SWITCH" == 1 ]] || exit 64
+[[ "$ROUTING_MODE" == vpn_all || "$ROUTING_MODE" == iran_direct ]] || { echo "invalid routing mode" >&2; exit 64; }
 [[ "$HOTSPOT_IFACE_REQUEST" == auto || "$HOTSPOT_IFACE_REQUEST" =~ ^[a-zA-Z0-9_.:-]{1,32}$ ]] || { echo "invalid hotspot interface" >&2; exit 64; }
 
 state_get() {
@@ -72,6 +78,7 @@ cleanup_policy() {
   while ip rule del pref "$RULE_DIRECT_PREF" fwmark "$MARK_DIRECT" table main >/dev/null 2>&1; do :; done
   while ip rule del pref "$RULE_VPN_PREF" fwmark "$MARK_VPN" table "$ROUTE_TABLE" >/dev/null 2>&1; do :; done
   ip route flush table "$ROUTE_TABLE" >/dev/null 2>&1 || true
+  command -v ipset >/dev/null 2>&1 && ipset destroy "$IRAN_SET" >/dev/null 2>&1 || true
 }
 
 subnet_from_cidr() { python3 - "$1" <<'PY'
@@ -133,6 +140,44 @@ recover_interface() {
   fi
 }
 
+build_host_chain() {
+  ipt_chain_reset mangle "$CHAIN_HOST"
+  iptables -w -t mangle -A "$CHAIN_HOST" -d "$SERVER_IP/32" -j RETURN
+  for net in 127.0.0.0/8 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16 224.0.0.0/4 255.255.255.255/32; do
+    iptables -w -t mangle -A "$CHAIN_HOST" -d "$net" -j MARK --set-mark "$MARK_DIRECT"
+    iptables -w -t mangle -A "$CHAIN_HOST" -d "$net" -j RETURN
+  done
+  if [[ "$ROUTING_MODE" == iran_direct && "$IRAN_READY" == 1 ]]; then
+    iptables -w -t mangle -A "$CHAIN_HOST" -m set --match-set "$IRAN_SET" dst -j MARK --set-mark "$MARK_DIRECT"
+    iptables -w -t mangle -A "$CHAIN_HOST" -m set --match-set "$IRAN_SET" dst -j RETURN
+  fi
+  iptables -w -t mangle -A "$CHAIN_HOST" -m mark ! --mark "$MARK_DIRECT" -j MARK --set-mark "$MARK_VPN"
+  ipt_unhook mangle OUTPUT "$CHAIN_HOST"
+  iptables -w -t mangle -I OUTPUT 2 -j "$CHAIN_HOST"
+}
+
+load_iran_set() {
+  IRAN_READY=0
+  IRAN_ENTRIES=0
+  [[ "$ROUTING_MODE" == iran_direct ]] || return 0
+  command -v ipset >/dev/null 2>&1 || { echo "Iran Direct requires the 'ipset' package. Install it or choose VPN Everything." >&2; return 71; }
+  install -d -m 0755 "$DATA_DIR"
+  tmp="$(mktemp)"
+  if curl -4 --max-time 15 -fsSL "$IRAN_SOURCE" -o "$tmp" 2>/dev/null && grep -Eq '^[0-9]+(\.[0-9]+){3}/[0-9]+$' "$tmp"; then
+    install -m 0644 "$tmp" "$IRAN_CACHE"
+  fi
+  rm -f "$tmp"
+  [[ -s "$IRAN_CACHE" ]] || { echo "Iran Direct list is unavailable and no cached list exists." >&2; return 72; }
+  {
+    echo "create $IRAN_SET hash:net family inet hashsize 4096 maxelem 65536 -exist"
+    echo "flush $IRAN_SET"
+    awk '/^[0-9]+(\.[0-9]+){3}\/[0-9]+$/ {print "add '"$IRAN_SET"' "$1}' "$IRAN_CACHE"
+  } | ipset restore -exist
+  IRAN_ENTRIES="$(ipset list "$IRAN_SET" 2>/dev/null | awk '/Number of entries:/ {print $4; exit}')"
+  [[ "${IRAN_ENTRIES:-0}" -gt 0 ]] || { echo "Iran Direct set loaded zero prefixes." >&2; return 72; }
+  IRAN_READY=1
+}
+
 SERVICE_PASS=""
 if [[ ! -t 0 ]]; then IFS= read -r SERVICE_PASS || true; fi
 install -d -m 0700 "$CRED_DIR"
@@ -152,14 +197,13 @@ OLD_IFACE="$(state_get IFACE)"
 OLD_VIP="$(state_get VIRTUAL_IP)"
 OLD_HOT="$(state_get HOTSPOT_IFACE)"
 OLD_SUBNET="$(state_get HOTSPOT_SUBNET)"
-OLD_MSS="$(state_get MSS_VALUE)"
 cleanup_policy
 swanctl --terminate --ike "$CONN_NAME" >/dev/null 2>&1 || true
 swanctl --terminate --ike surfshark-tr >/dev/null 2>&1 || true
 ip link del "$XFRM_IF" >/dev/null 2>&1 || true
-if [[ -n "$OLD_VIP" ]]; then ip addr del "$OLD_VIP/32" dev "$OLD_IFACE" >/dev/null 2>&1 || true; fi
+if [[ -n "$OLD_VIP" && -n "$OLD_IFACE" ]]; then ip addr del "$OLD_VIP/32" dev "$OLD_IFACE" >/dev/null 2>&1 || true; fi
 if [[ -n "$OLD_IFACE" ]] && command -v resolvectl >/dev/null 2>&1; then resolvectl revert "$OLD_IFACE" >/dev/null 2>&1 || true; fi
-if [[ -n "$OLD_HOT" && -n "$OLD_SUBNET" ]]; then
+if [[ -n "$OLD_HOT" && -n "$OLD_SUBNET" && -n "$OLD_VIP" ]]; then
   iptables -w -t nat -D POSTROUTING -s "$OLD_SUBNET" -o "$XFRM_IF" -j SNAT --to-source "$OLD_VIP" 2>/dev/null || true
 fi
 rm -f "$STATE_FILE"
@@ -223,23 +267,27 @@ VIRTUAL_IP="$(printf '%s\n' "$SA_TEXT" | sed -nE 's/.*local .*\[([0-9]+\.[0-9]+\
 [[ -n "$VIRTUAL_IP" ]] || { echo "$SA_TEXT"; echo "No virtual IPv4 was found." >&2; exit 67; }
 IFACE="$(ip -4 route get "$SERVER_IP" | sed -nE 's/.* dev ([^ ]+).*/\1/p' | head -n1)"
 
-# Route table: only packets explicitly marked VPN enter the XFRM interface.
 ip route replace default dev "$XFRM_IF" src "$VIRTUAL_IP" table "$ROUTE_TABLE"
+ip route replace blackhole default metric 32767 table "$ROUTE_TABLE" 2>/dev/null || true
 ip rule add pref "$RULE_DIRECT_PREF" fwmark "$MARK_DIRECT" table main
 ip rule add pref "$RULE_VPN_PREF" fwmark "$MARK_VPN" table "$ROUTE_TABLE"
 
-# Host policy chain. Local/private/control traffic stays direct, Internet traffic gets VPN mark.
-ipt_chain_reset mangle "$CHAIN_HOST"
-iptables -w -t mangle -A "$CHAIN_HOST" -d "$SERVER_IP/32" -j RETURN
-for net in 127.0.0.0/8 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16 224.0.0.0/4 255.255.255.255/32; do
-  iptables -w -t mangle -A "$CHAIN_HOST" -d "$net" -j MARK --set-mark "$MARK_DIRECT"
-  iptables -w -t mangle -A "$CHAIN_HOST" -d "$net" -j RETURN
-done
-iptables -w -t mangle -A "$CHAIN_HOST" -m mark ! --mark "$MARK_DIRECT" -j MARK --set-mark "$MARK_VPN"
-ipt_unhook mangle OUTPUT "$CHAIN_HOST"
-iptables -w -t mangle -I OUTPUT 2 -j "$CHAIN_HOST"
+# First establish a VPN-all mark policy so the optional Iran list update itself
+# is downloaded through the already-established tunnel.
+IRAN_READY=0
+IRAN_ENTRIES=0
+build_host_chain
+if [[ "$ROUTING_MODE" == iran_direct ]]; then
+  if ! load_iran_set; then
+    cleanup_policy
+    swanctl --terminate --ike "$CONN_NAME" >/dev/null 2>&1 || true
+    ip link del "$XFRM_IF" >/dev/null 2>&1 || true
+    recover_interface "$IFACE"
+    exit 72
+  fi
+  build_host_chain
+fi
 
-# Explicitly mark systemd-resolved upstream DNS into the VPN policy.
 ipt_chain_reset mangle "$CHAIN_DNS"
 RESOLVED_UID="$(id -u systemd-resolve 2>/dev/null || id -u systemd-resolved 2>/dev/null || true)"
 if [[ -n "$RESOLVED_UID" ]]; then
@@ -248,7 +296,6 @@ fi
 ipt_unhook mangle OUTPUT "$CHAIN_DNS"
 iptables -w -t mangle -I OUTPUT 1 -j "$CHAIN_DNS"
 
-# MSS clamp on both host and forwarded TCP SYN traffic.
 ipt_chain_reset mangle "$CHAIN_MSS"
 iptables -w -t mangle -A "$CHAIN_MSS" -m mark --mark "$MARK_VPN" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$MSS"
 ipt_unhook mangle OUTPUT "$CHAIN_MSS"; iptables -w -t mangle -I OUTPUT 3 -j "$CHAIN_MSS"
@@ -260,7 +307,6 @@ if command -v resolvectl >/dev/null 2>&1 && [[ -n "$IFACE" ]]; then
   resolvectl flush-caches || true
 fi
 
-# Optional selected hotspot policy: mark its forwarded packets into the same VPN table.
 if [[ "$HOTSPOT_VPN" == 1 && -n "$HOTSPOT_IFACE" && -n "$HOTSPOT_SUBNET" ]]; then
   sysctl -w net.ipv4.ip_forward=1 >/dev/null
   ipt_chain_reset mangle "$CHAIN_HOT"
@@ -268,21 +314,27 @@ if [[ "$HOTSPOT_VPN" == 1 && -n "$HOTSPOT_IFACE" && -n "$HOTSPOT_SUBNET" ]]; the
     iptables -w -t mangle -A "$CHAIN_HOT" -d "$net" -j MARK --set-mark "$MARK_DIRECT"
     iptables -w -t mangle -A "$CHAIN_HOT" -d "$net" -j RETURN
   done
+  if [[ "$ROUTING_MODE" == iran_direct && "$IRAN_READY" == 1 ]]; then
+    iptables -w -t mangle -A "$CHAIN_HOT" -m set --match-set "$IRAN_SET" dst -j MARK --set-mark "$MARK_DIRECT"
+    iptables -w -t mangle -A "$CHAIN_HOT" -m set --match-set "$IRAN_SET" dst -j RETURN
+  fi
   iptables -w -t mangle -A "$CHAIN_HOT" -j MARK --set-mark "$MARK_VPN"
   ipt_unhook mangle PREROUTING "$CHAIN_HOT"
   iptables -w -t mangle -I PREROUTING 1 -i "$HOTSPOT_IFACE" -s "$HOTSPOT_SUBNET" -j "$CHAIN_HOT"
   iptables -w -t nat -D POSTROUTING -s "$HOTSPOT_SUBNET" -o "$XFRM_IF" -j SNAT --to-source "$VIRTUAL_IP" 2>/dev/null || true
   iptables -w -t nat -I POSTROUTING 1 -s "$HOTSPOT_SUBNET" -o "$XFRM_IF" -j SNAT --to-source "$VIRTUAL_IP"
+  iptables -w -t nat -D PREROUTING -i "$HOTSPOT_IFACE" -s "$HOTSPOT_SUBNET" -p udp --dport 53 -j DNAT --to-destination "$HOTSPOT_DNS" 2>/dev/null || true
+  iptables -w -t nat -D PREROUTING -i "$HOTSPOT_IFACE" -s "$HOTSPOT_SUBNET" -p tcp --dport 53 -j DNAT --to-destination "$HOTSPOT_DNS" 2>/dev/null || true
   iptables -w -t nat -I PREROUTING 1 -i "$HOTSPOT_IFACE" -s "$HOTSPOT_SUBNET" -p udp --dport 53 -j DNAT --to-destination "$HOTSPOT_DNS"
   iptables -w -t nat -I PREROUTING 1 -i "$HOTSPOT_IFACE" -s "$HOTSPOT_SUBNET" -p tcp --dport 53 -j DNAT --to-destination "$HOTSPOT_DNS"
 fi
 
-# Optional fail-closed kill switch. It only applies to public IPv4 traffic.
 ipt_chain_reset filter "$CHAIN_KILL"
 if [[ "$KILL_SWITCH" == 1 ]]; then
   iptables -w -t filter -A "$CHAIN_KILL" -d "$SERVER_IP/32" -j RETURN
   for net in 127.0.0.0/8 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16; do iptables -w -t filter -A "$CHAIN_KILL" -d "$net" -j RETURN; done
   iptables -w -t filter -A "$CHAIN_KILL" -m mark --mark "$MARK_VPN" -j RETURN
+  if [[ "$ROUTING_MODE" == iran_direct ]]; then iptables -w -t filter -A "$CHAIN_KILL" -m mark --mark "$MARK_DIRECT" -j RETURN; fi
   iptables -w -t filter -A "$CHAIN_KILL" -j REJECT
   ipt_unhook filter OUTPUT "$CHAIN_KILL"; iptables -w -t filter -A OUTPUT -j "$CHAIN_KILL"
 fi
@@ -329,6 +381,9 @@ RULE_VPN_PREF=$RULE_VPN_PREF
 RULE_DIRECT_PREF=$RULE_DIRECT_PREF
 SYSTEM_VPN=1
 KILL_SWITCH=$KILL_SWITCH
+ROUTING_MODE=$ROUTING_MODE
+IRAN_SET_READY=$IRAN_READY
+IRAN_SET_ENTRIES=${IRAN_ENTRIES:-0}
 HOTSPOT_VPN=$HOTSPOT_VPN
 HOTSPOT_IFACE_REQUEST=$HOTSPOT_IFACE_REQUEST
 HOTSPOT_CONNECTION=$HOTSPOT_CONNECTION
@@ -343,6 +398,8 @@ chmod 0644 "$STATE_FILE"
 printf '\nRestricted Surfshark IKEv2 is established\n'
 printf 'Virtual IPv4 : %s\nMSS clamp    : %s\nDNS          : %s\nInterface    : %s\n' "$VIRTUAL_IP" "$MSS" "$DNS_CSV" "$IFACE"
 printf 'Routing      : MARK %s -> table %s -> %s\n' "$MARK_VPN" "$ROUTE_TABLE" "$XFRM_IF"
+printf 'Routing mode : %s\n' "$([[ "$ROUTING_MODE" == iran_direct ]] && echo 'Iran direct · foreign VPN' || echo 'VPN everything')"
+printf 'Iran prefixes: %s\n' "${IRAN_ENTRIES:-0}"
 printf 'Policy pkts  : %s -> %s\n' "$BEFORE_PKTS" "$AFTER_PKTS"
 printf 'Kill switch  : %s\n' "$([[ "$KILL_SWITCH" == 1 ]] && echo ON || echo OFF)"
 printf 'Hotspot VPN  : %s\n' "$([[ "$HOTSPOT_VPN" == 1 && -n "$HOTSPOT_IFACE" ]] && printf 'ON · %s · %s' "$HOTSPOT_IFACE" "$HOTSPOT_SUBNET" || echo OFF)"
