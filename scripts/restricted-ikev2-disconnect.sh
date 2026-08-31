@@ -14,6 +14,7 @@ IRAN_SET=MILMIT_IRAN
 CHAIN_HOST=MILMIT_VPN_OUT
 CHAIN_DNS=MILMIT_DNS_MARK
 CHAIN_HOT=MILMIT_HOTSPOT_MARK
+CHAIN_HOT_DNS=MILMIT_HOTSPOT_DNS
 CHAIN_MSS=MILMIT_VPN_MSS
 CHAIN_KILL=MILMIT_VPN_KILL
 
@@ -33,10 +34,12 @@ remove_chains() {
   ipt_unhook mangle OUTPUT "$CHAIN_DNS"
   ipt_unhook mangle OUTPUT "$CHAIN_HOST"
   ipt_unhook mangle PREROUTING "$CHAIN_HOT"
+  ipt_unhook nat PREROUTING "$CHAIN_HOT_DNS"
   ipt_unhook mangle OUTPUT "$CHAIN_MSS"
   ipt_unhook mangle FORWARD "$CHAIN_MSS"
   ipt_unhook filter OUTPUT "$CHAIN_KILL"
-  for spec in "mangle:$CHAIN_DNS" "mangle:$CHAIN_HOST" "mangle:$CHAIN_HOT" "mangle:$CHAIN_MSS" "filter:$CHAIN_KILL"; do
+  ipt_unhook filter FORWARD "$CHAIN_KILL"
+  for spec in "mangle:$CHAIN_DNS" "mangle:$CHAIN_HOST" "mangle:$CHAIN_HOT" "nat:$CHAIN_HOT_DNS" "mangle:$CHAIN_MSS" "filter:$CHAIN_KILL"; do
     table="${spec%%:*}"; chain="${spec#*:}"
     iptables -w -t "$table" -F "$chain" 2>/dev/null || true
     iptables -w -t "$table" -X "$chain" 2>/dev/null || true
@@ -47,7 +50,6 @@ VIRTUAL_IP="$(state_get VIRTUAL_IP)"
 IFACE="$(state_get IFACE)"
 HOTSPOT_IFACE="$(state_get HOTSPOT_IFACE)"
 HOTSPOT_SUBNET="$(state_get HOTSPOT_SUBNET)"
-HOTSPOT_DNS="$(state_get HOTSPOT_DNS)"
 RECOVER_NETWORK="$(state_get RECOVER_NETWORK)"
 
 remove_chains
@@ -59,10 +61,6 @@ command -v ipset >/dev/null 2>&1 && ipset destroy "$IRAN_SET" >/dev/null 2>&1 ||
 
 if [[ -n "$HOTSPOT_SUBNET" && -n "$VIRTUAL_IP" ]]; then
   while iptables -w -t nat -D POSTROUTING -s "$HOTSPOT_SUBNET" -o "$XFRM_IF" -j SNAT --to-source "$VIRTUAL_IP" 2>/dev/null; do :; done
-fi
-if [[ -n "$HOTSPOT_IFACE" && -n "$HOTSPOT_SUBNET" && -n "$HOTSPOT_DNS" ]]; then
-  while iptables -w -t nat -D PREROUTING -i "$HOTSPOT_IFACE" -s "$HOTSPOT_SUBNET" -p udp --dport 53 -j DNAT --to-destination "$HOTSPOT_DNS" 2>/dev/null; do :; done
-  while iptables -w -t nat -D PREROUTING -i "$HOTSPOT_IFACE" -s "$HOTSPOT_SUBNET" -p tcp --dport 53 -j DNAT --to-destination "$HOTSPOT_DNS" 2>/dev/null; do :; done
 fi
 if [[ -n "$HOTSPOT_SUBNET" ]] && command -v conntrack >/dev/null 2>&1; then
   conntrack -D -s "$HOTSPOT_SUBNET" >/dev/null 2>&1 || true
@@ -96,4 +94,4 @@ if command -v nmcli >/dev/null 2>&1; then
 fi
 
 rm -f "$STATE_FILE"
-echo "Restricted Surfshark IKEv2 disconnected. fwmark/IPSet policy, kill switch, XFRM interface, hotspot NAT, DNS and physical-link state were restored."
+echo "Restricted Surfshark IKEv2 disconnected. Per-device hotspot policy, fwmark/IPSet rules, kill switch, XFRM interface, NAT/DNS and physical-link state were restored."
