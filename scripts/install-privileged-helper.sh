@@ -7,6 +7,13 @@ ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 EXT_UUID=surfshark-ikev2@milmit.net
 EXT_DIR="/usr/share/gnome-shell/extensions/$EXT_UUID"
 
+# Iran Direct uses an efficient kernel IP set instead of thousands of ip rules.
+# Try to install it once on Debian/Ubuntu; if package access is unavailable the
+# normal VPN Everything mode still works and the GUI will explain the missing dependency.
+if ! command -v ipset >/dev/null 2>&1 && command -v apt-get >/dev/null 2>&1; then
+  DEBIAN_FRONTEND=noninteractive apt-get install -y ipset >/dev/null 2>&1 || true
+fi
+
 install -d -m 0755 /usr/lib/milmit-surfshark /usr/libexec /usr/share/polkit-1/actions "$EXT_DIR"
 install -o root -g root -m 0755 "$ROOT/scripts/restricted-ikev2-connect.sh" /usr/lib/milmit-surfshark/restricted-ikev2-connect.sh
 install -o root -g root -m 0755 "$ROOT/scripts/restricted-ikev2-disconnect.sh" /usr/lib/milmit-surfshark/restricted-ikev2-disconnect.sh
@@ -18,4 +25,9 @@ install -o root -g root -m 0644 "$ROOT/packaging/gnome-shell-extension/extension
 systemctl try-reload-or-restart polkit.service >/dev/null 2>&1 || true
 
 echo "MilMit Surfshark privileged helper and GNOME VPN indicator installed."
+if command -v ipset >/dev/null 2>&1; then
+  echo "Iran Direct dependency: ipset ready."
+else
+  echo "Iran Direct dependency: ipset not installed; VPN Everything remains available."
+fi
 echo "Future Connect/Disconnect operations from an active local session should not ask for the Ubuntu password again."
