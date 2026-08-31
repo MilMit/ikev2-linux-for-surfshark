@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+REAL_PKEXEC=/usr/bin/pkexec
+HELPER=/usr/libexec/milmit-surfshark-helper
+
+# The current GTK client invokes `pkexec bash <repo-helper> ...`. Intercept
+# only our two known VPN helpers and route them to the installed, root-owned
+# helper whose Polkit action allows the active local session without another
+# password prompt. Everything else is delegated untouched to real pkexec.
+if [[ "${1:-}" == "bash" && -n "${2:-}" ]]; then
+  script="${2}"
+  case "$script" in
+    */scripts/restricted-ikev2-connect.sh)
+      endpoint="${3:-}"
+      username="${4:-}"
+      exec "$REAL_PKEXEC" "$HELPER" connect "$endpoint" "$username"
+      ;;
+    */scripts/restricted-ikev2-disconnect.sh)
+      exec "$REAL_PKEXEC" "$HELPER" disconnect
+      ;;
+  esac
+fi
+
+exec "$REAL_PKEXEC" "$@"
