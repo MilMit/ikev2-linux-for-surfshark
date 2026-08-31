@@ -18,6 +18,8 @@ STATE_FILE="$STATE_DIR/restricted.state"
 CRED_DIR=/etc/milmit-surfshark
 CRED_FILE="$CRED_DIR/credentials"
 MSS=1200
+NM_MARKER="Surfshark IKEv2 (Connected)"
+NM_MARKER_IF="milmitvpn0"
 
 if [[ $EUID -ne 0 ]]; then
   echo "This helper must run as root." >&2
@@ -41,9 +43,6 @@ if [[ -n "$PASSWORD_FILE" ]]; then
   SERVICE_PASS="$(cat -- "$PASSWORD_FILE")"
   rm -f -- "$PASSWORD_FILE" || true
 else
-  # Compatibility path for GUI builds that pipe the password to pkexec/bash.
-  # Only attempt a read when stdin is not a terminal so command-line use does
-  # not unexpectedly block waiting for input.
   if [[ ! -t 0 ]]; then
     IFS= read -r SERVICE_PASS || true
   fi
@@ -65,6 +64,7 @@ else
   exit 66
 fi
 
+# Clear previous temporary network state before a new attempt.
 if [[ -f "$STATE_FILE" ]]; then
   # shellcheck disable=SC1090
   source "$STATE_FILE" || true
@@ -74,6 +74,10 @@ if [[ -f "$STATE_FILE" ]]; then
   if [[ -n "${IFACE:-}" ]] && command -v resolvectl >/dev/null 2>&1; then
     resolvectl revert "$IFACE" 2>/dev/null || true
   fi
+fi
+if command -v nmcli >/dev/null 2>&1; then
+  nmcli connection down "$NM_MARKER" >/dev/null 2>&1 || true
+  nmcli connection delete "$NM_MARKER" >/dev/null 2>&1 || true
 fi
 
 install -d -m 0755 /etc/swanctl/conf.d
@@ -148,6 +152,30 @@ if command -v resolvectl >/dev/null 2>&1 && [[ -n "$IFACE" ]]; then
   resolvectl flush-caches || true
 fi
 
+TRACE="$(curl -4 --interface "$VIRTUAL_IP" --max-time 10 -ks https://1.1.1.1/cdn-cgi/trace || true)"
+PUBLIC_IP="$(printf '%s\n' "$TRACE" | sed -n 's/^ip=//p' | head -n1)"
+EXIT_COUNTRY="$(printf '%s\n' "$TRACE" | sed -n 's/^loc=//p' | head -n1)"
+
+if [[ -z "$PUBLIC_IP" ]]; then
+  printf '\nData-path test: FAILED\n'
+  exit 68
+fi
+
+# NetworkManager cannot own this tunnel because the working restricted backend
+# is direct strongSwan. Create a harmless NetworkManager marker connection so
+# Ubuntu/GNOME visibly shows an active Surfshark connection while the real
+# traffic remains handled by strongSwan/XFRM. The marker carries no routes/DNS.
+NM_MARKER_ACTIVE=0
+if command -v nmcli >/dev/null 2>&1 && systemctl is-active --quiet NetworkManager.service 2>/dev/null; then
+  nmcli connection delete "$NM_MARKER" >/dev/null 2>&1 || true
+  if nmcli connection add type dummy ifname "$NM_MARKER_IF" con-name "$NM_MARKER" \
+      ipv4.method disabled ipv6.method disabled connection.autoconnect no >/dev/null 2>&1; then
+    if nmcli connection up "$NM_MARKER" >/dev/null 2>&1; then
+      NM_MARKER_ACTIVE=1
+    fi
+  fi
+fi
+
 install -d -m 0755 "$STATE_DIR"
 umask 077
 cat > "$STATE_FILE" <<EOF
@@ -155,21 +183,15 @@ VIRTUAL_IP=$VIRTUAL_IP
 IFACE=$IFACE
 MSS_VALUE=$MSS
 SERVER_IP=$SERVER_IP
+NM_MARKER=$NM_MARKER
+NM_MARKER_ACTIVE=$NM_MARKER_ACTIVE
 EOF
-
-TRACE="$(curl -4 --interface "$VIRTUAL_IP" --max-time 10 -ks https://1.1.1.1/cdn-cgi/trace || true)"
-PUBLIC_IP="$(printf '%s\n' "$TRACE" | sed -n 's/^ip=//p' | head -n1)"
-EXIT_COUNTRY="$(printf '%s\n' "$TRACE" | sed -n 's/^loc=//p' | head -n1)"
 
 printf '\nRestricted Surfshark IKEv2 is established\n'
 printf 'Virtual IPv4 : %s\n' "$VIRTUAL_IP"
 printf 'MSS clamp    : %s\n' "$MSS"
 printf 'DNS          : 162.252.172.57, 149.154.159.92\n'
 printf 'Interface    : %s\n' "$IFACE"
+printf 'Ubuntu marker: %s\n' "$([[ "$NM_MARKER_ACTIVE" == 1 ]] && echo active || echo unavailable)"
 printf '%s\n' "$SA_TEXT"
-if [[ -n "$PUBLIC_IP" ]]; then
-  printf '\nData-path test: OK\nPublic IPv4 : %s\nExit country: %s\n' "$PUBLIC_IP" "${EXIT_COUNTRY:-unknown}"
-else
-  printf '\nData-path test: FAILED\n'
-  exit 68
-fi
+printf '\nData-path test: OK\nPublic IPv4 : %s\nExit country: %s\n' "$PUBLIC_IP" "${EXIT_COUNTRY:-unknown}"
