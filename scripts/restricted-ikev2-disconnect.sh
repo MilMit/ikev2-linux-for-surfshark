@@ -8,6 +8,7 @@ XFRM_IF=milmitxfrm0
 XFRM_IF_ID=42
 ROUTE_TABLE=220
 HOTSPOT_RULE_PREF=179
+SYSTEM_RULE_PREF=180
 HOTSPOT_XFRM_PRIORITY=383614
 
 if [[ $EUID -ne 0 ]]; then echo "This helper must run as root." >&2; exit 77; fi
@@ -32,7 +33,6 @@ purge_legacy_hotspot_rules() {
   [[ -n "$hs_subnet" ]] || return 0
   while IFS= read -r rule; do
     [[ "$rule" == *"-s $hs_subnet"* && "$rule" == *"-j SNAT --to-source 10.6."* ]] || continue
-    # shellcheck disable=SC2086
     iptables -t nat -D POSTROUTING ${rule#-A POSTROUTING } >/dev/null 2>&1 || true
   done < <(iptables -t nat -S POSTROUTING 2>/dev/null || true)
   if [[ -n "$hs_iface" ]]; then
@@ -50,8 +50,13 @@ HOTSPOT_DNS="$(state_get HOTSPOT_DNS)"
 RECOVER_NETWORK="$(state_get RECOVER_NETWORK)"
 SERVER_IP="$(state_get SERVER_IP)"
 
-# Remove our auxiliary hotspot policy before strongSwan removes the negotiated
-# policy/state, otherwise a stale policy can survive a failed or interrupted run.
+# Remove host policy routing first so traffic immediately falls back to the
+# physical connection even if strongSwan termination takes a moment.
+while ip rule del pref "$SYSTEM_RULE_PREF" lookup "$ROUTE_TABLE" >/dev/null 2>&1; do :; done
+if [[ -n "$HOTSPOT_SUBNET" ]]; then
+  while ip rule del pref "$HOTSPOT_RULE_PREF" from "$HOTSPOT_SUBNET" lookup "$ROUTE_TABLE" >/dev/null 2>&1; do :; done
+fi
+
 if [[ -n "$HOTSPOT_SUBNET" ]]; then
   ip xfrm policy delete src "$HOTSPOT_SUBNET" dst 0.0.0.0/0 dir out priority "$HOTSPOT_XFRM_PRIORITY" if_id "$XFRM_IF_ID" >/dev/null 2>&1 || true
 fi
@@ -64,7 +69,6 @@ if [[ -n "$VIRTUAL_IP" ]]; then
 fi
 
 if [[ -n "$HOTSPOT_SUBNET" ]]; then
-  while ip rule del pref "$HOTSPOT_RULE_PREF" from "$HOTSPOT_SUBNET" lookup "$ROUTE_TABLE" >/dev/null 2>&1; do :; done
   if [[ -n "$VIRTUAL_IP" ]]; then
     while iptables -t nat -D POSTROUTING -s "$HOTSPOT_SUBNET" ! -d "$HOTSPOT_SUBNET" -o "$XFRM_IF" -j SNAT --to-source "$VIRTUAL_IP" 2>/dev/null; do :; done
   fi
@@ -83,12 +87,14 @@ fi
 
 ip route del default dev "$XFRM_IF" table "$ROUTE_TABLE" >/dev/null 2>&1 || true
 [[ -z "$SERVER_IP" ]] || ip route del throw "$SERVER_IP" table "$ROUTE_TABLE" >/dev/null 2>&1 || true
+for net in 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16; do
+  ip route del throw "$net" table "$ROUTE_TABLE" >/dev/null 2>&1 || true
+done
 ip link del "$XFRM_IF" >/dev/null 2>&1 || true
 
 if [[ -n "$VIRTUAL_IP" ]]; then
   while IFS= read -r route; do
     [[ "$route" == *"src $VIRTUAL_IP"* ]] || continue
-    # shellcheck disable=SC2086
     ip route del table "$ROUTE_TABLE" $route >/dev/null 2>&1 || true
   done < <(ip route show table "$ROUTE_TABLE" 2>/dev/null || true)
 fi
@@ -118,4 +124,4 @@ if command -v nmcli >/dev/null 2>&1; then
 fi
 
 rm -f "$STATE_FILE"
-echo "Restricted Surfshark IKEv2 disconnected. XFRM interface/policies, stale hotspot NAT/conntrack state, VPN routes, DNS and physical-link state were restored."
+echo "Restricted Surfshark IKEv2 disconnected. System VPN rule, XFRM interface/policies, hotspot NAT, VPN routes, DNS and physical-link state were restored."
