@@ -6,6 +6,7 @@ STATE_FILE=/run/milmit-surfshark/restricted.state
 VIRTUAL_IP=""
 IFACE=""
 MSS_VALUE=1200
+NM_MARKER="Surfshark IKEv2 (Connected)"
 
 if [[ $EUID -ne 0 ]]; then
   echo "This helper must run as root." >&2
@@ -28,5 +29,10 @@ if [[ -n "${IFACE:-}" ]] && command -v resolvectl >/dev/null 2>&1; then
   resolvectl flush-caches 2>/dev/null || true
 fi
 
+if command -v nmcli >/dev/null 2>&1; then
+  nmcli connection down "${NM_MARKER:-Surfshark IKEv2 (Connected)}" >/dev/null 2>&1 || true
+  nmcli connection delete "${NM_MARKER:-Surfshark IKEv2 (Connected)}" >/dev/null 2>&1 || true
+fi
+
 rm -f "$STATE_FILE"
-echo "Restricted Surfshark IKEv2 disconnected and network overrides reverted."
+echo "Restricted Surfshark IKEv2 disconnected; Ubuntu marker and network overrides reverted."
