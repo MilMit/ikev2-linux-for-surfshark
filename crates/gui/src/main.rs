@@ -1,6 +1,8 @@
+mod bundled_endpoints;
 mod locations;
 
 use adw::prelude::*;
+use bundled_endpoints::for_host as bundled_for_host;
 use gtk::{glib, Orientation};
 use locations::{by_host, by_id, LOCATIONS};
 use std::collections::HashSet;
@@ -125,7 +127,7 @@ fn failure_log() -> String {
             "NetworkManager",
             "--no-pager",
             "-n",
-            "120",
+            "140",
             "-o",
             "short-precise",
         ],
@@ -187,13 +189,15 @@ fn configure_profile(
     }
 
     log.push_str("[configure IKEv2 endpoint and credentials]\n");
-    log.push_str(&format!("address: {address}\nserver identity: {server_identity}\nforce NAT-T encapsulation: yes\n"));
+    log.push_str(&format!(
+        "address: {address}\nserver identity: {server_identity}\nforce NAT-T encapsulation: yes\n"
+    ));
     log.push_str(&run_owned("nmcli", &args));
     log
 }
 
 fn ipv4_is_public(ip: Ipv4Addr) -> bool {
-    let octets = ip.octets();
+    let o = ip.octets();
     if ip.is_private()
         || ip.is_loopback()
         || ip.is_link_local()
@@ -204,16 +208,13 @@ fn ipv4_is_public(ip: Ipv4Addr) -> bool {
     {
         return false;
     }
-    // Shared carrier-grade NAT 100.64.0.0/10.
-    if octets[0] == 100 && (64..=127).contains(&octets[1]) {
+    if o[0] == 100 && (64..=127).contains(&o[1]) {
         return false;
     }
-    // Benchmarking range 198.18.0.0/15.
-    if octets[0] == 198 && (octets[1] == 18 || octets[1] == 19) {
+    if o[0] == 198 && (o[1] == 18 || o[1] == 19) {
         return false;
     }
-    // Reserved 240.0.0.0/4 and 0.0.0.0/8.
-    if octets[0] == 0 || octets[0] >= 240 {
+    if o[0] == 0 || o[0] >= 240 {
         return false;
     }
     true
@@ -263,9 +264,9 @@ fn doh_query(host: &str, resolver_host: &str, resolver_ip: &str, path: &str) -> 
         .args([
             "-4",
             "--max-time",
-            "7",
+            "5",
             "--connect-timeout",
-            "4",
+            "3",
             "--fail",
             "--silent",
             "--show-error",
@@ -287,9 +288,9 @@ fn doh_query(host: &str, resolver_host: &str, resolver_ip: &str, path: &str) -> 
                 Vec::new()
             };
             let detail = if out.status.success() {
-                format!("{resolver_host} via pinned {resolver_ip}: {} public IPv4 result(s)", ips.len())
+                format!("{resolver_host} via pinned {resolver_ip}: {} result(s)", ips.len())
             } else {
-                format!("{resolver_host} via pinned {resolver_ip}: curl failed: {stderr}")
+                format!("{resolver_host} via pinned {resolver_ip}: failed: {stderr}")
             };
             (ips, detail)
         }
@@ -298,16 +299,30 @@ fn doh_query(host: &str, resolver_host: &str, resolver_ip: &str, path: &str) -> 
 }
 
 fn secure_ipv4_endpoints(host: &str) -> (Vec<String>, String) {
-    let system_raw = run("getent", &["ahostsv4", host]);
-    let system_all = extract_public_ipv4s(&system_raw);
-    let system_has_only_rejected = !system_raw.trim().is_empty() && system_all.is_empty();
-
+    let mut seen = HashSet::new();
+    let mut endpoints = Vec::new();
     let mut log = String::new();
+
+    // Offline bootstrap comes first. This is the crucial path for networks that
+    // poison ordinary DNS and also block well-known DoH resolvers.
+    let bundled = bundled_for_host(host);
+    log.push_str(&format!("Bundled bootstrap endpoints: {}\n", bundled.len()));
+    for ip in bundled {
+        if let Ok(parsed) = ip.parse::<Ipv4Addr>() {
+            if ipv4_is_public(parsed) && seen.insert((*ip).to_string()) {
+                endpoints.push((*ip).to_string());
+                log.push_str(&format!("  bundled: {ip}\n"));
+            }
+        }
+    }
+
+    let system_raw = run("getent", &["ahostsv4", host]);
+    let system_public = extract_public_ipv4s(&system_raw);
     log.push_str("System resolver inspection:\n");
     log.push_str(system_raw.trim());
     log.push('\n');
-    if system_has_only_rejected {
-        log.push_str("DNS hijack/sinkhole suspected: system response contains no routable public IPv4. Private/bogon answers were rejected.\n");
+    if !system_raw.trim().is_empty() && system_public.is_empty() {
+        log.push_str("DNS hijack/sinkhole suspected; private/bogon answers rejected.\n");
     }
 
     let resolvers = [
@@ -316,9 +331,6 @@ fn secure_ipv4_endpoints(host: &str) -> (Vec<String>, String) {
         ("dns.google", "8.8.8.8", "/resolve?name="),
         ("dns.google", "8.8.4.4", "/resolve?name="),
     ];
-
-    let mut seen = HashSet::new();
-    let mut endpoints = Vec::new();
     for (resolver_host, resolver_ip, path) in resolvers {
         let (ips, detail) = doh_query(host, resolver_host, resolver_ip, path);
         log.push_str(&detail);
@@ -330,24 +342,17 @@ fn secure_ipv4_endpoints(host: &str) -> (Vec<String>, String) {
         }
     }
 
-    // If HTTPS DNS is unavailable but the system resolver gave genuinely public
-    // addresses, keep them as a last-resort fallback. Never accept private/bogon
-    // sinkhole answers such as 10.10.34.36.
-    if endpoints.is_empty() {
-        for ip in system_ipv4_endpoints(host) {
-            if seen.insert(ip.clone()) {
-                endpoints.push(ip);
-            }
-        }
-        if !endpoints.is_empty() {
-            log.push_str("Secure DNS produced no answer; using validated public system-DNS fallback.\n");
+    for ip in system_ipv4_endpoints(host) {
+        if seen.insert(ip.clone()) {
+            endpoints.push(ip);
+            log.push_str(&format!("  validated system DNS: {ip}\n"));
         }
     }
 
     if endpoints.is_empty() {
-        log.push_str("No safe public IPv4 endpoint was discovered.\n");
+        log.push_str("No safe public IPv4 endpoint is available for this location.\n");
     } else {
-        log.push_str("Accepted endpoints:\n");
+        log.push_str("Final connection order:\n");
         for ip in &endpoints {
             log.push_str(&format!("  - {ip}\n"));
         }
@@ -355,25 +360,15 @@ fn secure_ipv4_endpoints(host: &str) -> (Vec<String>, String) {
     (endpoints, log)
 }
 
-fn endpoint_candidates(host: &str, restricted_mode: bool) -> (Vec<String>, String) {
-    if !restricted_mode {
-        return (vec![host.to_string()], "Standard mode: hostname is resolved by NetworkManager/system DNS.\n".to_string());
+fn endpoint_candidates(host: &str, restricted: bool) -> (Vec<String>, String) {
+    if restricted {
+        secure_ipv4_endpoints(host)
+    } else {
+        (
+            vec![host.to_string()],
+            "Standard mode: NetworkManager resolves the selected hostname.\n".to_string(),
+        )
     }
-
-    let (secure, mut log) = secure_ipv4_endpoints(host);
-    let mut candidates = Vec::new();
-    // In restricted mode do not try the hostname first when DNS hijacking may be
-    // present. Use only validated public IPs while preserving the hostname as
-    // server-identity for certificate verification.
-    for ip in secure {
-        if !candidates.contains(&ip) {
-            candidates.push(ip);
-        }
-    }
-    if candidates.is_empty() {
-        log.push_str("Restricted mode intentionally refused to use the raw hostname because no trustworthy public endpoint was available.\n");
-    }
-    (candidates, log)
 }
 
 fn disconnect_quietly() {
@@ -382,23 +377,11 @@ fn disconnect_quietly() {
     }
 }
 
-fn try_endpoint(
-    endpoint: &str,
-    identity: &str,
-    username: &str,
-    password: Option<&str>,
-) -> (bool, String) {
+fn try_endpoint(endpoint: &str, identity: &str, username: &str, password: Option<&str>) -> (bool, String) {
     disconnect_quietly();
-
     let mut log = configure_profile(endpoint, identity, username, password);
     log.push_str("\n[activate]\n");
-    let up = nm(&[
-        "--wait",
-        CONNECT_WAIT_SECONDS,
-        "connection",
-        "up",
-        PROFILE,
-    ]);
+    let up = nm(&["--wait", CONNECT_WAIT_SECONDS, "connection", "up", PROFILE]);
     log.push_str(&up);
     log.push_str("\n[active check]\n");
     let active = nm_active();
@@ -407,19 +390,16 @@ fn try_endpoint(
 }
 
 fn ping_ms(host: &str) -> Option<u32> {
-    if host.is_empty() {
-        return None;
-    }
+    let target = bundled_for_host(host).first().copied().unwrap_or(host);
     let output = Command::new("ping")
-        .args(["-n", "-c", "1", "-W", "1", host])
+        .args(["-n", "-c", "1", "-W", "1", target])
         .output()
         .ok()?;
     if !output.status.success() {
         return None;
     }
     let text = String::from_utf8_lossy(&output.stdout);
-    let marker = "time=";
-    let start = text.find(marker)? + marker.len();
+    let start = text.find("time=")? + 5;
     let rest = &text[start..];
     let end = rest.find(|c: char| c == ' ' || c == '\n').unwrap_or(rest.len());
     rest[..end].parse::<f64>().ok().map(|v| v.round() as u32)
@@ -432,25 +412,19 @@ fn scan_latencies() -> Vec<(String, Option<u32>)> {
         .collect()
 }
 
-fn repopulate_locations(
-    combo: &gtk::ComboBoxText,
-    results: &[(String, Option<u32>)],
-    connected_host: Option<&str>,
-) {
+fn repopulate_locations(combo: &gtk::ComboBoxText, results: &[(String, Option<u32>)], connected_host: Option<&str>) {
     let active = combo.active_id().map(|s| s.to_string());
     combo.remove_all();
-
     for item in LOCATIONS {
         let latency = results
             .iter()
             .find(|(id, _)| id == item.id)
             .and_then(|(_, value)| *value);
-        let is_connected = connected_host == Some(item.host) && nm_active();
-        let label = if is_connected {
-            match latency {
-                Some(ms) => format!("🟢 {} · Connected · {} ms", item.label, ms),
-                None => format!("🟢 {} · Connected", item.label),
-            }
+        let connected = connected_host == Some(item.host) && nm_active();
+        let label = if connected {
+            latency
+                .map(|ms| format!("🟢 {} · Connected · {} ms", item.label, ms))
+                .unwrap_or_else(|| format!("🟢 {} · Connected", item.label))
         } else {
             match latency {
                 Some(ms) if ms < 100 => format!("🟢 {} · {} ms", item.label, ms),
@@ -461,7 +435,6 @@ fn repopulate_locations(
         };
         combo.append(Some(item.id), &label);
     }
-
     if let Some(id) = active {
         combo.set_active_id(Some(&id));
     } else {
@@ -480,10 +453,10 @@ fn install_css() {
         ".hero { padding: 28px; border-radius: 22px; background: linear-gradient(135deg, rgba(65,83,255,.18), rgba(40,190,155,.12)); }\n\
          .hero-title { font-size: 28px; font-weight: 800; }\n\
          .status-pill { padding: 7px 12px; border-radius: 999px; background: alpha(@accent_bg_color, .14); }\n\
-         .location-box { padding: 14px; border-radius: 14px; }\n\
+         .panel { padding: 14px; border-radius: 14px; }\n\
          .compat-box { padding: 12px; border-radius: 14px; background: alpha(@warning_bg_color, .08); }\n\
          .primary-connect { min-height: 44px; padding-left: 30px; padding-right: 30px; }\n\
-         .ping-note { font-size: 11px; }\n\
+         .small-note { font-size: 11px; }\n\
          .diag-box { font-size: 12px; }",
     );
     if let Some(display) = gtk::gdk::Display::default() {
@@ -507,25 +480,15 @@ fn build_ui(app: &adw::Application) {
     install_css();
 
     let header = adw::HeaderBar::new();
-    let title = adw::WindowTitle::new("Surfshark IKEv2", "Unofficial Linux client by MilMit");
-    header.set_title_widget(Some(&title));
+    header.set_title_widget(Some(&adw::WindowTitle::new(
+        "Surfshark IKEv2",
+        "Unofficial Linux client by MilMit",
+    )));
 
     let status = gtk::Label::builder()
         .label(if nm_active() { "Connected" } else { "Ready" })
         .css_classes(["status-pill"])
         .build();
-    let hero_title = gtk::Label::builder()
-        .label("Private. Fast. Native IKEv2.")
-        .halign(gtk::Align::Start)
-        .css_classes(["hero-title"])
-        .build();
-    let hero_subtitle = gtk::Label::builder()
-        .label("Choose a Surfshark location and connect through Ubuntu NetworkManager.")
-        .halign(gtk::Align::Start)
-        .wrap(true)
-        .css_classes(["dim-label"])
-        .build();
-
     let spinner = gtk::Spinner::new();
     let hero_top = gtk::Box::new(Orientation::Horizontal, 12);
     hero_top.append(&status);
@@ -534,20 +497,27 @@ fn build_ui(app: &adw::Application) {
     let hero = gtk::Box::new(Orientation::Vertical, 10);
     hero.add_css_class("hero");
     hero.append(&hero_top);
-    hero.append(&hero_title);
-    hero.append(&hero_subtitle);
+    hero.append(
+        &gtk::Label::builder()
+            .label("Private. Fast. Native IKEv2.")
+            .halign(gtk::Align::Start)
+            .css_classes(["hero-title"])
+            .build(),
+    );
+    hero.append(
+        &gtk::Label::builder()
+            .label("Restricted mode can connect from bundled public endpoints without trusting poisoned DNS.")
+            .halign(gtk::Align::Start)
+            .wrap(true)
+            .css_classes(["dim-label"])
+            .build(),
+    );
 
-    let location_label = gtk::Label::builder()
-        .label("Location")
-        .halign(gtk::Align::Start)
-        .css_classes(["heading"])
-        .build();
     let location = gtk::ComboBoxText::new();
     location.set_hexpand(true);
     for item in LOCATIONS {
         location.append(Some(item.id), item.label);
     }
-
     if let Some(host) = saved_host() {
         if let Some(saved) = by_host(&host) {
             location.set_active_id(Some(saved.id));
@@ -557,68 +527,49 @@ fn build_ui(app: &adw::Application) {
     } else {
         location.set_active(Some(0));
     }
-
     let ping_button = gtk::Button::with_label("Test latency");
-    ping_button.set_tooltip_text(Some("Ping all listed locations in the background"));
-    let ping_note = gtk::Label::builder()
-        .label("🟢 fast  ·  🟡 medium  ·  🟠 slow  ·  ⚪ ICMP unavailable")
-        .halign(gtk::Align::Start)
-        .css_classes(["dim-label", "ping-note"])
-        .build();
-
     let location_row = gtk::Box::new(Orientation::Horizontal, 8);
     location_row.append(&location);
     location_row.append(&ping_button);
-
     let location_box = gtk::Box::new(Orientation::Vertical, 7);
-    location_box.add_css_class("location-box");
-    location_box.append(&location_label);
+    location_box.add_css_class("panel");
+    location_box.append(&gtk::Label::builder().label("Location").halign(gtk::Align::Start).css_classes(["heading"]).build());
     location_box.append(&location_row);
-    location_box.append(&ping_note);
+    location_box.append(&gtk::Label::builder().label("🟢 fast  ·  🟡 medium  ·  🟠 slow  ·  ⚪ no ICMP reply").halign(gtk::Align::Start).css_classes(["dim-label", "small-note"]).build());
 
     let restricted_mode = gtk::CheckButton::with_label("Restricted network / Iran compatibility mode");
     restricted_mode.set_active(true);
-    restricted_mode.set_tooltip_text(Some(
-        "Detects poisoned DNS, resolves Surfshark endpoints through pinned DNS-over-HTTPS, rejects private/bogon answers, then rotates through safe public IPv4 endpoints.",
-    ));
-    let restricted_note = gtk::Label::builder()
-        .label("Secure endpoint discovery: rejects DNS sinkholes such as 10.x.x.x, queries pinned Cloudflare/Google DoH over HTTPS, then connects to public IPs while preserving Surfshark certificate identity.")
-        .halign(gtk::Align::Start)
-        .wrap(true)
-        .css_classes(["dim-label", "ping-note"])
-        .build();
     let restricted_box = gtk::Box::new(Orientation::Vertical, 5);
     restricted_box.add_css_class("compat-box");
     restricted_box.append(&restricted_mode);
-    restricted_box.append(&restricted_note);
+    restricted_box.append(&gtk::Label::builder()
+        .label("Bundled endpoints first → pinned DoH refresh → validated public system DNS. Private/sinkhole answers such as 10.x.x.x are never used.")
+        .halign(gtk::Align::Start)
+        .wrap(true)
+        .css_classes(["dim-label", "small-note"])
+        .build());
 
-    let user = gtk::Entry::builder()
-        .placeholder_text("Surfshark service username")
-        .hexpand(true)
+    let cipher_note = gtk::Label::builder()
+        .label("Android Surfshark exposes AES-256-GCM and ChaCha20-Poly1305. Linux currently leaves cipher negotiation to strongSwan; this setting is not the cause of the instant DNS-stage failure.")
+        .halign(gtk::Align::Start)
+        .wrap(true)
+        .css_classes(["dim-label", "small-note"])
         .build();
+
+    let user = gtk::Entry::builder().placeholder_text("Surfshark service username").hexpand(true).build();
     if let Some(name) = saved_username() {
         user.set_text(&name);
     }
     let pass = gtk::PasswordEntry::builder()
-        .placeholder_text(if profile_exists() {
-            "Password saved · leave blank to reuse"
-        } else {
-            "Surfshark service password"
-        })
+        .placeholder_text(if profile_exists() { "Password saved · leave blank to reuse" } else { "Surfshark service password" })
         .show_peek_icon(true)
         .hexpand(true)
         .build();
     let creds_note = gtk::Label::builder()
-        .label(if profile_exists() {
-            "✓ Credentials are stored in NetworkManager. Password is not shown back to the app."
-        } else {
-            "Enter service credentials once. They will be saved by NetworkManager."
-        })
+        .label(if profile_exists() { "✓ Credentials are stored in NetworkManager" } else { "Enter service credentials once; NetworkManager stores them." })
         .halign(gtk::Align::Start)
-        .wrap(true)
         .css_classes(["dim-label"])
         .build();
-
     let credentials = gtk::Box::new(Orientation::Vertical, 8);
     credentials.append(&user);
     credentials.append(&pass);
@@ -630,19 +581,13 @@ fn build_ui(app: &adw::Application) {
     let disconnect = gtk::Button::with_label("Disconnect");
     disconnect.add_css_class("destructive-action");
     let refresh = gtk::Button::with_label("Refresh status");
-
     let actions = gtk::Box::new(Orientation::Horizontal, 8);
     actions.set_halign(gtk::Align::Center);
     actions.append(&connect);
     actions.append(&disconnect);
     actions.append(&refresh);
 
-    let ip_label = gtk::Label::builder()
-        .label("Public IP: —")
-        .halign(gtk::Align::Center)
-        .css_classes(["dim-label"])
-        .build();
-
+    let ip_label = gtk::Label::builder().label("Public IP: —").halign(gtk::Align::Center).css_classes(["dim-label"]).build();
     let text_view = gtk::TextView::builder()
         .editable(false)
         .monospace(true)
@@ -655,13 +600,7 @@ fn build_ui(app: &adw::Application) {
         .build();
     let buffer = text_view.buffer();
     buffer.set_text("Surfshark IKEv2 diagnostic log\n");
-
-    let scroller = gtk::ScrolledWindow::builder()
-        .vexpand(true)
-        .hexpand(true)
-        .min_content_height(240)
-        .child(&text_view)
-        .build();
+    let scroller = gtk::ScrolledWindow::builder().vexpand(true).hexpand(true).min_content_height(240).child(&text_view).build();
     let expander = gtk::Expander::new(Some("Advanced diagnostics"));
     expander.set_child(Some(&scroller));
 
@@ -673,6 +612,7 @@ fn build_ui(app: &adw::Application) {
     content.append(&hero);
     content.append(&location_box);
     content.append(&restricted_box);
+    content.append(&cipher_note);
     content.append(&credentials);
     content.append(&actions);
     content.append(&ip_label);
@@ -681,17 +621,15 @@ fn build_ui(app: &adw::Application) {
     let root = gtk::Box::new(Orientation::Vertical, 0);
     root.append(&header);
     root.append(&content);
-
     let window = adw::ApplicationWindow::builder()
         .application(app)
         .title("Surfshark IKEv2 for Linux")
         .default_width(760)
-        .default_height(760)
+        .default_height(790)
         .content(&root)
         .build();
 
     let (tx, rx) = mpsc::channel::<Event>();
-
     let status = Rc::new(status);
     let spinner = Rc::new(spinner);
     let connect = Rc::new(connect);
@@ -718,7 +656,6 @@ fn build_ui(app: &adw::Application) {
         let creds_note = Rc::clone(&creds_note);
         let pass = Rc::clone(&pass);
         let location = Rc::clone(&location);
-
         glib::timeout_add_local(Duration::from_millis(80), move || {
             while let Ok(event) = rx.try_recv() {
                 match event {
@@ -733,7 +670,7 @@ fn build_ui(app: &adw::Application) {
                     Event::Connected(ip, label) => {
                         spinner.stop();
                         status.set_label("🟢 Connected · Ubuntu VPN active");
-                        ip_label.set_label(&format!("{label}  ·  Public IP: {ip}"));
+                        ip_label.set_label(&format!("{label} · Public IP: {ip}"));
                         connect.set_sensitive(true);
                         disconnect.set_sensitive(true);
                         refresh.set_sensitive(true);
@@ -776,12 +713,7 @@ fn build_ui(app: &adw::Application) {
                         ping_button.set_label("Test latency");
                         let connected = if nm_active() { saved_host() } else { None };
                         repopulate_locations(&location, &results, connected.as_deref());
-                        let responsive = results.iter().filter(|(_, ms)| ms.is_some()).count();
-                        append_log(
-                            &buffer,
-                            "LATENCY SCAN",
-                            &format!("{} of {} locations replied to ICMP ping.", responsive, results.len()),
-                        );
+                        append_log(&buffer, "LATENCY SCAN", &format!("{} of {} locations replied.", results.iter().filter(|(_, ms)| ms.is_some()).count(), results.len()));
                     }
                 }
             }
@@ -796,125 +728,74 @@ fn build_ui(app: &adw::Application) {
         let location = Rc::clone(&location);
         let restricted_mode = Rc::clone(&restricted_mode);
         connect.connect_clicked(move |_| {
-            let id = location
-                .active_id()
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| "tr-ist".to_string());
+            let id = location.active_id().map(|s| s.to_string()).unwrap_or_else(|| "tr-ist".to_string());
             let Some(selected) = by_id(&id) else { return; };
             let username = user.text().trim().to_string();
             let password = pass.text().to_string();
             let restricted = restricted_mode.is_active();
             let tx = tx.clone();
-
             thread::spawn(move || {
                 let _ = tx.send(Event::Busy(format!("Connecting to {}…", selected.city)));
                 let before = public_ip();
-
                 if nm_active() {
-                    let down = nm(&["--wait", "5", "connection", "down", PROFILE]);
-                    let _ = tx.send(Event::Log("SWITCH LOCATION".into(), down));
+                    let _ = tx.send(Event::Log("SWITCH LOCATION".into(), nm(&["--wait", "5", "connection", "down", PROFILE])));
                 }
 
-                let effective_user = if username.is_empty() {
-                    saved_username().unwrap_or_default()
-                } else {
-                    username
-                };
-
+                let effective_user = if username.is_empty() { saved_username().unwrap_or_default() } else { username };
                 if effective_user.is_empty() {
-                    let _ = tx.send(Event::Failed(
-                        "Surfshark service username is required for first setup.".into(),
-                    ));
+                    let _ = tx.send(Event::Failed("Surfshark service username is required for first setup.".into()));
                     return;
                 }
-
                 let password_opt = if password.is_empty() {
                     if profile_exists() { None } else { Some("") }
                 } else {
                     Some(password.as_str())
                 };
-
                 if password_opt == Some("") {
-                    let _ = tx.send(Event::Failed(
-                        "Surfshark service password is required for first setup.".into(),
-                    ));
+                    let _ = tx.send(Event::Failed("Surfshark service password is required for first setup.".into()));
                     return;
                 }
 
                 let (candidates, resolver_log) = endpoint_candidates(selected.host, restricted);
                 let mut discovery = format!(
                     "Mode: {}\nSurfshark identity: {}\nCandidates: {}\n\n{}",
-                    if restricted { "Restricted network + secure DNS" } else { "Standard" },
+                    if restricted { "Restricted / offline-bootstrap" } else { "Standard" },
                     selected.host,
                     candidates.len(),
                     resolver_log
                 );
                 if !candidates.is_empty() {
                     discovery.push_str("Connection order:\n");
-                    for (index, candidate) in candidates.iter().enumerate() {
-                        discovery.push_str(&format!("  {}. {}\n", index + 1, candidate));
+                    for (i, candidate) in candidates.iter().enumerate() {
+                        discovery.push_str(&format!("  {}. {}\n", i + 1, candidate));
                     }
                 }
                 let _ = tx.send(Event::Log("SECURE ENDPOINT DISCOVERY".into(), discovery));
-
                 if candidates.is_empty() {
-                    let _ = tx.send(Event::Failed(
-                        "Restricted mode detected unsafe/poisoned DNS and could not obtain a safe public endpoint over pinned DNS-over-HTTPS. See Secure Endpoint Discovery log.".into(),
-                    ));
+                    let _ = tx.send(Event::Failed("No bundled or validated public endpoint exists for the selected location.".into()));
                     return;
                 }
 
-                for (index, endpoint) in candidates.iter().enumerate() {
-                    let _ = tx.send(Event::Busy(format!(
-                        "Trying {} · endpoint {}/{}…",
-                        selected.city,
-                        index + 1,
-                        candidates.len()
-                    )));
-
-                    let (active, attempt_log) = try_endpoint(
-                        endpoint,
-                        selected.host,
-                        &effective_user,
-                        password_opt,
-                    );
-                    let _ = tx.send(Event::Log(
-                        format!("IKEV2 ATTEMPT {}/{}", index + 1, candidates.len()),
-                        attempt_log,
-                    ));
-
+                for (i, endpoint) in candidates.iter().enumerate() {
+                    let _ = tx.send(Event::Busy(format!("Trying {} · endpoint {}/{}…", selected.city, i + 1, candidates.len())));
+                    let (active, attempt_log) = try_endpoint(endpoint, selected.host, &effective_user, password_opt);
+                    let _ = tx.send(Event::Log(format!("IKEV2 ATTEMPT {}/{}", i + 1, candidates.len()), attempt_log));
                     if !active {
                         continue;
                     }
-
                     thread::sleep(Duration::from_millis(900));
                     let after = public_ip();
-                    let _ = tx.send(Event::Log(
-                        "PUBLIC IP CHECK".into(),
-                        format!("before: {}\nafter: {}\nendpoint: {}", before.trim(), after.trim(), endpoint),
-                    ));
-
+                    let _ = tx.send(Event::Log("PUBLIC IP CHECK".into(), format!("before: {}\nafter: {}\nendpoint: {}", before.trim(), after.trim(), endpoint)));
                     if !after.trim().is_empty() && after.trim() != before.trim() {
-                        let _ = tx.send(Event::Log(
-                            "COMPATIBILITY RESULT".into(),
-                            format!("Success via validated pinned IPv4 endpoint: {endpoint}"),
-                        ));
-                        let _ = tx.send(Event::Connected(
-                            after.trim().to_string(),
-                            selected.label.into(),
-                        ));
+                        let _ = tx.send(Event::Log("COMPATIBILITY RESULT".into(), format!("Success via pinned public endpoint: {endpoint}")));
+                        let _ = tx.send(Event::Connected(after.trim().to_string(), selected.label.into()));
                         return;
                     }
-
                     disconnect_quietly();
                 }
 
-                let log = failure_log();
-                let _ = tx.send(Event::Log("NETWORKMANAGER FAILURE LOG".into(), log));
-                let _ = tx.send(Event::Failed(format!(
-                    "All {} safe endpoint candidate(s) failed or did not change public IPv4. Open Advanced diagnostics to see which IKEv2 stage failed.",
-                    candidates.len()
-                )));
+                let _ = tx.send(Event::Log("NETWORKMANAGER FAILURE LOG".into(), failure_log()));
+                let _ = tx.send(Event::Failed(format!("All {} endpoint candidate(s) failed.", candidates.len())));
             });
         });
     }
@@ -927,11 +808,7 @@ fn build_ui(app: &adw::Application) {
                 let _ = tx.send(Event::Busy("Disconnecting…".into()));
                 let out = nm(&["--wait", "5", "connection", "down", PROFILE]);
                 let _ = tx.send(Event::Log("DISCONNECT".into(), out));
-                if nm_active() {
-                    let _ = tx.send(Event::Failed("VPN still appears active.".into()));
-                } else {
-                    let _ = tx.send(Event::Disconnected);
-                }
+                let _ = tx.send(if nm_active() { Event::Failed("VPN still appears active.".into()) } else { Event::Disconnected });
             });
         });
     }
@@ -942,9 +819,7 @@ fn build_ui(app: &adw::Application) {
             let tx = tx.clone();
             thread::spawn(move || {
                 let _ = tx.send(Event::Busy("Refreshing…".into()));
-                let active = nm_active();
-                let text = nm_status();
-                let _ = tx.send(Event::Refreshed(active, text));
+                let _ = tx.send(Event::Refreshed(nm_active(), nm_status()));
             });
         });
     }
@@ -955,8 +830,7 @@ fn build_ui(app: &adw::Application) {
             let tx = tx.clone();
             thread::spawn(move || {
                 let _ = tx.send(Event::PingStarted);
-                let results = scan_latencies();
-                let _ = tx.send(Event::PingResults(results));
+                let _ = tx.send(Event::PingResults(scan_latencies()));
             });
         });
     }
@@ -965,8 +839,7 @@ fn build_ui(app: &adw::Application) {
         let tx = tx.clone();
         thread::spawn(move || {
             let _ = tx.send(Event::PingStarted);
-            let results = scan_latencies();
-            let _ = tx.send(Event::PingResults(results));
+            let _ = tx.send(Event::PingResults(scan_latencies()));
         });
     }
 
