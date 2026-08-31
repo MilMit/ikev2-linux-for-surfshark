@@ -48,7 +48,6 @@ else
   exit 66
 fi
 
-# Clean up previous restricted session state before reconnecting.
 if [[ -f "$STATE_FILE" ]]; then
   # shellcheck disable=SC1090
   source "$STATE_FILE" || true
@@ -139,13 +138,13 @@ if command -v resolvectl >/dev/null 2>&1 && [[ -n "$IFACE" ]]; then
 fi
 
 install -d -m 0755 "$STATE_DIR"
-umask 077
 cat > "$STATE_FILE" <<EOF
 VIRTUAL_IP=$VIRTUAL_IP
 IFACE=$IFACE
 MSS_VALUE=$MSS
 SERVER_IP=$SERVER_IP
 EOF
+chmod 0644 "$STATE_FILE"
 
 TRACE="$(curl -4 --interface "$VIRTUAL_IP" --max-time 10 -ks https://1.1.1.1/cdn-cgi/trace || true)"
 PUBLIC_IP="$(printf '%s\n' "$TRACE" | sed -n 's/^ip=//p' | head -n1)"
