@@ -4,17 +4,20 @@ set -euo pipefail
 REAL_PKEXEC=/usr/bin/pkexec
 HELPER=/usr/libexec/milmit-surfshark-helper
 
-# The current GTK client invokes `pkexec bash <repo-helper> ...`. Intercept
-# only our two known VPN helpers and route them to the installed, root-owned
-# helper whose Polkit action allows the active local session without another
-# password prompt. Everything else is delegated untouched to real pkexec.
+# Intercept only MilMit's known VPN helpers. Stdin is intentionally preserved,
+# so the first-run Surfshark service password can be handed to the root-owned
+# helper without putting the secret on the command line.
 if [[ "${1:-}" == "bash" && -n "${2:-}" ]]; then
   script="${2}"
   case "$script" in
     */scripts/restricted-ikev2-connect.sh)
       endpoint="${3:-}"
       username="${4:-}"
-      exec "$REAL_PKEXEC" "$HELPER" connect "$endpoint" "$username"
+      mss="${5:-1200}"
+      dns_csv="${6:-162.252.172.57,149.154.159.92}"
+      hotspot_vpn="${7:-1}"
+      recover_network="${8:-1}"
+      exec "$REAL_PKEXEC" "$HELPER" connect "$endpoint" "$username" "$mss" "$dns_csv" "$hotspot_vpn" "$recover_network"
       ;;
     */scripts/restricted-ikev2-disconnect.sh)
       exec "$REAL_PKEXEC" "$HELPER" disconnect
