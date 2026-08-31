@@ -20,7 +20,9 @@ if [[ "${1:-}" == "bash" && -n "${2:-}" ]]; then
       hotspot_iface="${9:-auto}"
       kill_switch="${10:-0}"
       routing_mode="${11:-vpn_all}"
-      exec "$REAL_PKEXEC" "$HELPER" connect "$endpoint" "$username" "$mss" "$dns_csv" "$hotspot_vpn" "$recover_network" "$hotspot_iface" "$kill_switch" "$routing_mode"
+      hotspot_vpn_macs="${12:-}"
+      hotspot_direct_macs="${13:-}"
+      exec "$REAL_PKEXEC" "$HELPER" connect "$endpoint" "$username" "$mss" "$dns_csv" "$hotspot_vpn" "$recover_network" "$hotspot_iface" "$kill_switch" "$routing_mode" "$hotspot_vpn_macs" "$hotspot_direct_macs"
       ;;
     */scripts/restricted-ikev2-disconnect.sh)
       exec "$REAL_PKEXEC" "$HELPER" disconnect
