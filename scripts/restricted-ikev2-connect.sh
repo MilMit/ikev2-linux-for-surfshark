@@ -2,11 +2,13 @@
 set -euo pipefail
 
 # Direct strongSwan backend modeled on Surfshark Android's IKEv2 handshake.
-# Usage (root): restricted-ikev2-connect.sh <server-ip> <service-user>
-# Password is read from stdin. An empty stdin reuses the root-only saved secret.
+# Usage (root): restricted-ikev2-connect.sh <server-ip> <service-user> [password-file]
+# The GUI passes a short-lived 0600 file path instead of putting the password
+# in argv. If omitted/empty, the root-only saved credential is reused.
 
 SERVER_IP="${1:-}"
 SERVICE_USER="${2:-}"
+PASSWORD_FILE="${3:-}"
 CONF=/etc/swanctl/conf.d/milmit-surfshark-restricted.conf
 CONN_NAME=milmit-surfshark-restricted
 CHILD_NAME=milmit-restricted
@@ -21,7 +23,7 @@ if [[ $EUID -ne 0 ]]; then
   exit 77
 fi
 if [[ -z "$SERVER_IP" || -z "$SERVICE_USER" ]]; then
-  echo "usage: $0 <server-ip> <service-user>" >&2
+  echo "usage: $0 <server-ip> <service-user> [password-file]" >&2
   exit 64
 fi
 if ! [[ "$SERVER_IP" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
@@ -30,7 +32,14 @@ if ! [[ "$SERVER_IP" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
 fi
 
 SERVICE_PASS=""
-IFS= read -r SERVICE_PASS || true
+if [[ -n "$PASSWORD_FILE" ]]; then
+  if [[ ! -f "$PASSWORD_FILE" ]]; then
+    echo "Password handoff file does not exist: $PASSWORD_FILE" >&2
+    exit 66
+  fi
+  SERVICE_PASS="$(cat -- "$PASSWORD_FILE")"
+  rm -f -- "$PASSWORD_FILE" || true
+fi
 
 install -d -m 0700 "$CRED_DIR"
 if [[ -n "$SERVICE_PASS" ]]; then
@@ -113,20 +122,14 @@ swanctl --load-creds
 swanctl --initiate --child "$CHILD_NAME"
 
 SA_TEXT="$(swanctl --list-sas 2>&1 || true)"
-VIRTUAL_IP="$(printf '%s\n' "$SA_TEXT" | sed -nE "s/.*local  '[^']+' @ .*[[]([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)[]].*/\1/p" | head -n1)"
-if [[ -z "$VIRTUAL_IP" ]]; then
-  VIRTUAL_IP="$(printf '%s\n' "$SA_TEXT" | sed -nE 's/.*local  ([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)\/32.*/\1/p' | head -n1)"
-fi
+VIRTUAL_IP="$(printf '%s\n' "$SA_TEXT" | sed -nE 's/.*local .*\[([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)\].*/\1/p' | head -n1)"
 if [[ -z "$VIRTUAL_IP" ]]; then
   echo "$SA_TEXT"
-  echo "Tunnel established but virtual IPv4 could not be detected." >&2
+  echo "Restricted tunnel established but no virtual IPv4 was found." >&2
   exit 67
 fi
 
-IFACE="$(ip route get "$SERVER_IP" | sed -nE 's/.* dev ([^ ]+).*/\1/p' | head -n1)"
-if [[ -z "$IFACE" ]]; then
-  IFACE="$(ip -4 route show default | awk 'NR==1 {print $5}')"
-fi
+IFACE="$(ip -4 route get "$SERVER_IP" 2>/dev/null | sed -nE 's/.* dev ([^ ]+).*/\1/p' | head -n1)"
 
 iptables -t mangle -D OUTPUT -s "$VIRTUAL_IP/32" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$MSS" 2>/dev/null || true
 iptables -t mangle -A OUTPUT -s "$VIRTUAL_IP/32" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$MSS"
@@ -138,13 +141,13 @@ if command -v resolvectl >/dev/null 2>&1 && [[ -n "$IFACE" ]]; then
 fi
 
 install -d -m 0755 "$STATE_DIR"
+umask 077
 cat > "$STATE_FILE" <<EOF
 VIRTUAL_IP=$VIRTUAL_IP
 IFACE=$IFACE
 MSS_VALUE=$MSS
 SERVER_IP=$SERVER_IP
 EOF
-chmod 0644 "$STATE_FILE"
 
 TRACE="$(curl -4 --interface "$VIRTUAL_IP" --max-time 10 -ks https://1.1.1.1/cdn-cgi/trace || true)"
 PUBLIC_IP="$(printf '%s\n' "$TRACE" | sed -n 's/^ip=//p' | head -n1)"
