@@ -173,6 +173,7 @@ if [[ -n "$SERVICE_PASS" ]]; then
   umask 077
   printf 'SERVICE_USER=%q\nSERVICE_PASS=%q\n' "$SERVICE_USER" "$SERVICE_PASS" > "$CRED_FILE"
 elif [[ -f "$CRED_FILE" ]]; then
+  # shellcheck disable=SC1090
   source "$CRED_FILE"
   [[ -n "${SERVICE_PASS:-}" ]] || { echo "Saved Surfshark password is empty." >&2; exit 66; }
 else
@@ -222,8 +223,15 @@ connections {
         fragmentation = yes
         mobike = yes
         send_certreq = yes
-        local { auth = eap-mschapv2; eap_id = $SERVICE_USER; id = $SERVICE_USER }
-        remote { auth = pubkey; id = %any }
+        local {
+            auth = eap-mschapv2
+            eap_id = $SERVICE_USER
+            id = $SERVICE_USER
+        }
+        remote {
+            auth = pubkey
+            id = $SERVER_IP
+        }
         children {
             $CHILD_NAME {
                 local_ts = 0.0.0.0/0
@@ -238,14 +246,31 @@ $(printf '%b' "$IF_ID_LINES")
         dpd_delay = 30s
     }
 }
-secrets { eap-milmit-surfshark { id = $SERVICE_USER; secret = "$ESC_PASS" } }
+secrets {
+    eap-milmit-surfshark {
+        id = $SERVICE_USER
+        secret = "$ESC_PASS"
+    }
+}
 EOF
 chmod 0600 "$CONF"
 
+# Fail closed if the generated profile is not exactly the restricted profile we
+# expect. This prevents a stale/partial helper from silently sending the public
+# interface IP as EAP identity or falling into PEAP.
+grep -Fq "eap_id = $SERVICE_USER" "$CONF" || { echo "Generated config is missing EAP identity." >&2; exit 66; }
+grep -Fq "auth = eap-mschapv2" "$CONF" || { echo "Generated config is missing EAP-MSCHAPv2 enforcement." >&2; exit 66; }
+grep -Fq "id = $SERVER_IP" "$CONF" || { echo "Generated config is missing direct-IP server identity." >&2; exit 66; }
+
 swanctl --terminate --ike "$CONN_NAME" >/dev/null 2>&1 || true
 swanctl --terminate --ike surfshark-tr >/dev/null 2>&1 || true
-swanctl --load-conns
-swanctl --load-creds
+LOAD_CONNS="$(swanctl --load-conns 2>&1)"
+printf '%s\n' "$LOAD_CONNS"
+printf '%s\n' "$LOAD_CONNS" | grep -Fq "loaded connection '$CONN_NAME'" || { echo "strongSwan did not load the MilMit restricted connection." >&2; exit 66; }
+LOAD_CREDS="$(swanctl --load-creds 2>&1)"
+printf '%s\n' "$LOAD_CREDS"
+printf '%s\n' "$LOAD_CREDS" | grep -Fq "eap-milmit-surfshark" || { echo "strongSwan did not load the MilMit EAP secret; refusing to attempt authentication." >&2; exit 66; }
+
 if ! swanctl --initiate --child "$CHILD_NAME"; then
   swanctl --terminate --ike "$CONN_NAME" >/dev/null 2>&1 || true
   ip link del "$XFRM_IF" >/dev/null 2>&1 || true
