@@ -17,7 +17,8 @@ if [[ "${1:-}" == "bash" && -n "${2:-}" ]]; then
       dns_csv="${6:-162.252.172.57,149.154.159.92}"
       hotspot_vpn="${7:-1}"
       recover_network="${8:-1}"
-      exec "$REAL_PKEXEC" "$HELPER" connect "$endpoint" "$username" "$mss" "$dns_csv" "$hotspot_vpn" "$recover_network"
+      hotspot_iface="${9:-auto}"
+      exec "$REAL_PKEXEC" "$HELPER" connect "$endpoint" "$username" "$mss" "$dns_csv" "$hotspot_vpn" "$recover_network" "$hotspot_iface"
       ;;
     */scripts/restricted-ikev2-disconnect.sh)
       exec "$REAL_PKEXEC" "$HELPER" disconnect
