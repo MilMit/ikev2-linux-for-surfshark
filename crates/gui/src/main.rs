@@ -4,7 +4,7 @@ use adw::prelude::*;
 use gtk::{glib, Orientation};
 use locations::{by_host, by_id, LOCATIONS};
 use std::collections::HashSet;
-use std::net::{IpAddr, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, ToSocketAddrs};
 use std::process::Command;
 use std::rc::Rc;
 use std::sync::mpsc;
@@ -98,9 +98,6 @@ fn saved_username() -> Option<String> {
     parse_vpn_value(&vpn_data(), "user")
 }
 
-// Prefer the certificate identity because restricted-network mode may pin
-// `address` to a concrete server IP while the original Surfshark hostname is
-// retained as `server-identity` for certificate verification.
 fn saved_host() -> Option<String> {
     let data = vpn_data();
     parse_vpn_value(&data, "server-identity").or_else(|| parse_vpn_value(&data, "address"))
@@ -168,9 +165,6 @@ fn configure_profile(
         log.push('\n');
     }
 
-    // `address` may be a concrete IPv4 selected by compatibility mode, while
-    // `server-identity` always stays the Surfshark hostname so TLS/IKE server
-    // certificate verification is not weakened by endpoint pinning.
     let data = format!(
         "address = {address}, server-identity = {server_identity}, certificate = {CA_CERT}, encap = yes, ipcomp = no, method = eap, proposal = no, user = {username}, virtual = yes"
     );
@@ -198,13 +192,42 @@ fn configure_profile(
     log
 }
 
-fn resolve_ipv4_endpoints(host: &str) -> Vec<String> {
+fn ipv4_is_public(ip: Ipv4Addr) -> bool {
+    let octets = ip.octets();
+    if ip.is_private()
+        || ip.is_loopback()
+        || ip.is_link_local()
+        || ip.is_unspecified()
+        || ip.is_multicast()
+        || ip.is_broadcast()
+        || ip.is_documentation()
+    {
+        return false;
+    }
+    // Shared carrier-grade NAT 100.64.0.0/10.
+    if octets[0] == 100 && (64..=127).contains(&octets[1]) {
+        return false;
+    }
+    // Benchmarking range 198.18.0.0/15.
+    if octets[0] == 198 && (octets[1] == 18 || octets[1] == 19) {
+        return false;
+    }
+    // Reserved 240.0.0.0/4 and 0.0.0.0/8.
+    if octets[0] == 0 || octets[0] >= 240 {
+        return false;
+    }
+    true
+}
+
+fn extract_public_ipv4s(text: &str) -> Vec<String> {
     let mut seen = HashSet::new();
     let mut out = Vec::new();
-
-    if let Ok(addrs) = (host, 500).to_socket_addrs() {
-        for socket in addrs {
-            if let IpAddr::V4(ip) = socket.ip() {
+    for token in text.split(|c: char| !(c.is_ascii_digit() || c == '.')) {
+        if token.matches('.').count() != 3 {
+            continue;
+        }
+        if let Ok(ip) = token.parse::<Ipv4Addr>() {
+            if ipv4_is_public(ip) {
                 let value = ip.to_string();
                 if seen.insert(value.clone()) {
                     out.push(value);
@@ -215,16 +238,142 @@ fn resolve_ipv4_endpoints(host: &str) -> Vec<String> {
     out
 }
 
-fn endpoint_candidates(host: &str, restricted_mode: bool) -> Vec<String> {
-    let mut candidates = vec![host.to_string()];
-    if restricted_mode {
-        for ip in resolve_ipv4_endpoints(host) {
-            if !candidates.iter().any(|candidate| candidate == &ip) {
-                candidates.push(ip);
+fn system_ipv4_endpoints(host: &str) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    if let Ok(addrs) = (host, 500).to_socket_addrs() {
+        for socket in addrs {
+            if let IpAddr::V4(ip) = socket.ip() {
+                if ipv4_is_public(ip) {
+                    let value = ip.to_string();
+                    if seen.insert(value.clone()) {
+                        out.push(value);
+                    }
+                }
             }
         }
     }
-    candidates
+    out
+}
+
+fn doh_query(host: &str, resolver_host: &str, resolver_ip: &str, path: &str) -> (Vec<String>, String) {
+    let url = format!("https://{resolver_host}{path}{host}&type=A");
+    let resolve = format!("{resolver_host}:443:{resolver_ip}");
+    let output = Command::new("curl")
+        .args([
+            "-4",
+            "--max-time",
+            "7",
+            "--connect-timeout",
+            "4",
+            "--fail",
+            "--silent",
+            "--show-error",
+            "--resolve",
+            &resolve,
+            "-H",
+            "accept: application/dns-json",
+            &url,
+        ])
+        .output();
+
+    match output {
+        Ok(out) => {
+            let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+            let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            let ips = if out.status.success() {
+                extract_public_ipv4s(&stdout)
+            } else {
+                Vec::new()
+            };
+            let detail = if out.status.success() {
+                format!("{resolver_host} via pinned {resolver_ip}: {} public IPv4 result(s)", ips.len())
+            } else {
+                format!("{resolver_host} via pinned {resolver_ip}: curl failed: {stderr}")
+            };
+            (ips, detail)
+        }
+        Err(err) => (Vec::new(), format!("{resolver_host}: failed to launch curl: {err}")),
+    }
+}
+
+fn secure_ipv4_endpoints(host: &str) -> (Vec<String>, String) {
+    let system_raw = run("getent", &["ahostsv4", host]);
+    let system_all = extract_public_ipv4s(&system_raw);
+    let system_has_only_rejected = !system_raw.trim().is_empty() && system_all.is_empty();
+
+    let mut log = String::new();
+    log.push_str("System resolver inspection:\n");
+    log.push_str(system_raw.trim());
+    log.push('\n');
+    if system_has_only_rejected {
+        log.push_str("DNS hijack/sinkhole suspected: system response contains no routable public IPv4. Private/bogon answers were rejected.\n");
+    }
+
+    let resolvers = [
+        ("cloudflare-dns.com", "1.1.1.1", "/dns-query?name="),
+        ("cloudflare-dns.com", "1.0.0.1", "/dns-query?name="),
+        ("dns.google", "8.8.8.8", "/resolve?name="),
+        ("dns.google", "8.8.4.4", "/resolve?name="),
+    ];
+
+    let mut seen = HashSet::new();
+    let mut endpoints = Vec::new();
+    for (resolver_host, resolver_ip, path) in resolvers {
+        let (ips, detail) = doh_query(host, resolver_host, resolver_ip, path);
+        log.push_str(&detail);
+        log.push('\n');
+        for ip in ips {
+            if seen.insert(ip.clone()) {
+                endpoints.push(ip);
+            }
+        }
+    }
+
+    // If HTTPS DNS is unavailable but the system resolver gave genuinely public
+    // addresses, keep them as a last-resort fallback. Never accept private/bogon
+    // sinkhole answers such as 10.10.34.36.
+    if endpoints.is_empty() {
+        for ip in system_ipv4_endpoints(host) {
+            if seen.insert(ip.clone()) {
+                endpoints.push(ip);
+            }
+        }
+        if !endpoints.is_empty() {
+            log.push_str("Secure DNS produced no answer; using validated public system-DNS fallback.\n");
+        }
+    }
+
+    if endpoints.is_empty() {
+        log.push_str("No safe public IPv4 endpoint was discovered.\n");
+    } else {
+        log.push_str("Accepted endpoints:\n");
+        for ip in &endpoints {
+            log.push_str(&format!("  - {ip}\n"));
+        }
+    }
+    (endpoints, log)
+}
+
+fn endpoint_candidates(host: &str, restricted_mode: bool) -> (Vec<String>, String) {
+    if !restricted_mode {
+        return (vec![host.to_string()], "Standard mode: hostname is resolved by NetworkManager/system DNS.\n".to_string());
+    }
+
+    let (secure, mut log) = secure_ipv4_endpoints(host);
+    let mut candidates = Vec::new();
+    // In restricted mode do not try the hostname first when DNS hijacking may be
+    // present. Use only validated public IPs while preserving the hostname as
+    // server-identity for certificate verification.
+    for ip in secure {
+        if !candidates.contains(&ip) {
+            candidates.push(ip);
+        }
+    }
+    if candidates.is_empty() {
+        log.push_str("Restricted mode intentionally refused to use the raw hostname because no trustworthy public endpoint was available.\n");
+    }
+    (candidates, log)
 }
 
 fn disconnect_quietly() {
@@ -430,10 +579,10 @@ fn build_ui(app: &adw::Application) {
     let restricted_mode = gtk::CheckButton::with_label("Restricted network / Iran compatibility mode");
     restricted_mode.set_active(true);
     restricted_mode.set_tooltip_text(Some(
-        "If the normal hostname path fails, rotate through all IPv4 endpoints returned for the selected Surfshark location while keeping certificate verification enabled.",
+        "Detects poisoned DNS, resolves Surfshark endpoints through pinned DNS-over-HTTPS, rejects private/bogon answers, then rotates through safe public IPv4 endpoints.",
     ));
     let restricted_note = gtk::Label::builder()
-        .label("Tries the normal endpoint first, then pins each resolved IPv4 one-by-one with forced NAT-T. Useful when a network filters only some Surfshark server IPs.")
+        .label("Secure endpoint discovery: rejects DNS sinkholes such as 10.x.x.x, queries pinned Cloudflare/Google DoH over HTTPS, then connects to public IPs while preserving Surfshark certificate identity.")
         .halign(gtk::Align::Start)
         .wrap(true)
         .css_classes(["dim-label", "ping-note"])
@@ -692,20 +841,28 @@ fn build_ui(app: &adw::Application) {
                     return;
                 }
 
-                let candidates = endpoint_candidates(selected.host, restricted);
+                let (candidates, resolver_log) = endpoint_candidates(selected.host, restricted);
                 let mut discovery = format!(
-                    "Mode: {}\nSurfshark identity: {}\nCandidates: {}\n",
-                    if restricted { "Restricted network" } else { "Standard" },
+                    "Mode: {}\nSurfshark identity: {}\nCandidates: {}\n\n{}",
+                    if restricted { "Restricted network + secure DNS" } else { "Standard" },
                     selected.host,
-                    candidates.len()
+                    candidates.len(),
+                    resolver_log
                 );
-                for (index, candidate) in candidates.iter().enumerate() {
-                    discovery.push_str(&format!("  {}. {}\n", index + 1, candidate));
+                if !candidates.is_empty() {
+                    discovery.push_str("Connection order:\n");
+                    for (index, candidate) in candidates.iter().enumerate() {
+                        discovery.push_str(&format!("  {}. {}\n", index + 1, candidate));
+                    }
                 }
-                if restricted && candidates.len() == 1 {
-                    discovery.push_str("DNS returned no additional IPv4 endpoints; only the hostname can be attempted.\n");
+                let _ = tx.send(Event::Log("SECURE ENDPOINT DISCOVERY".into(), discovery));
+
+                if candidates.is_empty() {
+                    let _ = tx.send(Event::Failed(
+                        "Restricted mode detected unsafe/poisoned DNS and could not obtain a safe public endpoint over pinned DNS-over-HTTPS. See Secure Endpoint Discovery log.".into(),
+                    ));
+                    return;
                 }
-                let _ = tx.send(Event::Log("ENDPOINT DISCOVERY".into(), discovery));
 
                 for (index, endpoint) in candidates.iter().enumerate() {
                     let _ = tx.send(Event::Busy(format!(
@@ -730,8 +887,6 @@ fn build_ui(app: &adw::Application) {
                         continue;
                     }
 
-                    // Give NetworkManager/charon-nm a short moment to finish route
-                    // and DNS installation before verifying traffic egress.
                     thread::sleep(Duration::from_millis(900));
                     let after = public_ip();
                     let _ = tx.send(Event::Log(
@@ -740,14 +895,9 @@ fn build_ui(app: &adw::Application) {
                     ));
 
                     if !after.trim().is_empty() && after.trim() != before.trim() {
-                        let mode_note = if endpoint == selected.host {
-                            "hostname"
-                        } else {
-                            "pinned IPv4 fallback"
-                        };
                         let _ = tx.send(Event::Log(
                             "COMPATIBILITY RESULT".into(),
-                            format!("Success via {mode_note}: {endpoint}"),
+                            format!("Success via validated pinned IPv4 endpoint: {endpoint}"),
                         ));
                         let _ = tx.send(Event::Connected(
                             after.trim().to_string(),
@@ -756,15 +906,13 @@ fn build_ui(app: &adw::Application) {
                         return;
                     }
 
-                    // A green NetworkManager state without changed egress is not
-                    // accepted as success. Tear it down and rotate to the next IP.
                     disconnect_quietly();
                 }
 
                 let log = failure_log();
                 let _ = tx.send(Event::Log("NETWORKMANAGER FAILURE LOG".into(), log));
                 let _ = tx.send(Event::Failed(format!(
-                    "All {} endpoint candidate(s) failed or did not change public IPv4. Open Advanced diagnostics to see which IKEv2 stage failed.",
+                    "All {} safe endpoint candidate(s) failed or did not change public IPv4. Open Advanced diagnostics to see which IKEv2 stage failed.",
                     candidates.len()
                 )));
             });
@@ -813,7 +961,6 @@ fn build_ui(app: &adw::Application) {
         });
     }
 
-    // Run one non-blocking latency scan automatically after launch.
     {
         let tx = tx.clone();
         thread::spawn(move || {
