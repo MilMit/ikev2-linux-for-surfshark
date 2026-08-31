@@ -20,8 +20,8 @@ NM_MARKER_IF=milmitvpn0
 XFRM_IF=milmitxfrm0
 XFRM_IF_ID=42
 ROUTE_TABLE=220
-# Must run before strongSwan's catch-all rule at priority 220.
 HOTSPOT_RULE_PREF=179
+HOTSPOT_XFRM_PRIORITY=383614
 
 if [[ $EUID -ne 0 ]]; then echo "This helper must run as root." >&2; exit 77; fi
 if [[ -z "$SERVER_IP" || -z "$SERVICE_USER" ]]; then echo "usage: $0 <server-ip> <service-user> [mss] [dns-csv] [hotspot-vpn] [recover]" >&2; exit 64; fi
@@ -81,18 +81,20 @@ flush_hotspot_conntrack() {
   fi
 }
 
+remove_hotspot_xfrm_policy() {
+  local hs_subnet="${1:-}"
+  [[ -n "$hs_subnet" ]] || return 0
+  ip xfrm policy delete src "$hs_subnet" dst 0.0.0.0/0 dir out priority "$HOTSPOT_XFRM_PRIORITY" if_id "$XFRM_IF_ID" >/dev/null 2>&1 || true
+}
+
 purge_legacy_hotspot_rules() {
   local hs_iface="${1:-}" hs_subnet="${2:-}"
   [[ -n "$hs_subnet" ]] || return 0
-
-  # Remove MilMit SNAT rules left by pre-XFRM builds. Keep NetworkManager's
-  # own nm-shared MASQUERADE rule untouched.
   while IFS= read -r rule; do
     [[ "$rule" == *"-s $hs_subnet"* && "$rule" == *"-j SNAT --to-source 10.6."* ]] || continue
     # shellcheck disable=SC2086
     iptables -t nat -D POSTROUTING ${rule#-A POSTROUTING } >/dev/null 2>&1 || true
   done < <(iptables -t nat -S POSTROUTING 2>/dev/null || true)
-
   if [[ -n "$hs_iface" ]]; then
     while iptables -D FORWARD -i "$hs_iface" -s "$hs_subnet" -j ACCEPT 2>/dev/null; do :; done
     while iptables -D FORWARD -o "$hs_iface" -d "$hs_subnet" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null; do :; done
@@ -102,6 +104,7 @@ purge_legacy_hotspot_rules() {
 remove_hotspot_rules() {
   local vip="${1:-}" hs_iface="${2:-}" hs_subnet="${3:-}" old_mss="${4:-1200}" hs_dns="${5:-}"
   [[ -n "$hs_subnet" ]] || return 0
+  remove_hotspot_xfrm_policy "$hs_subnet"
   while ip rule del pref "$HOTSPOT_RULE_PREF" from "$hs_subnet" lookup "$ROUTE_TABLE" >/dev/null 2>&1; do :; done
   [[ -z "$vip" ]] || while iptables -t nat -D POSTROUTING -s "$hs_subnet" ! -d "$hs_subnet" -o "$XFRM_IF" -j SNAT --to-source "$vip" 2>/dev/null; do :; done
   if [[ -n "$hs_iface" ]]; then
@@ -278,6 +281,7 @@ if command -v resolvectl >/dev/null 2>&1 && [[ -n "$IFACE" ]]; then
   resolvectl flush-caches || true
 fi
 
+HOTSPOT_XFRM_POLICY=0
 if [[ "$ROUTE_BASED" == 1 ]]; then
   sysctl -w net.ipv4.ip_forward=1 >/dev/null
   ip route replace throw "$SERVER_IP" table "$ROUTE_TABLE"
@@ -285,7 +289,38 @@ if [[ "$ROUTE_BASED" == 1 ]]; then
   while ip rule del pref "$HOTSPOT_RULE_PREF" from "$HOTSPOT_SUBNET" lookup "$ROUTE_TABLE" >/dev/null 2>&1; do :; done
   ip rule add pref "$HOTSPOT_RULE_PREF" from "$HOTSPOT_SUBNET" lookup "$ROUTE_TABLE"
 
+  # XFRM interfaces perform a policy check before the packet reaches the
+  # POSTROUTING SNAT hook. Surfshark narrows the negotiated local selector to
+  # the assigned VIP (/32), so forwarded 10.42.x.x packets otherwise die at
+  # the interface with zero FORWARD/NAT counters. Install a local-only helper
+  # policy that admits the hotspot subnet to the existing SA. POSTROUTING then
+  # statefully translates it to the Surfshark VIP before encryption, so the
+  # peer still sees only the negotiated VIP.
+  read -r OUTER_SRC OUTER_DST OUT_REQID <<< "$(ip xfrm state | awk '
+    /^src / {s=$2; d=$4; r=""}
+    /^[[:space:]]+proto esp/ {for (i=1;i<=NF;i++) if ($i=="reqid") r=$(i+1)}
+    /^[[:space:]]+dir out/ {print s, d, r; exit}
+  ')"
+  if [[ -n "${OUTER_SRC:-}" && -n "${OUTER_DST:-}" && -n "${OUT_REQID:-}" ]]; then
+    remove_hotspot_xfrm_policy "$HOTSPOT_SUBNET"
+    if ip xfrm policy add src "$HOTSPOT_SUBNET" dst 0.0.0.0/0 dir out priority "$HOTSPOT_XFRM_PRIORITY" if_id "$XFRM_IF_ID" \
+      tmpl src "$OUTER_SRC" dst "$OUTER_DST" proto esp reqid "$OUT_REQID" mode tunnel; then
+      HOTSPOT_XFRM_POLICY=1
+    fi
+  fi
+
   remove_hotspot_rules "$VIRTUAL_IP" "$HOTSPOT_IFACE" "$HOTSPOT_SUBNET" "$MSS" "$HOTSPOT_DNS"
+  # remove_hotspot_rules also removes the helper policy, so re-add it after the
+  # stale firewall cleanup using the just-discovered SA parameters.
+  if [[ -n "${OUTER_SRC:-}" && -n "${OUTER_DST:-}" && -n "${OUT_REQID:-}" ]]; then
+    if ip xfrm policy add src "$HOTSPOT_SUBNET" dst 0.0.0.0/0 dir out priority "$HOTSPOT_XFRM_PRIORITY" if_id "$XFRM_IF_ID" \
+      tmpl src "$OUTER_SRC" dst "$OUTER_DST" proto esp reqid "$OUT_REQID" mode tunnel 2>/dev/null; then
+      HOTSPOT_XFRM_POLICY=1
+    else
+      HOTSPOT_XFRM_POLICY=0
+    fi
+  fi
+
   iptables -t nat -I POSTROUTING 1 -s "$HOTSPOT_SUBNET" ! -d "$HOTSPOT_SUBNET" -o "$XFRM_IF" -j SNAT --to-source "$VIRTUAL_IP"
   iptables -t mangle -I FORWARD 1 -i "$HOTSPOT_IFACE" -s "$HOTSPOT_SUBNET" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$MSS"
   iptables -I FORWARD 1 -i "$HOTSPOT_IFACE" -o "$XFRM_IF" -s "$HOTSPOT_SUBNET" -j ACCEPT
@@ -334,6 +369,8 @@ HOTSPOT_IFACE=$HOTSPOT_IFACE
 HOTSPOT_SUBNET=$HOTSPOT_SUBNET
 HOTSPOT_DNS=$HOTSPOT_DNS
 HOTSPOT_RULE_PREF=$HOTSPOT_RULE_PREF
+HOTSPOT_XFRM_POLICY=$HOTSPOT_XFRM_POLICY
+HOTSPOT_XFRM_PRIORITY=$HOTSPOT_XFRM_PRIORITY
 ROUTE_BASED=$ROUTE_BASED
 XFRM_IF=$([[ "$ROUTE_BASED" == 1 ]] && echo "$XFRM_IF" || true)
 XFRM_IF_ID=$([[ "$ROUTE_BASED" == 1 ]] && echo "$XFRM_IF_ID" || true)
@@ -347,6 +384,7 @@ printf 'Ubuntu marker: %s\n' "$([[ "$NM_MARKER_ACTIVE" == 1 ]] && echo active ||
 if [[ "$ROUTE_BASED" == 1 ]]; then
   printf 'Hotspot VPN   : ON · route-based XFRM · %s · %s\n' "$HOTSPOT_IFACE" "$HOTSPOT_SUBNET"
   printf 'XFRM interface: %s · if_id %s · MTU 1280\n' "$XFRM_IF" "$XFRM_IF_ID"
+  printf 'Hotspot policy: %s\n' "$([[ "$HOTSPOT_XFRM_POLICY" == 1 ]] && echo armed || echo unavailable)"
 elif [[ "$HOTSPOT_VPN" == 1 ]]; then
   printf 'Hotspot VPN   : enabled · no hotspot interface detected\n'
 else
