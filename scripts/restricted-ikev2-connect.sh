@@ -22,6 +22,7 @@ XFRM_IF=milmitxfrm0
 XFRM_IF_ID=42
 ROUTE_TABLE=220
 HOTSPOT_RULE_PREF=179
+SYSTEM_RULE_PREF=180
 HOTSPOT_XFRM_PRIORITY=383614
 
 if [[ $EUID -ne 0 ]]; then echo "This helper must run as root." >&2; exit 77; fi
@@ -118,6 +119,14 @@ remove_hotspot_policy() {
   ip xfrm policy delete src "$subnet" dst 0.0.0.0/0 dir out priority "$HOTSPOT_XFRM_PRIORITY" if_id "$XFRM_IF_ID" >/dev/null 2>&1 || true
 }
 
+purge_system_routes() {
+  while ip rule del pref "$SYSTEM_RULE_PREF" lookup "$ROUTE_TABLE" >/dev/null 2>&1; do :; done
+  ip route del default dev "$XFRM_IF" table "$ROUTE_TABLE" >/dev/null 2>&1 || true
+  for net in 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16; do
+    ip route del throw "$net" table "$ROUTE_TABLE" >/dev/null 2>&1 || true
+  done
+}
+
 purge_hotspot_rules() {
   local vip="${1:-}" iface="${2:-}" subnet="${3:-}" old_mss="${4:-1200}" dns="${5:-}"
   [[ -n "$subnet" ]] || return 0
@@ -145,8 +154,8 @@ cleanup_old() {
   hs_iface="$(state_get HOTSPOT_IFACE)"; hs_subnet="$(state_get HOTSPOT_SUBNET)"; hs_dns="$(state_get HOTSPOT_DNS)"; server="$(state_get SERVER_IP)"
   [[ -z "$vip" ]] || iptables -t mangle -D OUTPUT -s "$vip/32" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "${old_mss:-1200}" 2>/dev/null || true
   purge_hotspot_rules "$vip" "$hs_iface" "$hs_subnet" "${old_mss:-1200}" "$hs_dns"
+  purge_system_routes
   [[ -z "$server" ]] || ip route del throw "$server" table "$ROUTE_TABLE" >/dev/null 2>&1 || true
-  ip route del default dev "$XFRM_IF" table "$ROUTE_TABLE" >/dev/null 2>&1 || true
   ip link del "$XFRM_IF" >/dev/null 2>&1 || true
   if [[ -n "$iface" ]] && command -v resolvectl >/dev/null 2>&1; then resolvectl revert "$iface" >/dev/null 2>&1 || true; fi
   [[ -z "$vip" || -z "$iface" ]] || ip addr del "$vip/32" dev "$iface" >/dev/null 2>&1 || true
@@ -199,18 +208,22 @@ DNS_CSV="$(IFS=,; echo "${VALID_DNS[*]}")"
 HOTSPOT_DNS="${VALID_DNS[0]}"
 
 detect_hotspot
-ROUTE_BASED=0
-if [[ "$HOTSPOT_VPN" == 1 && -n "$HOTSPOT_IFACE" && -n "$HOTSPOT_SUBNET" ]]; then
-  ROUTE_BASED=1
-  purge_hotspot_rules "" "$HOTSPOT_IFACE" "$HOTSPOT_SUBNET" "$MSS" "$HOTSPOT_DNS"
-  if ! ip link add "$XFRM_IF" type xfrm if_id "$XFRM_IF_ID" 2>/dev/null; then echo "Kernel/iproute2 could not create XFRM interface $XFRM_IF." >&2; exit 70; fi
-  ip link set "$XFRM_IF" mtu 1280 up
+
+# The restricted tunnel is route-based for the Ubuntu host itself. Previously
+# XFRM routing was only enabled when a hotspot happened to be active, which let
+# the IKE/CHILD SA show as connected while ordinary desktop traffic kept using
+# the ISP default route. Always create the XFRM interface and bind the CHILD_SA
+# to it; hotspot forwarding remains independently optional below.
+ip link del "$XFRM_IF" >/dev/null 2>&1 || true
+if ! ip link add "$XFRM_IF" type xfrm if_id "$XFRM_IF_ID" 2>/dev/null; then
+  echo "Kernel/iproute2 could not create XFRM interface $XFRM_IF." >&2
+  exit 70
 fi
+ip link set "$XFRM_IF" mtu 1280 up
+ROUTE_BASED=1
 
 ESC_PASS="${SERVICE_PASS//\\/\\\\}"
 ESC_PASS="${ESC_PASS//\"/\\\"}"
-IF_ID_LINES=""
-if [[ "$ROUTE_BASED" == 1 ]]; then IF_ID_LINES="                if_id_in = $XFRM_IF_ID\n                if_id_out = $XFRM_IF_ID"; fi
 
 install -d -m 0755 /etc/swanctl/conf.d
 cat >"$CONF" <<EOF
@@ -239,7 +252,8 @@ connections {
                 esp_proposals = aes256-sha1,aes256-sha256
                 start_action = none
                 dpd_action = restart
-$(printf '%b' "$IF_ID_LINES")
+                if_id_in = $XFRM_IF_ID
+                if_id_out = $XFRM_IF_ID
             }
         }
         vips = 0.0.0.0
@@ -255,9 +269,6 @@ secrets {
 EOF
 chmod 0600 "$CONF"
 
-# Fail closed if the generated profile is not exactly the restricted profile we
-# expect. This prevents a stale/partial helper from silently sending the public
-# interface IP as EAP identity or falling into PEAP.
 grep -Fq "eap_id = $SERVICE_USER" "$CONF" || { echo "Generated config is missing EAP identity." >&2; exit 66; }
 grep -Fq "auth = eap-mschapv2" "$CONF" || { echo "Generated config is missing EAP-MSCHAPv2 enforcement." >&2; exit 66; }
 grep -Fq "id = $SERVER_IP" "$CONF" || { echo "Generated config is missing direct-IP server identity." >&2; exit 66; }
@@ -291,12 +302,21 @@ if command -v resolvectl >/dev/null 2>&1 && [[ -n "$IFACE" ]]; then
   resolvectl flush-caches || true
 fi
 
+# Force normal Ubuntu traffic into the XFRM interface. The Surfshark endpoint
+# itself and local/private networks intentionally fall through to the normal
+# routing table, preventing a routing loop and preserving LAN access.
+purge_system_routes
+ip route replace throw "$SERVER_IP" table "$ROUTE_TABLE"
+for net in 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16; do
+  ip route replace throw "$net" table "$ROUTE_TABLE"
+done
+ip route replace default dev "$XFRM_IF" src "$VIRTUAL_IP" table "$ROUTE_TABLE"
+ip rule add pref "$SYSTEM_RULE_PREF" lookup "$ROUTE_TABLE"
+
 HOTSPOT_XFRM_POLICY=0
 HOTSPOT_XFRM_SPI=""
-if [[ "$ROUTE_BASED" == 1 ]]; then
+if [[ "$HOTSPOT_VPN" == 1 && -n "$HOTSPOT_IFACE" && -n "$HOTSPOT_SUBNET" ]]; then
   sysctl -w net.ipv4.ip_forward=1 >/dev/null
-  ip route replace throw "$SERVER_IP" table "$ROUTE_TABLE"
-  ip route replace default dev "$XFRM_IF" src "$VIRTUAL_IP" table "$ROUTE_TABLE"
   while ip rule del pref "$HOTSPOT_RULE_PREF" from "$HOTSPOT_SUBNET" lookup "$ROUTE_TABLE" >/dev/null 2>&1; do :; done
   ip rule add pref "$HOTSPOT_RULE_PREF" from "$HOTSPOT_SUBNET" lookup "$ROUTE_TABLE"
   read -r OUTER_SRC OUTER_DST OUT_SPI OUT_REQID <<< "$(ip xfrm state | awk '/^src / {s=$2; d=$4; spi=""; req=""} /^[[:space:]]+proto esp/ {for (i=1;i<=NF;i++) {if ($i=="spi") spi=$(i+1); if ($i=="reqid") req=$(i+1)}} /^[[:space:]]+dir out/ {print s, d, spi, req; exit}')"
@@ -313,20 +333,23 @@ if [[ "$ROUTE_BASED" == 1 ]]; then
   iptables -t nat -I PREROUTING 1 -i "$HOTSPOT_IFACE" -s "$HOTSPOT_SUBNET" -p udp --dport 53 -j DNAT --to-destination "$HOTSPOT_DNS"
   iptables -t nat -I PREROUTING 1 -i "$HOTSPOT_IFACE" -s "$HOTSPOT_SUBNET" -p tcp --dport 53 -j DNAT --to-destination "$HOTSPOT_DNS"
   flush_hotspot_conntrack "$HOTSPOT_SUBNET"
-  ip route flush cache >/dev/null 2>&1 || true
 fi
+ip route flush cache >/dev/null 2>&1 || true
 
-TRACE="$(curl -4 --interface "$VIRTUAL_IP" --max-time 10 -ks https://1.1.1.1/cdn-cgi/trace || true)"
+# Important: test the ordinary system path, not a curl explicitly bound to the
+# VPN virtual IP. This catches the exact failure where the SA is established but
+# desktop applications still leave through the ISP interface.
+TRACE="$(curl -4 --max-time 10 -ks https://1.1.1.1/cdn-cgi/trace || true)"
 PUBLIC_IP="$(printf '%s\n' "$TRACE" | sed -n 's/^ip=//p' | head -n1)"
 EXIT_COUNTRY="$(printf '%s\n' "$TRACE" | sed -n 's/^loc=//p' | head -n1)"
 if [[ -z "$PUBLIC_IP" ]]; then
   swanctl --terminate --ike "$CONN_NAME" >/dev/null 2>&1 || true
   purge_hotspot_rules "$VIRTUAL_IP" "$HOTSPOT_IFACE" "$HOTSPOT_SUBNET" "$MSS" "$HOTSPOT_DNS"
+  purge_system_routes
   ip route del throw "$SERVER_IP" table "$ROUTE_TABLE" >/dev/null 2>&1 || true
-  ip route del default dev "$XFRM_IF" table "$ROUTE_TABLE" >/dev/null 2>&1 || true
   ip link del "$XFRM_IF" >/dev/null 2>&1 || true
   [[ "$RECOVER_NETWORK" == 1 ]] && recover_interface "$IFACE" 1
-  printf '\nData-path test: FAILED\n'; exit 68
+  printf '\nSystem data-path test: FAILED\n'; exit 68
 fi
 
 NM_MARKER_ACTIVE=0
@@ -346,6 +369,8 @@ SERVER_IP=$SERVER_IP
 NM_MARKER_ACTIVE=$NM_MARKER_ACTIVE
 PUBLIC_IP=$PUBLIC_IP
 EXIT_COUNTRY=$EXIT_COUNTRY
+SYSTEM_VPN=1
+SYSTEM_RULE_PREF=$SYSTEM_RULE_PREF
 HOTSPOT_VPN=$HOTSPOT_VPN
 HOTSPOT_IFACE_REQUEST=$HOTSPOT_IFACE_REQUEST
 HOTSPOT_CONNECTION=$HOTSPOT_CONNECTION
@@ -361,9 +386,10 @@ chmod 0644 "$STATE_FILE"
 
 printf '\nRestricted Surfshark IKEv2 is established\n'
 printf 'Virtual IPv4 : %s\nMSS clamp    : %s\nDNS          : %s\nInterface    : %s\n' "$VIRTUAL_IP" "$MSS" "$DNS_CSV" "$IFACE"
+printf 'System VPN   : ON · all normal IPv4 Internet traffic via %s\n' "$XFRM_IF"
 printf 'Ubuntu marker: %s\n' "$([[ "$NM_MARKER_ACTIVE" == 1 ]] && echo active || echo unavailable)"
 printf 'Hotspot target: %s\n' "$HOTSPOT_IFACE_REQUEST"
-if [[ "$ROUTE_BASED" == 1 ]]; then
+if [[ "$HOTSPOT_VPN" == 1 && -n "$HOTSPOT_IFACE" ]]; then
   printf 'Hotspot VPN   : ON · %s · %s\n' "$HOTSPOT_IFACE" "$HOTSPOT_SUBNET"
 elif [[ "$HOTSPOT_VPN" == 1 ]]; then
   printf 'Hotspot VPN   : enabled · selected/auto hotspot not active\n'
@@ -371,4 +397,4 @@ else
   printf 'Hotspot VPN   : OFF · hotspot keeps normal route\n'
 fi
 printf '%s\n' "$SA_TEXT"
-printf '\nData-path test: OK\nPublic IPv4 : %s\nExit country: %s\n' "$PUBLIC_IP" "${EXIT_COUNTRY:-unknown}"
+printf '\nSystem data-path test: OK\nData-path test: OK\nPublic IPv4 : %s\nExit country: %s\n' "$PUBLIC_IP" "${EXIT_COUNTRY:-unknown}"
