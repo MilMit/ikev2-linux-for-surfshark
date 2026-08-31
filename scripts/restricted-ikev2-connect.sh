@@ -8,6 +8,7 @@ DNS_CSV="${4:-162.252.172.57,149.154.159.92}"
 HOTSPOT_VPN="${5:-1}"
 RECOVER_NETWORK="${6:-1}"
 HOTSPOT_IFACE_REQUEST="${7:-auto}"
+KILL_SWITCH="${8:-0}"
 
 CONF=/etc/swanctl/conf.d/milmit-surfshark-restricted.conf
 CONN_NAME=milmit-surfshark-restricted
@@ -21,26 +22,60 @@ NM_MARKER_IF=milmitvpn0
 XFRM_IF=milmitxfrm0
 XFRM_IF_ID=42
 ROUTE_TABLE=220
-HOTSPOT_RULE_PREF=179
-SYSTEM_RULE_PREF=180
-HOTSPOT_XFRM_PRIORITY=383614
+MARK_VPN=0x112
+MARK_DIRECT=0x113
+RULE_DIRECT_PREF=109
+RULE_VPN_PREF=110
+CHAIN_HOST=MILMIT_VPN_OUT
+CHAIN_DNS=MILMIT_DNS_MARK
+CHAIN_HOT=MILMIT_HOTSPOT_MARK
+CHAIN_MSS=MILMIT_VPN_MSS
+CHAIN_KILL=MILMIT_VPN_KILL
 
-if [[ $EUID -ne 0 ]]; then echo "This helper must run as root." >&2; exit 77; fi
-if [[ -z "$SERVER_IP" || -z "$SERVICE_USER" ]]; then echo "usage: $0 <server-ip> <service-user> [mss] [dns-csv] [hotspot-vpn] [recover] [hotspot-iface|auto]" >&2; exit 64; fi
+[[ $EUID -eq 0 ]] || { echo "This helper must run as root." >&2; exit 77; }
+[[ -n "$SERVER_IP" && -n "$SERVICE_USER" ]] || { echo "usage: $0 <server-ip> <service-user> [mss] [dns-csv] [hotspot-vpn] [recover] [hotspot-iface|auto] [kill-switch]" >&2; exit 64; }
+[[ "$SERVER_IP" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || { echo "invalid server IPv4" >&2; exit 64; }
 [[ "$MSS" =~ ^[0-9]+$ && "$MSS" -ge 900 && "$MSS" -le 1400 ]] || { echo "MSS must be 900-1400" >&2; exit 64; }
 [[ "$HOTSPOT_VPN" == 0 || "$HOTSPOT_VPN" == 1 ]] || exit 64
 [[ "$RECOVER_NETWORK" == 0 || "$RECOVER_NETWORK" == 1 ]] || exit 64
+[[ "$KILL_SWITCH" == 0 || "$KILL_SWITCH" == 1 ]] || exit 64
 [[ "$HOTSPOT_IFACE_REQUEST" == auto || "$HOTSPOT_IFACE_REQUEST" =~ ^[a-zA-Z0-9_.:-]{1,32}$ ]] || { echo "invalid hotspot interface" >&2; exit 64; }
 
 state_get() {
-  local key="$1"
   [[ -f "$STATE_FILE" ]] || return 0
-  awk -F= -v k="$key" '$1==k {sub(/^[^=]*=/, ""); print; exit}' "$STATE_FILE" 2>/dev/null || true
+  awk -F= -v k="$1" '$1==k {sub(/^[^=]*=/, ""); print; exit}' "$STATE_FILE" 2>/dev/null || true
 }
 
-subnet_from_cidr() {
-  python3 - "$1" <<'PY'
-import ipaddress, sys
+ipt_chain_reset() {
+  local table="$1" chain="$2"
+  iptables -w -t "$table" -N "$chain" 2>/dev/null || true
+  iptables -w -t "$table" -F "$chain"
+}
+
+ipt_unhook() {
+  local table="$1" base="$2" chain="$3"
+  while iptables -w -t "$table" -D "$base" -j "$chain" 2>/dev/null; do :; done
+}
+
+cleanup_policy() {
+  ipt_unhook mangle OUTPUT "$CHAIN_DNS"
+  ipt_unhook mangle OUTPUT "$CHAIN_HOST"
+  ipt_unhook mangle PREROUTING "$CHAIN_HOT"
+  ipt_unhook mangle OUTPUT "$CHAIN_MSS"
+  ipt_unhook mangle FORWARD "$CHAIN_MSS"
+  ipt_unhook filter OUTPUT "$CHAIN_KILL"
+  for spec in "mangle:$CHAIN_DNS" "mangle:$CHAIN_HOST" "mangle:$CHAIN_HOT" "mangle:$CHAIN_MSS" "filter:$CHAIN_KILL"; do
+    table="${spec%%:*}"; chain="${spec#*:}"
+    iptables -w -t "$table" -F "$chain" 2>/dev/null || true
+    iptables -w -t "$table" -X "$chain" 2>/dev/null || true
+  done
+  while ip rule del pref "$RULE_DIRECT_PREF" fwmark "$MARK_DIRECT" table main >/dev/null 2>&1; do :; done
+  while ip rule del pref "$RULE_VPN_PREF" fwmark "$MARK_VPN" table "$ROUTE_TABLE" >/dev/null 2>&1; do :; done
+  ip route flush table "$ROUTE_TABLE" >/dev/null 2>&1 || true
+}
+
+subnet_from_cidr() { python3 - "$1" <<'PY'
+import ipaddress,sys
 print(ipaddress.ip_interface(sys.argv[1]).network)
 PY
 }
@@ -62,109 +97,32 @@ is_shared_iface() {
 
 detect_hotspot() {
   HOTSPOT_CONNECTION="" HOTSPOT_IFACE="" HOTSPOT_SUBNET=""
-  local line name dev method cidr type state
-
+  local name dev cidr method line
   if [[ "$HOTSPOT_IFACE_REQUEST" != auto ]]; then
     if is_shared_iface "$HOTSPOT_IFACE_REQUEST"; then
       dev="$HOTSPOT_IFACE_REQUEST"
-      cidr="$(ip -4 -o addr show dev "$dev" scope global 2>/dev/null | awk '{print $4}' | head -n1)"
+      cidr="$(ip -4 -o addr show dev "$dev" scope global | awk '{print $4}' | head -n1)"
       name="$(nmcli -g GENERAL.CONNECTION device show "$dev" 2>/dev/null | head -n1 || true)"
-      HOTSPOT_CONNECTION="${name:-Hotspot}"
-      HOTSPOT_IFACE="$dev"
-      HOTSPOT_SUBNET="$(subnet_from_cidr "$cidr")"
-      return 0
+      HOTSPOT_CONNECTION="${name:-Hotspot}"; HOTSPOT_IFACE="$dev"; HOTSPOT_SUBNET="$(subnet_from_cidr "$cidr")"
     fi
-    echo "Selected hotspot interface '$HOTSPOT_IFACE_REQUEST' is not currently an active shared/hotspot interface." >&2
     return 0
   fi
-
   if command -v nmcli >/dev/null 2>&1; then
     while IFS= read -r line; do
-      [[ -n "$line" ]] || continue
       dev="${line##*:}"; name="${line%:*}"
-      [[ -n "$name" && -n "$dev" && "$dev" != "--" ]] || continue
+      [[ -n "$dev" && "$dev" != -- ]] || continue
       method="$(nmcli -g ipv4.method connection show "$name" 2>/dev/null | head -n1 | tr -d '[:space:]' || true)"
       [[ "$method" == shared ]] || continue
       cidr="$(ip -4 -o addr show dev "$dev" scope global 2>/dev/null | awk '{print $4}' | head -n1)"
       [[ -n "$cidr" ]] || continue
       HOTSPOT_CONNECTION="$name"; HOTSPOT_IFACE="$dev"; HOTSPOT_SUBNET="$(subnet_from_cidr "$cidr")"; return 0
     done < <(nmcli -t -f NAME,DEVICE connection show --active 2>/dev/null || true)
-
-    while IFS=: read -r dev type state; do
-      [[ "$type" == wifi && "$state" == connected ]] || continue
-      cidr="$(ip -4 -o addr show dev "$dev" scope global 2>/dev/null | awk '{print $4}' | head -n1)"
-      [[ "$cidr" == 10.42.* ]] || continue
-      name="$(nmcli -g GENERAL.CONNECTION device show "$dev" 2>/dev/null | head -n1 || true)"
-      HOTSPOT_CONNECTION="${name:-Hotspot}"; HOTSPOT_IFACE="$dev"; HOTSPOT_SUBNET="$(subnet_from_cidr "$cidr")"; return 0
-    done < <(nmcli -t -f DEVICE,TYPE,STATE device status 2>/dev/null || true)
   fi
-
-  while read -r dev cidr; do
-    [[ "$cidr" == 10.42.* ]] || continue
-    HOTSPOT_CONNECTION=Hotspot; HOTSPOT_IFACE="$dev"; HOTSPOT_SUBNET="$(subnet_from_cidr "$cidr")"; return 0
-  done < <(ip -4 -o addr show scope global 2>/dev/null | awk '{print $2, $4}')
-}
-
-flush_hotspot_conntrack() {
-  local subnet="${1:-}"
-  [[ -n "$subnet" ]] || return 0
-  command -v conntrack >/dev/null 2>&1 || return 0
-  conntrack -D -s "$subnet" >/dev/null 2>&1 || true
-  conntrack -D -d "$subnet" >/dev/null 2>&1 || true
-}
-
-remove_hotspot_policy() {
-  local subnet="${1:-}"
-  [[ -n "$subnet" ]] || return 0
-  ip xfrm policy delete src "$subnet" dst 0.0.0.0/0 dir out priority "$HOTSPOT_XFRM_PRIORITY" if_id "$XFRM_IF_ID" >/dev/null 2>&1 || true
-}
-
-purge_system_routes() {
-  while ip rule del pref "$SYSTEM_RULE_PREF" lookup "$ROUTE_TABLE" >/dev/null 2>&1; do :; done
-  ip route del default dev "$XFRM_IF" table "$ROUTE_TABLE" >/dev/null 2>&1 || true
-  for net in 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16; do
-    ip route del throw "$net" table "$ROUTE_TABLE" >/dev/null 2>&1 || true
-  done
-}
-
-purge_hotspot_rules() {
-  local vip="${1:-}" iface="${2:-}" subnet="${3:-}" old_mss="${4:-1200}" dns="${5:-}"
-  [[ -n "$subnet" ]] || return 0
-  remove_hotspot_policy "$subnet"
-  while ip rule del pref "$HOTSPOT_RULE_PREF" from "$subnet" lookup "$ROUTE_TABLE" >/dev/null 2>&1; do :; done
-  while IFS= read -r rule; do
-    [[ "$rule" == *"-s $subnet"* && "$rule" == *"-j SNAT --to-source 10.6."* ]] || continue
-    iptables -t nat -D POSTROUTING ${rule#-A POSTROUTING } >/dev/null 2>&1 || true
-  done < <(iptables -t nat -S POSTROUTING 2>/dev/null || true)
-  if [[ -n "$iface" ]]; then
-    while iptables -t mangle -D FORWARD -i "$iface" -s "$subnet" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$old_mss" 2>/dev/null; do :; done
-    while iptables -D FORWARD -i "$iface" -o "$XFRM_IF" -s "$subnet" -j ACCEPT 2>/dev/null; do :; done
-    while iptables -D FORWARD -i "$XFRM_IF" -o "$iface" -d "$subnet" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null; do :; done
-    if [[ -n "$dns" ]]; then
-      while iptables -t nat -D PREROUTING -i "$iface" -s "$subnet" -p udp --dport 53 -j DNAT --to-destination "$dns" 2>/dev/null; do :; done
-      while iptables -t nat -D PREROUTING -i "$iface" -s "$subnet" -p tcp --dport 53 -j DNAT --to-destination "$dns" 2>/dev/null; do :; done
-    fi
-  fi
-  flush_hotspot_conntrack "$subnet"
-}
-
-cleanup_old() {
-  local vip iface old_mss hs_iface hs_subnet hs_dns server
-  vip="$(state_get VIRTUAL_IP)"; iface="$(state_get IFACE)"; old_mss="$(state_get MSS_VALUE)"
-  hs_iface="$(state_get HOTSPOT_IFACE)"; hs_subnet="$(state_get HOTSPOT_SUBNET)"; hs_dns="$(state_get HOTSPOT_DNS)"; server="$(state_get SERVER_IP)"
-  [[ -z "$vip" ]] || iptables -t mangle -D OUTPUT -s "$vip/32" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "${old_mss:-1200}" 2>/dev/null || true
-  purge_hotspot_rules "$vip" "$hs_iface" "$hs_subnet" "${old_mss:-1200}" "$hs_dns"
-  purge_system_routes
-  [[ -z "$server" ]] || ip route del throw "$server" table "$ROUTE_TABLE" >/dev/null 2>&1 || true
-  ip link del "$XFRM_IF" >/dev/null 2>&1 || true
-  if [[ -n "$iface" ]] && command -v resolvectl >/dev/null 2>&1; then resolvectl revert "$iface" >/dev/null 2>&1 || true; fi
-  [[ -z "$vip" || -z "$iface" ]] || ip addr del "$vip/32" dev "$iface" >/dev/null 2>&1 || true
-  rm -f "$STATE_FILE"
 }
 
 recover_interface() {
-  local iface="${1:-}" enabled="${2:-0}"
-  [[ "$enabled" == 1 && -n "$iface" ]] || return 0
+  local iface="${1:-}"
+  [[ "$RECOVER_NETWORK" == 1 && -n "$iface" ]] || return 0
   command -v nmcli >/dev/null 2>&1 || return 0
   nmcli device reapply "$iface" >/dev/null 2>&1 || true
   command -v resolvectl >/dev/null 2>&1 && resolvectl flush-caches >/dev/null 2>&1 || true
@@ -190,111 +148,111 @@ else
   exit 66
 fi
 
-cleanup_old
-if command -v nmcli >/dev/null 2>&1; then
-  nmcli connection down "$NM_MARKER" >/dev/null 2>&1 || true
-  nmcli connection delete "$NM_MARKER" >/dev/null 2>&1 || true
+OLD_IFACE="$(state_get IFACE)"
+OLD_VIP="$(state_get VIRTUAL_IP)"
+OLD_HOT="$(state_get HOTSPOT_IFACE)"
+OLD_SUBNET="$(state_get HOTSPOT_SUBNET)"
+OLD_MSS="$(state_get MSS_VALUE)"
+cleanup_policy
+swanctl --terminate --ike "$CONN_NAME" >/dev/null 2>&1 || true
+swanctl --terminate --ike surfshark-tr >/dev/null 2>&1 || true
+ip link del "$XFRM_IF" >/dev/null 2>&1 || true
+if [[ -n "$OLD_VIP" ]]; then ip addr del "$OLD_VIP/32" dev "$OLD_IFACE" >/dev/null 2>&1 || true; fi
+if [[ -n "$OLD_IFACE" ]] && command -v resolvectl >/dev/null 2>&1; then resolvectl revert "$OLD_IFACE" >/dev/null 2>&1 || true; fi
+if [[ -n "$OLD_HOT" && -n "$OLD_SUBNET" ]]; then
+  iptables -w -t nat -D POSTROUTING -s "$OLD_SUBNET" -o "$XFRM_IF" -j SNAT --to-source "$OLD_VIP" 2>/dev/null || true
 fi
+rm -f "$STATE_FILE"
 
 IFS=',' read -r -a DNS_SERVERS <<< "$DNS_CSV"
 VALID_DNS=()
 for dns in "${DNS_SERVERS[@]}"; do
   dns="${dns//[[:space:]]/}"
-  [[ "$dns" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || continue
-  VALID_DNS+=("$dns")
+  [[ "$dns" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] && VALID_DNS+=("$dns")
 done
 [[ ${#VALID_DNS[@]} -gt 0 ]] || VALID_DNS=(162.252.172.57 149.154.159.92)
 DNS_CSV="$(IFS=,; echo "${VALID_DNS[*]}")"
 HOTSPOT_DNS="${VALID_DNS[0]}"
-
 detect_hotspot
 
-# The restricted tunnel is route-based for the Ubuntu host itself. Previously
-# XFRM routing was only enabled when a hotspot happened to be active, which let
-# the IKE/CHILD SA show as connected while ordinary desktop traffic kept using
-# the ISP default route. Always create the XFRM interface and bind the CHILD_SA
-# to it; hotspot forwarding remains independently optional below.
-ip link del "$XFRM_IF" >/dev/null 2>&1 || true
-if ! ip link add "$XFRM_IF" type xfrm if_id "$XFRM_IF_ID" 2>/dev/null; then
-  echo "Kernel/iproute2 could not create XFRM interface $XFRM_IF." >&2
-  exit 70
-fi
+ip link add "$XFRM_IF" type xfrm if_id "$XFRM_IF_ID"
 ip link set "$XFRM_IF" mtu 1280 up
-ROUTE_BASED=1
 
-ESC_PASS="${SERVICE_PASS//\\/\\\\}"
-ESC_PASS="${ESC_PASS//\"/\\\"}"
-
+ESC_PASS="${SERVICE_PASS//\\/\\\\}"; ESC_PASS="${ESC_PASS//\"/\\\"}"
 install -d -m 0755 /etc/swanctl/conf.d
 cat >"$CONF" <<EOF
 connections {
-    $CONN_NAME {
-        version = 2
-        remote_addrs = $SERVER_IP
-        proposals = aes256gcm16-prfsha256-ecp521,aes256-sha256-modp2048
-        encap = yes
-        fragmentation = yes
-        mobike = yes
-        send_certreq = yes
-        local {
-            auth = eap-mschapv2
-            eap_id = $SERVICE_USER
-            id = $SERVICE_USER
-        }
-        remote {
-            auth = pubkey
-            id = $SERVER_IP
-        }
-        children {
-            $CHILD_NAME {
-                local_ts = 0.0.0.0/0
-                remote_ts = 0.0.0.0/0
-                esp_proposals = aes256-sha1,aes256-sha256
-                start_action = none
-                dpd_action = restart
-                if_id_in = $XFRM_IF_ID
-                if_id_out = $XFRM_IF_ID
-            }
-        }
-        vips = 0.0.0.0
-        dpd_delay = 30s
+  $CONN_NAME {
+    version = 2
+    remote_addrs = $SERVER_IP
+    proposals = aes256gcm16-prfsha256-ecp521,aes256-sha256-modp2048
+    encap = yes
+    fragmentation = yes
+    mobike = yes
+    send_certreq = yes
+    local { auth = eap-mschapv2; eap_id = $SERVICE_USER; id = $SERVICE_USER }
+    remote { auth = pubkey; id = $SERVER_IP }
+    children {
+      $CHILD_NAME {
+        local_ts = 0.0.0.0/0
+        remote_ts = 0.0.0.0/0
+        esp_proposals = aes256-sha1,aes256-sha256
+        start_action = none
+        dpd_action = restart
+        if_id_in = $XFRM_IF_ID
+        if_id_out = $XFRM_IF_ID
+      }
     }
+    vips = 0.0.0.0
+    dpd_delay = 30s
+  }
 }
-secrets {
-    eap-milmit-surfshark {
-        id = $SERVICE_USER
-        secret = "$ESC_PASS"
-    }
-}
+secrets { eap-milmit-surfshark { id = $SERVICE_USER; secret = "$ESC_PASS" } }
 EOF
 chmod 0600 "$CONF"
 
-grep -Fq "eap_id = $SERVICE_USER" "$CONF" || { echo "Generated config is missing EAP identity." >&2; exit 66; }
-grep -Fq "auth = eap-mschapv2" "$CONF" || { echo "Generated config is missing EAP-MSCHAPv2 enforcement." >&2; exit 66; }
-grep -Fq "id = $SERVER_IP" "$CONF" || { echo "Generated config is missing direct-IP server identity." >&2; exit 66; }
-
-swanctl --terminate --ike "$CONN_NAME" >/dev/null 2>&1 || true
-swanctl --terminate --ike surfshark-tr >/dev/null 2>&1 || true
-LOAD_CONNS="$(swanctl --load-conns 2>&1)"
-printf '%s\n' "$LOAD_CONNS"
-printf '%s\n' "$LOAD_CONNS" | grep -Fq "loaded connection '$CONN_NAME'" || { echo "strongSwan did not load the MilMit restricted connection." >&2; exit 66; }
-LOAD_CREDS="$(swanctl --load-creds 2>&1)"
-printf '%s\n' "$LOAD_CREDS"
-printf '%s\n' "$LOAD_CREDS" | grep -Fq "eap-milmit-surfshark" || { echo "strongSwan did not load the MilMit EAP secret; refusing to attempt authentication." >&2; exit 66; }
-
-if ! swanctl --initiate --child "$CHILD_NAME"; then
-  swanctl --terminate --ike "$CONN_NAME" >/dev/null 2>&1 || true
-  ip link del "$XFRM_IF" >/dev/null 2>&1 || true
-  exit 69
-fi
+grep -Fq "eap_id = $SERVICE_USER" "$CONF" || exit 66
+grep -Fq "id = $SERVER_IP" "$CONF" || exit 66
+LOAD_CONNS="$(swanctl --load-conns 2>&1)"; printf '%s\n' "$LOAD_CONNS"
+LOAD_CREDS="$(swanctl --load-creds 2>&1)"; printf '%s\n' "$LOAD_CREDS"
+printf '%s\n' "$LOAD_CREDS" | grep -Fq "eap-milmit-surfshark" || { echo "MilMit EAP secret was not loaded." >&2; exit 66; }
+swanctl --initiate --child "$CHILD_NAME"
 
 SA_TEXT="$(swanctl --list-sas 2>&1 || true)"
 VIRTUAL_IP="$(printf '%s\n' "$SA_TEXT" | sed -nE 's/.*local .*\[([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)\].*/\1/p' | head -n1)"
-[[ -n "$VIRTUAL_IP" ]] || { swanctl --terminate --ike "$CONN_NAME" >/dev/null 2>&1 || true; ip link del "$XFRM_IF" >/dev/null 2>&1 || true; echo "$SA_TEXT"; echo "No virtual IPv4 was found." >&2; exit 67; }
-IFACE="$(ip -4 route get "$SERVER_IP" 2>/dev/null | sed -nE 's/.* dev ([^ ]+).*/\1/p' | head -n1)"
+[[ -n "$VIRTUAL_IP" ]] || { echo "$SA_TEXT"; echo "No virtual IPv4 was found." >&2; exit 67; }
+IFACE="$(ip -4 route get "$SERVER_IP" | sed -nE 's/.* dev ([^ ]+).*/\1/p' | head -n1)"
 
-iptables -t mangle -D OUTPUT -s "$VIRTUAL_IP/32" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$MSS" 2>/dev/null || true
-iptables -t mangle -A OUTPUT -s "$VIRTUAL_IP/32" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$MSS"
+# Route table: only packets explicitly marked VPN enter the XFRM interface.
+ip route replace default dev "$XFRM_IF" src "$VIRTUAL_IP" table "$ROUTE_TABLE"
+ip rule add pref "$RULE_DIRECT_PREF" fwmark "$MARK_DIRECT" table main
+ip rule add pref "$RULE_VPN_PREF" fwmark "$MARK_VPN" table "$ROUTE_TABLE"
+
+# Host policy chain. Local/private/control traffic stays direct, Internet traffic gets VPN mark.
+ipt_chain_reset mangle "$CHAIN_HOST"
+iptables -w -t mangle -A "$CHAIN_HOST" -d "$SERVER_IP/32" -j RETURN
+for net in 127.0.0.0/8 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16 224.0.0.0/4 255.255.255.255/32; do
+  iptables -w -t mangle -A "$CHAIN_HOST" -d "$net" -j MARK --set-mark "$MARK_DIRECT"
+  iptables -w -t mangle -A "$CHAIN_HOST" -d "$net" -j RETURN
+done
+iptables -w -t mangle -A "$CHAIN_HOST" -m mark ! --mark "$MARK_DIRECT" -j MARK --set-mark "$MARK_VPN"
+ipt_unhook mangle OUTPUT "$CHAIN_HOST"
+iptables -w -t mangle -I OUTPUT 2 -j "$CHAIN_HOST"
+
+# Explicitly mark systemd-resolved upstream DNS into the VPN policy.
+ipt_chain_reset mangle "$CHAIN_DNS"
+RESOLVED_UID="$(id -u systemd-resolve 2>/dev/null || id -u systemd-resolved 2>/dev/null || true)"
+if [[ -n "$RESOLVED_UID" ]]; then
+  iptables -w -t mangle -A "$CHAIN_DNS" -m owner --uid-owner "$RESOLVED_UID" -j MARK --set-mark "$MARK_VPN"
+fi
+ipt_unhook mangle OUTPUT "$CHAIN_DNS"
+iptables -w -t mangle -I OUTPUT 1 -j "$CHAIN_DNS"
+
+# MSS clamp on both host and forwarded TCP SYN traffic.
+ipt_chain_reset mangle "$CHAIN_MSS"
+iptables -w -t mangle -A "$CHAIN_MSS" -m mark --mark "$MARK_VPN" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$MSS"
+ipt_unhook mangle OUTPUT "$CHAIN_MSS"; iptables -w -t mangle -I OUTPUT 3 -j "$CHAIN_MSS"
+ipt_unhook mangle FORWARD "$CHAIN_MSS"; iptables -w -t mangle -I FORWARD 1 -j "$CHAIN_MSS"
 
 if command -v resolvectl >/dev/null 2>&1 && [[ -n "$IFACE" ]]; then
   resolvectl dns "$IFACE" "${VALID_DNS[@]}" || true
@@ -302,99 +260,91 @@ if command -v resolvectl >/dev/null 2>&1 && [[ -n "$IFACE" ]]; then
   resolvectl flush-caches || true
 fi
 
-# Force normal Ubuntu traffic into the XFRM interface. The Surfshark endpoint
-# itself and local/private networks intentionally fall through to the normal
-# routing table, preventing a routing loop and preserving LAN access.
-purge_system_routes
-ip route replace throw "$SERVER_IP" table "$ROUTE_TABLE"
-for net in 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16; do
-  ip route replace throw "$net" table "$ROUTE_TABLE"
-done
-ip route replace default dev "$XFRM_IF" src "$VIRTUAL_IP" table "$ROUTE_TABLE"
-ip rule add pref "$SYSTEM_RULE_PREF" lookup "$ROUTE_TABLE"
-
-HOTSPOT_XFRM_POLICY=0
-HOTSPOT_XFRM_SPI=""
+# Optional selected hotspot policy: mark its forwarded packets into the same VPN table.
 if [[ "$HOTSPOT_VPN" == 1 && -n "$HOTSPOT_IFACE" && -n "$HOTSPOT_SUBNET" ]]; then
   sysctl -w net.ipv4.ip_forward=1 >/dev/null
-  while ip rule del pref "$HOTSPOT_RULE_PREF" from "$HOTSPOT_SUBNET" lookup "$ROUTE_TABLE" >/dev/null 2>&1; do :; done
-  ip rule add pref "$HOTSPOT_RULE_PREF" from "$HOTSPOT_SUBNET" lookup "$ROUTE_TABLE"
-  read -r OUTER_SRC OUTER_DST OUT_SPI OUT_REQID <<< "$(ip xfrm state | awk '/^src / {s=$2; d=$4; spi=""; req=""} /^[[:space:]]+proto esp/ {for (i=1;i<=NF;i++) {if ($i=="spi") spi=$(i+1); if ($i=="reqid") req=$(i+1)}} /^[[:space:]]+dir out/ {print s, d, spi, req; exit}')"
-  purge_hotspot_rules "$VIRTUAL_IP" "$HOTSPOT_IFACE" "$HOTSPOT_SUBNET" "$MSS" "$HOTSPOT_DNS"
-  if [[ -n "${OUTER_SRC:-}" && -n "${OUTER_DST:-}" && -n "${OUT_SPI:-}" && -n "${OUT_REQID:-}" ]]; then
-    if ip xfrm policy add src "$HOTSPOT_SUBNET" dst 0.0.0.0/0 dir out priority "$HOTSPOT_XFRM_PRIORITY" if_id "$XFRM_IF_ID" tmpl src "$OUTER_SRC" dst "$OUTER_DST" proto esp spi "$OUT_SPI" reqid "$OUT_REQID" mode tunnel; then
-      HOTSPOT_XFRM_POLICY=1; HOTSPOT_XFRM_SPI="$OUT_SPI"
-    fi
-  fi
-  iptables -t nat -I POSTROUTING 1 -s "$HOTSPOT_SUBNET" ! -d "$HOTSPOT_SUBNET" -o "$XFRM_IF" -j SNAT --to-source "$VIRTUAL_IP"
-  iptables -t mangle -I FORWARD 1 -i "$HOTSPOT_IFACE" -s "$HOTSPOT_SUBNET" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$MSS"
-  iptables -I FORWARD 1 -i "$HOTSPOT_IFACE" -o "$XFRM_IF" -s "$HOTSPOT_SUBNET" -j ACCEPT
-  iptables -I FORWARD 1 -i "$XFRM_IF" -o "$HOTSPOT_IFACE" -d "$HOTSPOT_SUBNET" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
-  iptables -t nat -I PREROUTING 1 -i "$HOTSPOT_IFACE" -s "$HOTSPOT_SUBNET" -p udp --dport 53 -j DNAT --to-destination "$HOTSPOT_DNS"
-  iptables -t nat -I PREROUTING 1 -i "$HOTSPOT_IFACE" -s "$HOTSPOT_SUBNET" -p tcp --dport 53 -j DNAT --to-destination "$HOTSPOT_DNS"
-  flush_hotspot_conntrack "$HOTSPOT_SUBNET"
+  ipt_chain_reset mangle "$CHAIN_HOT"
+  for net in "$HOTSPOT_SUBNET" 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16; do
+    iptables -w -t mangle -A "$CHAIN_HOT" -d "$net" -j MARK --set-mark "$MARK_DIRECT"
+    iptables -w -t mangle -A "$CHAIN_HOT" -d "$net" -j RETURN
+  done
+  iptables -w -t mangle -A "$CHAIN_HOT" -j MARK --set-mark "$MARK_VPN"
+  ipt_unhook mangle PREROUTING "$CHAIN_HOT"
+  iptables -w -t mangle -I PREROUTING 1 -i "$HOTSPOT_IFACE" -s "$HOTSPOT_SUBNET" -j "$CHAIN_HOT"
+  iptables -w -t nat -D POSTROUTING -s "$HOTSPOT_SUBNET" -o "$XFRM_IF" -j SNAT --to-source "$VIRTUAL_IP" 2>/dev/null || true
+  iptables -w -t nat -I POSTROUTING 1 -s "$HOTSPOT_SUBNET" -o "$XFRM_IF" -j SNAT --to-source "$VIRTUAL_IP"
+  iptables -w -t nat -I PREROUTING 1 -i "$HOTSPOT_IFACE" -s "$HOTSPOT_SUBNET" -p udp --dport 53 -j DNAT --to-destination "$HOTSPOT_DNS"
+  iptables -w -t nat -I PREROUTING 1 -i "$HOTSPOT_IFACE" -s "$HOTSPOT_SUBNET" -p tcp --dport 53 -j DNAT --to-destination "$HOTSPOT_DNS"
 fi
-ip route flush cache >/dev/null 2>&1 || true
 
-# Important: test the ordinary system path, not a curl explicitly bound to the
-# VPN virtual IP. This catches the exact failure where the SA is established but
-# desktop applications still leave through the ISP interface.
-TRACE="$(curl -4 --max-time 10 -ks https://1.1.1.1/cdn-cgi/trace || true)"
+# Optional fail-closed kill switch. It only applies to public IPv4 traffic.
+ipt_chain_reset filter "$CHAIN_KILL"
+if [[ "$KILL_SWITCH" == 1 ]]; then
+  iptables -w -t filter -A "$CHAIN_KILL" -d "$SERVER_IP/32" -j RETURN
+  for net in 127.0.0.0/8 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16; do iptables -w -t filter -A "$CHAIN_KILL" -d "$net" -j RETURN; done
+  iptables -w -t filter -A "$CHAIN_KILL" -m mark --mark "$MARK_VPN" -j RETURN
+  iptables -w -t filter -A "$CHAIN_KILL" -j REJECT
+  ipt_unhook filter OUTPUT "$CHAIN_KILL"; iptables -w -t filter -A OUTPUT -j "$CHAIN_KILL"
+fi
+
+ip route flush cache >/dev/null 2>&1 || true
+ROUTE_CHECK="$(ip -4 route get 1.1.1.1 mark "$MARK_VPN" 2>&1 || true)"
+printf 'Marked route : %s\n' "$ROUTE_CHECK"
+printf '%s' "$ROUTE_CHECK" | grep -Fq "dev $XFRM_IF" || { echo "Marked route does not select $XFRM_IF" >&2; cleanup_policy; exit 68; }
+
+BEFORE_PKTS="$(iptables -w -t mangle -L "$CHAIN_HOST" -v -n -x 2>/dev/null | awk 'NR>2 {s+=$1} END{print s+0}')"
+TRACE="$(curl -4 --max-time 12 -ks https://1.1.1.1/cdn-cgi/trace || true)"
+AFTER_PKTS="$(iptables -w -t mangle -L "$CHAIN_HOST" -v -n -x 2>/dev/null | awk 'NR>2 {s+=$1} END{print s+0}')"
 PUBLIC_IP="$(printf '%s\n' "$TRACE" | sed -n 's/^ip=//p' | head -n1)"
 EXIT_COUNTRY="$(printf '%s\n' "$TRACE" | sed -n 's/^loc=//p' | head -n1)"
-if [[ -z "$PUBLIC_IP" ]]; then
+if [[ -z "$PUBLIC_IP" || "$AFTER_PKTS" -le "$BEFORE_PKTS" ]]; then
+  echo "Marked system data-path verification failed." >&2
+  cleanup_policy
   swanctl --terminate --ike "$CONN_NAME" >/dev/null 2>&1 || true
-  purge_hotspot_rules "$VIRTUAL_IP" "$HOTSPOT_IFACE" "$HOTSPOT_SUBNET" "$MSS" "$HOTSPOT_DNS"
-  purge_system_routes
-  ip route del throw "$SERVER_IP" table "$ROUTE_TABLE" >/dev/null 2>&1 || true
   ip link del "$XFRM_IF" >/dev/null 2>&1 || true
-  [[ "$RECOVER_NETWORK" == 1 ]] && recover_interface "$IFACE" 1
-  printf '\nSystem data-path test: FAILED\n'; exit 68
+  recover_interface "$IFACE"
+  exit 68
 fi
 
 NM_MARKER_ACTIVE=0
 if command -v nmcli >/dev/null 2>&1 && systemctl is-active --quiet NetworkManager.service 2>/dev/null; then
   nmcli connection delete "$NM_MARKER" >/dev/null 2>&1 || true
-  if nmcli connection add type dummy ifname "$NM_MARKER_IF" con-name "$NM_MARKER" ipv4.method disabled ipv6.method disabled connection.autoconnect no >/dev/null 2>&1; then nmcli connection up "$NM_MARKER" >/dev/null 2>&1 && NM_MARKER_ACTIVE=1 || true; fi
+  if nmcli connection add type dummy ifname "$NM_MARKER_IF" con-name "$NM_MARKER" ipv4.method disabled ipv6.method disabled connection.autoconnect no >/dev/null 2>&1; then
+    nmcli connection up "$NM_MARKER" >/dev/null 2>&1 && NM_MARKER_ACTIVE=1 || true
+  fi
 fi
 
 install -d -m 0755 "$STATE_DIR"
-umask 077
-cat > "$STATE_FILE" <<EOF
+cat >"$STATE_FILE" <<EOF
 VIRTUAL_IP=$VIRTUAL_IP
 IFACE=$IFACE
 MSS_VALUE=$MSS
 DNS_CSV=$DNS_CSV
 SERVER_IP=$SERVER_IP
-NM_MARKER_ACTIVE=$NM_MARKER_ACTIVE
 PUBLIC_IP=$PUBLIC_IP
 EXIT_COUNTRY=$EXIT_COUNTRY
+MARK_VPN=$MARK_VPN
+MARK_DIRECT=$MARK_DIRECT
+RULE_VPN_PREF=$RULE_VPN_PREF
+RULE_DIRECT_PREF=$RULE_DIRECT_PREF
 SYSTEM_VPN=1
-SYSTEM_RULE_PREF=$SYSTEM_RULE_PREF
+KILL_SWITCH=$KILL_SWITCH
 HOTSPOT_VPN=$HOTSPOT_VPN
 HOTSPOT_IFACE_REQUEST=$HOTSPOT_IFACE_REQUEST
 HOTSPOT_CONNECTION=$HOTSPOT_CONNECTION
 HOTSPOT_IFACE=$HOTSPOT_IFACE
 HOTSPOT_SUBNET=$HOTSPOT_SUBNET
 HOTSPOT_DNS=$HOTSPOT_DNS
-HOTSPOT_XFRM_POLICY=$HOTSPOT_XFRM_POLICY
-HOTSPOT_XFRM_SPI=$HOTSPOT_XFRM_SPI
-ROUTE_BASED=$ROUTE_BASED
 RECOVER_NETWORK=$RECOVER_NETWORK
+NM_MARKER_ACTIVE=$NM_MARKER_ACTIVE
 EOF
 chmod 0644 "$STATE_FILE"
 
 printf '\nRestricted Surfshark IKEv2 is established\n'
 printf 'Virtual IPv4 : %s\nMSS clamp    : %s\nDNS          : %s\nInterface    : %s\n' "$VIRTUAL_IP" "$MSS" "$DNS_CSV" "$IFACE"
-printf 'System VPN   : ON · all normal IPv4 Internet traffic via %s\n' "$XFRM_IF"
-printf 'Ubuntu marker: %s\n' "$([[ "$NM_MARKER_ACTIVE" == 1 ]] && echo active || echo unavailable)"
-printf 'Hotspot target: %s\n' "$HOTSPOT_IFACE_REQUEST"
-if [[ "$HOTSPOT_VPN" == 1 && -n "$HOTSPOT_IFACE" ]]; then
-  printf 'Hotspot VPN   : ON · %s · %s\n' "$HOTSPOT_IFACE" "$HOTSPOT_SUBNET"
-elif [[ "$HOTSPOT_VPN" == 1 ]]; then
-  printf 'Hotspot VPN   : enabled · selected/auto hotspot not active\n'
-else
-  printf 'Hotspot VPN   : OFF · hotspot keeps normal route\n'
-fi
+printf 'Routing      : MARK %s -> table %s -> %s\n' "$MARK_VPN" "$ROUTE_TABLE" "$XFRM_IF"
+printf 'Policy pkts  : %s -> %s\n' "$BEFORE_PKTS" "$AFTER_PKTS"
+printf 'Kill switch  : %s\n' "$([[ "$KILL_SWITCH" == 1 ]] && echo ON || echo OFF)"
+printf 'Hotspot VPN  : %s\n' "$([[ "$HOTSPOT_VPN" == 1 && -n "$HOTSPOT_IFACE" ]] && printf 'ON · %s · %s' "$HOTSPOT_IFACE" "$HOTSPOT_SUBNET" || echo OFF)"
 printf '%s\n' "$SA_TEXT"
 printf '\nSystem data-path test: OK\nData-path test: OK\nPublic IPv4 : %s\nExit country: %s\n' "$PUBLIC_IP" "${EXIT_COUNTRY:-unknown}"
