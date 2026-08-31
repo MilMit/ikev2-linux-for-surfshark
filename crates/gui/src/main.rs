@@ -20,6 +20,8 @@ enum Event {
     Disconnected,
     Failed(String),
     Refreshed(bool, String),
+    PingStarted,
+    PingResults(Vec<(String, Option<u32>)>),
 }
 
 fn run(cmd: &str, args: &[&str]) -> String {
@@ -180,6 +182,66 @@ fn configure_profile(host: &str, username: &str, password: Option<&str>) -> Stri
     log
 }
 
+fn ping_ms(host: &str) -> Option<u32> {
+    let output = Command::new("ping")
+        .args(["-n", "-c", "1", "-W", "1", host])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let marker = "time=";
+    let start = text.find(marker)? + marker.len();
+    let rest = &text[start..];
+    let end = rest.find(|c: char| c == ' ' || c == '\n').unwrap_or(rest.len());
+    rest[..end].parse::<f64>().ok().map(|v| v.round() as u32)
+}
+
+fn scan_latencies() -> Vec<(String, Option<u32>)> {
+    LOCATIONS
+        .iter()
+        .map(|item| (item.id.to_string(), ping_ms(item.host)))
+        .collect()
+}
+
+fn repopulate_locations(
+    combo: &gtk::ComboBoxText,
+    results: &[(String, Option<u32>)],
+    connected_host: Option<&str>,
+) {
+    let active = combo.active_id().map(|s| s.to_string());
+    combo.remove_all();
+
+    for item in LOCATIONS {
+        let latency = results
+            .iter()
+            .find(|(id, _)| id == item.id)
+            .and_then(|(_, value)| *value);
+        let is_connected = connected_host == Some(item.host) && nm_active();
+        let label = if is_connected {
+            match latency {
+                Some(ms) => format!("🟢 {} · Connected · {} ms", item.label, ms),
+                None => format!("🟢 {} · Connected", item.label),
+            }
+        } else {
+            match latency {
+                Some(ms) if ms < 100 => format!("🟢 {} · {} ms", item.label, ms),
+                Some(ms) if ms < 220 => format!("🟡 {} · {} ms", item.label, ms),
+                Some(ms) => format!("🟠 {} · {} ms", item.label, ms),
+                None => format!("⚪ {} · no ping", item.label),
+            }
+        };
+        combo.append(Some(item.id), &label);
+    }
+
+    if let Some(id) = active {
+        combo.set_active_id(Some(&id));
+    } else {
+        combo.set_active(Some(0));
+    }
+}
+
 fn append_log(buffer: &gtk::TextBuffer, title: &str, body: &str) {
     let mut end = buffer.end_iter();
     buffer.insert(&mut end, &format!("\n=== {title} ===\n{body}\n"));
@@ -193,6 +255,7 @@ fn install_css() {
          .status-pill { padding: 7px 12px; border-radius: 999px; background: alpha(@accent_bg_color, .14); }\n\
          .location-box { padding: 14px; border-radius: 14px; }\n\
          .primary-connect { min-height: 44px; padding-left: 30px; padding-right: 30px; }\n\
+         .ping-note { font-size: 11px; }\n\
          .diag-box { font-size: 12px; }",
     );
     if let Some(display) = gtk::gdk::Display::default() {
@@ -267,10 +330,23 @@ fn build_ui(app: &adw::Application) {
         location.set_active(Some(0));
     }
 
+    let ping_button = gtk::Button::with_label("Test latency");
+    ping_button.set_tooltip_text(Some("Ping all listed locations in the background"));
+    let ping_note = gtk::Label::builder()
+        .label("🟢 fast  ·  🟡 medium  ·  🟠 slow  ·  ⚪ ICMP unavailable")
+        .halign(gtk::Align::Start)
+        .css_classes(["dim-label", "ping-note"])
+        .build();
+
+    let location_row = gtk::Box::new(Orientation::Horizontal, 8);
+    location_row.append(&location);
+    location_row.append(&ping_button);
+
     let location_box = gtk::Box::new(Orientation::Vertical, 7);
     location_box.add_css_class("location-box");
     location_box.append(&location_label);
-    location_box.append(&location);
+    location_box.append(&location_row);
+    location_box.append(&ping_note);
 
     let user = gtk::Entry::builder()
         .placeholder_text("Surfshark service username")
@@ -364,8 +440,8 @@ fn build_ui(app: &adw::Application) {
     let window = adw::ApplicationWindow::builder()
         .application(app)
         .title("Surfshark IKEv2 for Linux")
-        .default_width(720)
-        .default_height(680)
+        .default_width(760)
+        .default_height(700)
         .content(&root)
         .build();
 
@@ -376,6 +452,7 @@ fn build_ui(app: &adw::Application) {
     let connect = Rc::new(connect);
     let disconnect = Rc::new(disconnect);
     let refresh = Rc::new(refresh);
+    let ping_button = Rc::new(ping_button);
     let buffer = Rc::new(buffer);
     let ip_label = Rc::new(ip_label);
     let creds_note = Rc::new(creds_note);
@@ -389,10 +466,12 @@ fn build_ui(app: &adw::Application) {
         let connect = Rc::clone(&connect);
         let disconnect = Rc::clone(&disconnect);
         let refresh = Rc::clone(&refresh);
+        let ping_button = Rc::clone(&ping_button);
         let buffer = Rc::clone(&buffer);
         let ip_label = Rc::clone(&ip_label);
         let creds_note = Rc::clone(&creds_note);
         let pass = Rc::clone(&pass);
+        let location = Rc::clone(&location);
 
         glib::timeout_add_local(Duration::from_millis(80), move || {
             while let Ok(event) = rx.try_recv() {
@@ -407,7 +486,7 @@ fn build_ui(app: &adw::Application) {
                     Event::Log(title, body) => append_log(&buffer, &title, &body),
                     Event::Connected(ip, label) => {
                         spinner.stop();
-                        status.set_label("Connected · Ubuntu VPN active");
+                        status.set_label("🟢 Connected · Ubuntu VPN active");
                         ip_label.set_label(&format!("{label}  ·  Public IP: {ip}"));
                         connect.set_sensitive(true);
                         disconnect.set_sensitive(true);
@@ -415,6 +494,7 @@ fn build_ui(app: &adw::Application) {
                         pass.set_text("");
                         pass.set_placeholder_text(Some("Password saved · leave blank to reuse"));
                         creds_note.set_label("✓ Credentials saved in NetworkManager");
+                        repopulate_locations(&location, &[], saved_host().as_deref());
                     }
                     Event::Disconnected => {
                         spinner.stop();
@@ -423,6 +503,7 @@ fn build_ui(app: &adw::Application) {
                         connect.set_sensitive(true);
                         disconnect.set_sensitive(true);
                         refresh.set_sensitive(true);
+                        repopulate_locations(&location, &[], None);
                     }
                     Event::Failed(message) => {
                         spinner.stop();
@@ -434,11 +515,27 @@ fn build_ui(app: &adw::Application) {
                     }
                     Event::Refreshed(active, text) => {
                         spinner.stop();
-                        status.set_label(if active { "Connected" } else { "Disconnected" });
+                        status.set_label(if active { "🟢 Connected" } else { "Disconnected" });
                         connect.set_sensitive(true);
                         disconnect.set_sensitive(true);
                         refresh.set_sensitive(true);
                         append_log(&buffer, "STATUS", &text);
+                    }
+                    Event::PingStarted => {
+                        ping_button.set_sensitive(false);
+                        ping_button.set_label("Testing…");
+                    }
+                    Event::PingResults(results) => {
+                        ping_button.set_sensitive(true);
+                        ping_button.set_label("Test latency");
+                        let connected = if nm_active() { saved_host() } else { None };
+                        repopulate_locations(&location, &results, connected.as_deref());
+                        let responsive = results.iter().filter(|(_, ms)| ms.is_some()).count();
+                        append_log(
+                            &buffer,
+                            "LATENCY SCAN",
+                            &format!("{} of {} locations replied to ICMP ping.", responsive, results.len()),
+                        );
                     }
                 }
             }
@@ -552,6 +649,28 @@ fn build_ui(app: &adw::Application) {
                 let text = nm_status();
                 let _ = tx.send(Event::Refreshed(active, text));
             });
+        });
+    }
+
+    {
+        let tx = tx.clone();
+        ping_button.connect_clicked(move |_| {
+            let tx = tx.clone();
+            thread::spawn(move || {
+                let _ = tx.send(Event::PingStarted);
+                let results = scan_latencies();
+                let _ = tx.send(Event::PingResults(results));
+            });
+        });
+    }
+
+    // Run one non-blocking latency scan automatically after launch.
+    {
+        let tx = tx.clone();
+        thread::spawn(move || {
+            let _ = tx.send(Event::PingStarted);
+            let results = scan_latencies();
+            let _ = tx.send(Event::PingResults(results));
         });
     }
 
