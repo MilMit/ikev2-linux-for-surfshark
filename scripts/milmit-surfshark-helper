@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+CONNECT=/usr/lib/milmit-surfshark/restricted-ikev2-connect.sh
+DISCONNECT=/usr/lib/milmit-surfshark/restricted-ikev2-disconnect.sh
+
+if [[ $EUID -ne 0 ]]; then
+  echo "helper must run as root" >&2
+  exit 77
+fi
+
+cmd="${1:-}"
+case "$cmd" in
+  connect)
+    endpoint="${2:-}"
+    username="${3:-}"
+    [[ "$endpoint" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || { echo "invalid IPv4 endpoint" >&2; exit 64; }
+    [[ -n "$username" && ${#username} -le 128 && "$username" != *$'\n'* ]] || { echo "invalid service username" >&2; exit 64; }
+    exec "$CONNECT" "$endpoint" "$username"
+    ;;
+  disconnect)
+    exec "$DISCONNECT"
+    ;;
+  status)
+    exec /usr/sbin/swanctl --list-sas
+    ;;
+  *)
+    echo "usage: $0 {connect <ipv4> <service-user>|disconnect|status}" >&2
+    exit 64
+    ;;
+esac
