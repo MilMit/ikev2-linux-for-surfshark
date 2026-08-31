@@ -10,6 +10,8 @@ SERVER_IP="${1:-}"
 SERVICE_USER="${2:-}"
 SERVICE_PASS="${3:-}"
 CONF=/etc/swanctl/conf.d/milmit-surfshark-restricted.conf
+CONN_NAME=milmit-surfshark-restricted
+CHILD_NAME=milmit-restricted
 
 if [[ $EUID -ne 0 ]]; then
   echo "This helper must run as root." >&2
@@ -27,7 +29,7 @@ fi
 install -d -m 0755 /etc/swanctl/conf.d
 cat >"$CONF" <<EOF
 connections {
-    milmit-surfshark-restricted {
+    $CONN_NAME {
         version = 2
         remote_addrs = $SERVER_IP
         proposals = aes256gcm16-prfsha256-ecp521,aes256-sha256-modp2048
@@ -48,7 +50,7 @@ connections {
         }
 
         children {
-            surfshark {
+            $CHILD_NAME {
                 local_ts = 0.0.0.0/0
                 remote_ts = 0.0.0.0/0
                 esp_proposals = aes256-sha1,aes256-sha256
@@ -71,15 +73,15 @@ secrets {
 EOF
 chmod 0600 "$CONF"
 
-# Remove an old instance before loading the new endpoint.
-swanctl --terminate --ike milmit-surfshark-restricted >/dev/null 2>&1 || true
+# Remove only our previous restricted SA before loading the new endpoint.
+swanctl --terminate --ike "$CONN_NAME" >/dev/null 2>&1 || true
 swanctl --load-conns
 swanctl --load-creds
 
-# Android Surfshark sends PEAP NAK and then uses EAP-MSCHAPv2. The regular
-# charon daemon is configured separately from charon-nm; if PEAP is installed,
-# the connection's auth method still requires EAP-MSCHAPv2.
-swanctl --initiate --child surfshark
+# IMPORTANT: use a unique child name. The legacy Surfshark profile also has a
+# child called "surfshark"; initiating that generic name can select the wrong
+# connection and send traffic to the DNS-poisoned hostname.
+swanctl --initiate --child "$CHILD_NAME"
 
 echo
 swanctl --list-sas
