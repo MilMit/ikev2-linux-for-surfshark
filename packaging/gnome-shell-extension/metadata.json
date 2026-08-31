@@ -1,0 +1,7 @@
+{
+  "uuid": "surfshark-ikev2@milmit.net",
+  "name": "Surfshark IKEv2 Status",
+  "description": "Shows MilMit Surfshark IKEv2 restricted-mode status in the GNOME top bar.",
+  "shell-version": ["46", "47", "48", "49", "50"],
+  "version": 1
+}
