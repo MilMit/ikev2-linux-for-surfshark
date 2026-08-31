@@ -44,9 +44,7 @@ remove_route220_for_vip() {
 remove_hotspot_rules() {
   local vip="${1:-}" hs_iface="${2:-}" hs_subnet="${3:-}" old_mss="${4:-1200}" hs_dns="${5:-}"
   [[ -n "$hs_subnet" ]] || return 0
-
   while ip rule del pref "$HOTSPOT_RULE_PREF" from "$hs_subnet" lookup 220 >/dev/null 2>&1; do :; done
-
   if [[ -n "$vip" ]]; then
     while iptables -t nat -D POSTROUTING -s "$hs_subnet" -j SNAT --to-source "$vip" 2>/dev/null; do :; done
   fi
@@ -62,8 +60,7 @@ remove_hotspot_rules() {
 }
 
 recover_interface() {
-  local iface="${1:-}"
-  local enabled="${2:-0}"
+  local iface="${1:-}" enabled="${2:-0}"
   [[ "$enabled" == 1 && -n "$iface" ]] || return 0
   command -v nmcli >/dev/null 2>&1 || return 0
   nmcli device reapply "$iface" >/dev/null 2>&1 || true
@@ -90,6 +87,59 @@ cleanup_values() {
   recover_interface "$iface" "$recover"
 }
 
+subnet_from_cidr() {
+  python3 - "$1" <<'PY'
+import ipaddress, sys
+print(ipaddress.ip_interface(sys.argv[1]).network)
+PY
+}
+
+detect_hotspot() {
+  HOTSPOT_CONNECTION=""
+  HOTSPOT_IFACE=""
+  HOTSPOT_SUBNET=""
+  local line name dev method cidr type state
+
+  # Preferred path: an active NetworkManager profile explicitly using ipv4.method=shared.
+  if command -v nmcli >/dev/null 2>&1; then
+    while IFS= read -r line; do
+      [[ -n "$line" ]] || continue
+      dev="${line##*:}"
+      name="${line%:*}"
+      [[ -n "$name" && -n "$dev" && "$dev" != "--" ]] || continue
+      method="$(nmcli -g ipv4.method connection show "$name" 2>/dev/null | head -n1 | tr -d '[:space:]' || true)"
+      [[ "$method" == "shared" ]] || continue
+      cidr="$(ip -4 -o addr show dev "$dev" scope global 2>/dev/null | awk '{print $4}' | head -n1)"
+      [[ -n "$cidr" ]] || continue
+      HOTSPOT_CONNECTION="$name"
+      HOTSPOT_IFACE="$dev"
+      HOTSPOT_SUBNET="$(subnet_from_cidr "$cidr")"
+      return 0
+    done < <(nmcli -t -f NAME,DEVICE connection show --active 2>/dev/null || true)
+
+    # Ubuntu hotspot fallback: a connected Wi-Fi device acting as a 10.42.x.x gateway.
+    while IFS=: read -r dev type state; do
+      [[ "$type" == "wifi" && "$state" == "connected" ]] || continue
+      cidr="$(ip -4 -o addr show dev "$dev" scope global 2>/dev/null | awk '{print $4}' | head -n1)"
+      [[ "$cidr" == 10.42.* ]] || continue
+      name="$(nmcli -g GENERAL.CONNECTION device show "$dev" 2>/dev/null | head -n1 || true)"
+      HOTSPOT_CONNECTION="${name:--}"
+      HOTSPOT_IFACE="$dev"
+      HOTSPOT_SUBNET="$(subnet_from_cidr "$cidr")"
+      return 0
+    done < <(nmcli -t -f DEVICE,TYPE,STATE device status 2>/dev/null || true)
+  fi
+
+  # Final distro-independent fallback: Ubuntu's shared-mode address range.
+  while read -r dev cidr; do
+    [[ "$cidr" == 10.42.* ]] || continue
+    HOTSPOT_CONNECTION="Hotspot"
+    HOTSPOT_IFACE="$dev"
+    HOTSPOT_SUBNET="$(subnet_from_cidr "$cidr")"
+    return 0
+  done < <(ip -4 -o addr show scope global 2>/dev/null | awk '{print $2, $4}')
+}
+
 SERVICE_PASS=""
 if [[ ! -t 0 ]]; then IFS= read -r SERVICE_PASS || true; fi
 install -d -m 0700 "$CRED_DIR"
@@ -105,8 +155,6 @@ else
   exit 66
 fi
 
-# Remove stale state from a previous run. Do not recover the physical link here;
-# this is a reconnect path, not a user-requested disconnect.
 OLD_VIRTUAL_IP="$(state_get VIRTUAL_IP)"
 OLD_IFACE="$(state_get IFACE)"
 OLD_MSS="$(state_get MSS_VALUE)"
@@ -200,47 +248,22 @@ if command -v resolvectl >/dev/null 2>&1 && [[ -n "$IFACE" ]]; then
   resolvectl flush-caches || true
 fi
 
-HOTSPOT_IFACE=""
-HOTSPOT_SUBNET=""
-HOTSPOT_CONNECTION=""
-if command -v nmcli >/dev/null 2>&1; then
-  while IFS=: read -r ACTIVE_NAME ACTIVE_DEVICE; do
-    [[ -n "$ACTIVE_NAME" && -n "$ACTIVE_DEVICE" && "$ACTIVE_DEVICE" != "--" ]] || continue
-    METHOD="$(nmcli -g ipv4.method connection show "$ACTIVE_NAME" 2>/dev/null | head -n1 || true)"
-    [[ "$METHOD" == "shared" ]] || continue
-    CIDR="$(ip -4 -o addr show dev "$ACTIVE_DEVICE" scope global 2>/dev/null | awk '{print $4}' | head -n1)"
-    [[ -n "$CIDR" ]] || continue
-    HOTSPOT_CONNECTION="$ACTIVE_NAME"
-    HOTSPOT_IFACE="$ACTIVE_DEVICE"
-    HOTSPOT_SUBNET="$(python3 - "$CIDR" <<'PY'
-import ipaddress, sys
-print(ipaddress.ip_interface(sys.argv[1]).network)
-PY
-)"
-    break
-  done < <(nmcli -t -f NAME,DEVICE connection show --active 2>/dev/null || true)
-fi
+# Detect hotspot regardless of whether NetworkManager reports ipv4.method=shared.
+detect_hotspot
 
 if [[ "$HOTSPOT_VPN" == 1 && -n "$HOTSPOT_IFACE" && -n "$HOTSPOT_SUBNET" ]]; then
   sysctl -w net.ipv4.ip_forward=1 >/dev/null
-
-  # NetworkManager shared mode installs its own MASQUERADE rule. Put our SNAT
-  # rule first so hotspot packets are translated to the IKEv2 virtual IP before
-  # XFRM policy evaluation, instead of leaking out through the normal uplink.
   remove_hotspot_rules "$VIRTUAL_IP" "$HOTSPOT_IFACE" "$HOTSPOT_SUBNET" "$MSS" "$HOTSPOT_DNS"
-  iptables -t nat -I POSTROUTING 1 -s "$HOTSPOT_SUBNET" -j SNAT --to-source "$VIRTUAL_IP"
+
+  # Place VPN SNAT before NetworkManager's nm-shared MASQUERADE.
+  iptables -t nat -I POSTROUTING 1 -s "$HOTSPOT_SUBNET" ! -d "$HOTSPOT_SUBNET" -j SNAT --to-source "$VIRTUAL_IP"
   iptables -t mangle -I FORWARD 1 -i "$HOTSPOT_IFACE" -s "$HOTSPOT_SUBNET" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$MSS"
   iptables -I FORWARD 1 -i "$HOTSPOT_IFACE" -s "$HOTSPOT_SUBNET" -j ACCEPT
   iptables -I FORWARD 1 -o "$HOTSPOT_IFACE" -d "$HOTSPOT_SUBNET" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
 
-  # Force hotspot DNS through a known Surfshark resolver. This prevents a
-  # client from bypassing the host's VPN DNS by using a hard-coded resolver.
   iptables -t nat -I PREROUTING 1 -i "$HOTSPOT_IFACE" -s "$HOTSPOT_SUBNET" -p udp --dport 53 -j DNAT --to-destination "$HOTSPOT_DNS"
   iptables -t nat -I PREROUTING 1 -i "$HOTSPOT_IFACE" -s "$HOTSPOT_SUBNET" -p tcp --dport 53 -j DNAT --to-destination "$HOTSPOT_DNS"
 
-  # StrongSwan installs the encrypted default in table 220. Explicitly route
-  # hotspot-source traffic through that table so forwarded packets follow the
-  # same path as local traffic before the XFRM transform is applied.
   while ip rule del pref "$HOTSPOT_RULE_PREF" from "$HOTSPOT_SUBNET" lookup 220 >/dev/null 2>&1; do :; done
   ip rule add pref "$HOTSPOT_RULE_PREF" from "$HOTSPOT_SUBNET" lookup 220
   ip route flush cache >/dev/null 2>&1 || true
@@ -292,7 +315,7 @@ if [[ "$HOTSPOT_VPN" == 1 ]]; then
   if [[ -n "$HOTSPOT_IFACE" ]]; then
     printf 'Hotspot VPN   : ON · %s · %s · forced DNS %s\n' "$HOTSPOT_IFACE" "$HOTSPOT_SUBNET" "$HOTSPOT_DNS"
   else
-    printf 'Hotspot VPN   : enabled · no active shared connection detected\n'
+    printf 'Hotspot VPN   : enabled · no hotspot interface detected\n'
   fi
 else
   printf 'Hotspot VPN   : OFF · hotspot keeps its normal route\n'
