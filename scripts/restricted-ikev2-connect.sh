@@ -17,6 +17,7 @@ CRED_DIR=/etc/milmit-surfshark
 CRED_FILE="$CRED_DIR/credentials"
 NM_MARKER="Surfshark IKEv2 (Connected)"
 NM_MARKER_IF="milmitvpn0"
+HOTSPOT_RULE_PREF=17990
 
 if [[ $EUID -ne 0 ]]; then echo "This helper must run as root." >&2; exit 77; fi
 if [[ -z "$SERVER_IP" || -z "$SERVICE_USER" ]]; then echo "usage: $0 <server-ip> <service-user> [mss] [dns-csv] [hotspot-vpn] [recover]" >&2; exit 64; fi
@@ -40,6 +41,26 @@ remove_route220_for_vip() {
   done < <(ip route show table 220 2>/dev/null || true)
 }
 
+remove_hotspot_rules() {
+  local vip="${1:-}" hs_iface="${2:-}" hs_subnet="${3:-}" old_mss="${4:-1200}" hs_dns="${5:-}"
+  [[ -n "$hs_subnet" ]] || return 0
+
+  while ip rule del pref "$HOTSPOT_RULE_PREF" from "$hs_subnet" lookup 220 >/dev/null 2>&1; do :; done
+
+  if [[ -n "$vip" ]]; then
+    while iptables -t nat -D POSTROUTING -s "$hs_subnet" -j SNAT --to-source "$vip" 2>/dev/null; do :; done
+  fi
+  if [[ -n "$hs_iface" ]]; then
+    while iptables -t mangle -D FORWARD -i "$hs_iface" -s "$hs_subnet" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$old_mss" 2>/dev/null; do :; done
+    while iptables -D FORWARD -i "$hs_iface" -s "$hs_subnet" -j ACCEPT 2>/dev/null; do :; done
+    while iptables -D FORWARD -o "$hs_iface" -d "$hs_subnet" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null; do :; done
+    if [[ -n "$hs_dns" ]]; then
+      while iptables -t nat -D PREROUTING -i "$hs_iface" -s "$hs_subnet" -p udp --dport 53 -j DNAT --to-destination "$hs_dns" 2>/dev/null; do :; done
+      while iptables -t nat -D PREROUTING -i "$hs_iface" -s "$hs_subnet" -p tcp --dport 53 -j DNAT --to-destination "$hs_dns" 2>/dev/null; do :; done
+    fi
+  fi
+}
+
 recover_interface() {
   local iface="${1:-}"
   local enabled="${2:-0}"
@@ -55,16 +76,11 @@ recover_interface() {
 }
 
 cleanup_values() {
-  local vip="${1:-}" iface="${2:-}" old_mss="${3:-1200}" hs_iface="${4:-}" hs_subnet="${5:-}" recover="${6:-0}"
+  local vip="${1:-}" iface="${2:-}" old_mss="${3:-1200}" hs_iface="${4:-}" hs_subnet="${5:-}" recover="${6:-0}" hs_dns="${7:-}"
   if [[ -n "$vip" ]]; then
     iptables -t mangle -D OUTPUT -s "$vip/32" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$old_mss" 2>/dev/null || true
   fi
-  if [[ -n "$hs_iface" && -n "$hs_subnet" && -n "$vip" ]]; then
-    iptables -t nat -D POSTROUTING -s "$hs_subnet" -j SNAT --to-source "$vip" 2>/dev/null || true
-    iptables -t mangle -D FORWARD -i "$hs_iface" -s "$hs_subnet" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$old_mss" 2>/dev/null || true
-    iptables -D FORWARD -i "$hs_iface" -s "$hs_subnet" -j ACCEPT 2>/dev/null || true
-    iptables -D FORWARD -o "$hs_iface" -d "$hs_subnet" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
-  fi
+  remove_hotspot_rules "$vip" "$hs_iface" "$hs_subnet" "$old_mss" "$hs_dns"
   if [[ -n "$iface" ]] && command -v resolvectl >/dev/null 2>&1; then
     resolvectl revert "$iface" >/dev/null 2>&1 || true
     resolvectl flush-caches >/dev/null 2>&1 || true
@@ -96,7 +112,8 @@ OLD_IFACE="$(state_get IFACE)"
 OLD_MSS="$(state_get MSS_VALUE)"
 OLD_HOTSPOT_IFACE="$(state_get HOTSPOT_IFACE)"
 OLD_HOTSPOT_SUBNET="$(state_get HOTSPOT_SUBNET)"
-cleanup_values "$OLD_VIRTUAL_IP" "$OLD_IFACE" "${OLD_MSS:-1200}" "$OLD_HOTSPOT_IFACE" "$OLD_HOTSPOT_SUBNET" 0
+OLD_HOTSPOT_DNS="$(state_get HOTSPOT_DNS)"
+cleanup_values "$OLD_VIRTUAL_IP" "$OLD_IFACE" "${OLD_MSS:-1200}" "$OLD_HOTSPOT_IFACE" "$OLD_HOTSPOT_SUBNET" 0 "$OLD_HOTSPOT_DNS"
 rm -f "$STATE_FILE"
 
 if command -v nmcli >/dev/null 2>&1; then
@@ -113,6 +130,7 @@ for dns in "${DNS_SERVERS[@]}"; do
 done
 [[ ${#VALID_DNS[@]} -gt 0 ]] || VALID_DNS=(162.252.172.57 149.154.159.92)
 DNS_CSV="$(IFS=,; echo "${VALID_DNS[*]}")"
+HOTSPOT_DNS="${VALID_DNS[0]}"
 
 ESC_PASS="${SERVICE_PASS//\\/\\\\}"
 ESC_PASS="${ESC_PASS//\"/\\\"}"
@@ -184,13 +202,15 @@ fi
 
 HOTSPOT_IFACE=""
 HOTSPOT_SUBNET=""
-if [[ "$HOTSPOT_VPN" == 1 ]] && command -v nmcli >/dev/null 2>&1; then
+HOTSPOT_CONNECTION=""
+if command -v nmcli >/dev/null 2>&1; then
   while IFS=: read -r ACTIVE_NAME ACTIVE_DEVICE; do
     [[ -n "$ACTIVE_NAME" && -n "$ACTIVE_DEVICE" && "$ACTIVE_DEVICE" != "--" ]] || continue
     METHOD="$(nmcli -g ipv4.method connection show "$ACTIVE_NAME" 2>/dev/null | head -n1 || true)"
     [[ "$METHOD" == "shared" ]] || continue
     CIDR="$(ip -4 -o addr show dev "$ACTIVE_DEVICE" scope global 2>/dev/null | awk '{print $4}' | head -n1)"
     [[ -n "$CIDR" ]] || continue
+    HOTSPOT_CONNECTION="$ACTIVE_NAME"
     HOTSPOT_IFACE="$ACTIVE_DEVICE"
     HOTSPOT_SUBNET="$(python3 - "$CIDR" <<'PY'
 import ipaddress, sys
@@ -201,14 +221,29 @@ PY
   done < <(nmcli -t -f NAME,DEVICE connection show --active 2>/dev/null || true)
 fi
 
-if [[ -n "$HOTSPOT_IFACE" && -n "$HOTSPOT_SUBNET" ]]; then
+if [[ "$HOTSPOT_VPN" == 1 && -n "$HOTSPOT_IFACE" && -n "$HOTSPOT_SUBNET" ]]; then
   sysctl -w net.ipv4.ip_forward=1 >/dev/null
-  iptables -t nat -D POSTROUTING -s "$HOTSPOT_SUBNET" -j SNAT --to-source "$VIRTUAL_IP" 2>/dev/null || true
-  iptables -t nat -A POSTROUTING -s "$HOTSPOT_SUBNET" -j SNAT --to-source "$VIRTUAL_IP"
-  iptables -t mangle -D FORWARD -i "$HOTSPOT_IFACE" -s "$HOTSPOT_SUBNET" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$MSS" 2>/dev/null || true
-  iptables -t mangle -A FORWARD -i "$HOTSPOT_IFACE" -s "$HOTSPOT_SUBNET" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$MSS"
-  iptables -C FORWARD -i "$HOTSPOT_IFACE" -s "$HOTSPOT_SUBNET" -j ACCEPT 2>/dev/null || iptables -A FORWARD -i "$HOTSPOT_IFACE" -s "$HOTSPOT_SUBNET" -j ACCEPT
-  iptables -C FORWARD -o "$HOTSPOT_IFACE" -d "$HOTSPOT_SUBNET" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || iptables -A FORWARD -o "$HOTSPOT_IFACE" -d "$HOTSPOT_SUBNET" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+
+  # NetworkManager shared mode installs its own MASQUERADE rule. Put our SNAT
+  # rule first so hotspot packets are translated to the IKEv2 virtual IP before
+  # XFRM policy evaluation, instead of leaking out through the normal uplink.
+  remove_hotspot_rules "$VIRTUAL_IP" "$HOTSPOT_IFACE" "$HOTSPOT_SUBNET" "$MSS" "$HOTSPOT_DNS"
+  iptables -t nat -I POSTROUTING 1 -s "$HOTSPOT_SUBNET" -j SNAT --to-source "$VIRTUAL_IP"
+  iptables -t mangle -I FORWARD 1 -i "$HOTSPOT_IFACE" -s "$HOTSPOT_SUBNET" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$MSS"
+  iptables -I FORWARD 1 -i "$HOTSPOT_IFACE" -s "$HOTSPOT_SUBNET" -j ACCEPT
+  iptables -I FORWARD 1 -o "$HOTSPOT_IFACE" -d "$HOTSPOT_SUBNET" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+
+  # Force hotspot DNS through a known Surfshark resolver. This prevents a
+  # client from bypassing the host's VPN DNS by using a hard-coded resolver.
+  iptables -t nat -I PREROUTING 1 -i "$HOTSPOT_IFACE" -s "$HOTSPOT_SUBNET" -p udp --dport 53 -j DNAT --to-destination "$HOTSPOT_DNS"
+  iptables -t nat -I PREROUTING 1 -i "$HOTSPOT_IFACE" -s "$HOTSPOT_SUBNET" -p tcp --dport 53 -j DNAT --to-destination "$HOTSPOT_DNS"
+
+  # StrongSwan installs the encrypted default in table 220. Explicitly route
+  # hotspot-source traffic through that table so forwarded packets follow the
+  # same path as local traffic before the XFRM transform is applied.
+  while ip rule del pref "$HOTSPOT_RULE_PREF" from "$HOTSPOT_SUBNET" lookup 220 >/dev/null 2>&1; do :; done
+  ip rule add pref "$HOTSPOT_RULE_PREF" from "$HOTSPOT_SUBNET" lookup 220
+  ip route flush cache >/dev/null 2>&1 || true
 fi
 
 TRACE="$(curl -4 --interface "$VIRTUAL_IP" --max-time 10 -ks https://1.1.1.1/cdn-cgi/trace || true)"
@@ -216,7 +251,7 @@ PUBLIC_IP="$(printf '%s\n' "$TRACE" | sed -n 's/^ip=//p' | head -n1)"
 EXIT_COUNTRY="$(printf '%s\n' "$TRACE" | sed -n 's/^loc=//p' | head -n1)"
 if [[ -z "$PUBLIC_IP" ]]; then
   swanctl --terminate --ike "$CONN_NAME" >/dev/null 2>&1 || true
-  cleanup_values "$VIRTUAL_IP" "$IFACE" "$MSS" "$HOTSPOT_IFACE" "$HOTSPOT_SUBNET" "$RECOVER_NETWORK"
+  cleanup_values "$VIRTUAL_IP" "$IFACE" "$MSS" "$HOTSPOT_IFACE" "$HOTSPOT_SUBNET" "$RECOVER_NETWORK" "$HOTSPOT_DNS"
   printf '\nData-path test: FAILED\n'
   exit 68
 fi
@@ -241,8 +276,11 @@ NM_MARKER_ACTIVE=$NM_MARKER_ACTIVE
 PUBLIC_IP=$PUBLIC_IP
 EXIT_COUNTRY=$EXIT_COUNTRY
 HOTSPOT_VPN=$HOTSPOT_VPN
+HOTSPOT_CONNECTION=$HOTSPOT_CONNECTION
 HOTSPOT_IFACE=$HOTSPOT_IFACE
 HOTSPOT_SUBNET=$HOTSPOT_SUBNET
+HOTSPOT_DNS=$HOTSPOT_DNS
+HOTSPOT_RULE_PREF=$HOTSPOT_RULE_PREF
 RECOVER_NETWORK=$RECOVER_NETWORK
 EOF
 chmod 0644 "$STATE_FILE"
@@ -251,7 +289,11 @@ printf '\nRestricted Surfshark IKEv2 is established\n'
 printf 'Virtual IPv4 : %s\nMSS clamp    : %s\nDNS          : %s\nInterface    : %s\n' "$VIRTUAL_IP" "$MSS" "$DNS_CSV" "$IFACE"
 printf 'Ubuntu marker: %s\n' "$([[ "$NM_MARKER_ACTIVE" == 1 ]] && echo active || echo unavailable)"
 if [[ "$HOTSPOT_VPN" == 1 ]]; then
-  if [[ -n "$HOTSPOT_IFACE" ]]; then printf 'Hotspot VPN   : ON · %s · %s\n' "$HOTSPOT_IFACE" "$HOTSPOT_SUBNET"; else printf 'Hotspot VPN   : enabled · no active shared connection detected\n'; fi
+  if [[ -n "$HOTSPOT_IFACE" ]]; then
+    printf 'Hotspot VPN   : ON · %s · %s · forced DNS %s\n' "$HOTSPOT_IFACE" "$HOTSPOT_SUBNET" "$HOTSPOT_DNS"
+  else
+    printf 'Hotspot VPN   : enabled · no active shared connection detected\n'
+  fi
 else
   printf 'Hotspot VPN   : OFF · hotspot keeps its normal route\n'
 fi
