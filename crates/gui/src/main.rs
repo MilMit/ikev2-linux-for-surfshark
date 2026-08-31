@@ -31,6 +31,37 @@ fn append_log(buffer: &gtk::TextBuffer, title: &str, body: &str) {
     buffer.insert(&mut end, &format!("\n=== {title} ===\n{body}\n"));
 }
 
+fn vpn_status() -> String {
+    run("pkexec", &["/usr/sbin/swanctl", "--list-sas"])
+}
+
+fn tunnel_is_up(sas: &str) -> bool {
+    sas.contains("ESTABLISHED") && sas.contains("INSTALLED") && sas.contains("remote 0.0.0.0/0")
+}
+
+fn diagnostics() -> String {
+    let mut out = String::new();
+
+    let sections: [(&str, &str, &[&str]); 8] = [
+        ("IPv4 route to 1.1.1.1", "ip", &["route", "get", "1.1.1.1"]),
+        ("IPv4 routes", "ip", &["-4", "route"]),
+        ("IPv4 rules", "ip", &["-4", "rule"]),
+        ("XFRM policies", "ip", &["xfrm", "policy"]),
+        ("XFRM states", "ip", &["xfrm", "state"]),
+        ("DNS status", "resolvectl", &["status"]),
+        ("Public IPv4", "curl", &["-4", "--max-time", "8", "-sS", "https://api.ipify.org"]),
+        ("Public IPv6", "curl", &["-6", "--max-time", "8", "-sS", "https://api64.ipify.org"]),
+    ];
+
+    for (title, cmd, args) in sections {
+        out.push_str(&format!("\n--- {title} ---\n"));
+        out.push_str(&run(cmd, args));
+        out.push('\n');
+    }
+
+    out
+}
+
 fn main() -> glib::ExitCode {
     let app = adw::Application::builder()
         .application_id("net.milmit.SurfsharkIkev2")
@@ -44,7 +75,7 @@ fn build_ui(app: &adw::Application) {
     let header = adw::HeaderBar::new();
 
     let status = gtk::Label::builder()
-        .label("Disconnected")
+        .label("Checking status…")
         .css_classes(["title-2"])
         .build();
 
@@ -61,6 +92,7 @@ fn build_ui(app: &adw::Application) {
 
     let refresh = gtk::Button::with_label("Refresh status");
     let logs = gtk::Button::with_label("Refresh logs");
+    let diag = gtk::Button::with_label("Run diagnostics");
 
     let actions = gtk::Box::new(Orientation::Horizontal, 8);
     actions.set_halign(gtk::Align::Center);
@@ -68,6 +100,7 @@ fn build_ui(app: &adw::Application) {
     actions.append(&disconnect);
     actions.append(&refresh);
     actions.append(&logs);
+    actions.append(&diag);
 
     let text_view = gtk::TextView::builder()
         .editable(false)
@@ -98,8 +131,6 @@ fn build_ui(app: &adw::Application) {
     content.append(&actions);
     content.append(&scroller);
 
-    // libadwaita 0.8 does not expose ToolbarView. Keep the UI compatible
-    // with Ubuntu's packaged libadwaita by using a simple vertical root.
     let root = gtk::Box::new(Orientation::Vertical, 0);
     root.append(&header);
     root.append(&content);
@@ -107,18 +138,41 @@ fn build_ui(app: &adw::Application) {
     let window = adw::ApplicationWindow::builder()
         .application(app)
         .title("Surfshark IKEv2 for Linux")
-        .default_width(820)
-        .default_height(620)
+        .default_width(960)
+        .default_height(680)
         .content(&root)
         .build();
 
     let status = Rc::new(status);
     let buffer = Rc::new(buffer);
 
+    // Initial state check. Do not initiate a duplicate CHILD_SA if the tunnel
+    // already exists.
+    let initial = vpn_status();
+    if tunnel_is_up(&initial) {
+        status.set_label("Connected");
+        append_log(&buffer, "INITIAL STATUS", "An existing Surfshark IKEv2 tunnel is already established.");
+    } else {
+        status.set_label("Disconnected");
+    }
+    append_log(&buffer, "SA STATUS", &initial);
+
     {
         let buffer = Rc::clone(&buffer);
         let status = Rc::clone(&status);
         connect.connect_clicked(move |_| {
+            let before = vpn_status();
+            if tunnel_is_up(&before) {
+                status.set_label("Connected");
+                append_log(
+                    &buffer,
+                    "CONNECT",
+                    "Tunnel is already established. Skipping duplicate initiate.",
+                );
+                append_log(&buffer, "SA STATUS", &before);
+                return;
+            }
+
             status.set_label("Connecting…");
             append_log(
                 &buffer,
@@ -130,8 +184,9 @@ fn build_ui(app: &adw::Application) {
                 &["/usr/sbin/swanctl", "--initiate", "--child", "surfshark"],
             );
             append_log(&buffer, "CONNECT RESULT", &out);
-            let sas = run("pkexec", &["/usr/sbin/swanctl", "--list-sas"]);
-            if sas.contains("ESTABLISHED") && sas.contains("INSTALLED") {
+
+            let sas = vpn_status();
+            if tunnel_is_up(&sas) {
                 status.set_label("Connected");
             } else {
                 status.set_label("Connection failed / incomplete");
@@ -149,7 +204,13 @@ fn build_ui(app: &adw::Application) {
                 &["/usr/sbin/swanctl", "--terminate", "--ike", "surfshark-tr"],
             );
             append_log(&buffer, "DISCONNECT", &out);
-            status.set_label("Disconnected");
+            let sas = vpn_status();
+            if tunnel_is_up(&sas) {
+                status.set_label("Still connected");
+            } else {
+                status.set_label("Disconnected");
+            }
+            append_log(&buffer, "SA STATUS", &sas);
         });
     }
 
@@ -157,9 +218,9 @@ fn build_ui(app: &adw::Application) {
         let buffer = Rc::clone(&buffer);
         let status = Rc::clone(&status);
         refresh.connect_clicked(move |_| {
-            let out = run("pkexec", &["/usr/sbin/swanctl", "--list-sas"]);
+            let out = vpn_status();
             append_log(&buffer, "STATUS", &out);
-            if out.contains("ESTABLISHED") && out.contains("INSTALLED") {
+            if tunnel_is_up(&out) {
                 status.set_label("Connected");
             } else {
                 status.set_label("Disconnected / incomplete");
@@ -172,9 +233,16 @@ fn build_ui(app: &adw::Application) {
         logs.connect_clicked(move |_| {
             let out = run(
                 "journalctl",
-                &["-u", "strongswan", "-n", "120", "--no-pager", "-o", "cat"],
+                &["-u", "strongswan", "-n", "160", "--no-pager", "-o", "cat"],
             );
             append_log(&buffer, "STRONGSWAN JOURNAL", &out);
+        });
+    }
+
+    {
+        let buffer = Rc::clone(&buffer);
+        diag.connect_clicked(move |_| {
+            append_log(&buffer, "DIAGNOSTICS", &diagnostics());
         });
     }
 
