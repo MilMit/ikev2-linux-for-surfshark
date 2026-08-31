@@ -3,6 +3,8 @@ mod locations;
 use adw::prelude::*;
 use gtk::{glib, Orientation};
 use locations::{by_host, by_id, LOCATIONS};
+use std::collections::HashSet;
+use std::net::{IpAddr, ToSocketAddrs};
 use std::process::Command;
 use std::rc::Rc;
 use std::sync::mpsc;
@@ -11,6 +13,7 @@ use std::time::Duration;
 
 const PROFILE: &str = "MilMit Surfshark IKEv2";
 const CA_CERT: &str = "/etc/swanctl/x509ca/surfshark_ikev2.crt";
+const CONNECT_WAIT_SECONDS: &str = "12";
 
 #[derive(Debug)]
 enum Event {
@@ -95,8 +98,12 @@ fn saved_username() -> Option<String> {
     parse_vpn_value(&vpn_data(), "user")
 }
 
+// Prefer the certificate identity because restricted-network mode may pin
+// `address` to a concrete server IP while the original Surfshark hostname is
+// retained as `server-identity` for certificate verification.
 fn saved_host() -> Option<String> {
-    parse_vpn_value(&vpn_data(), "address")
+    let data = vpn_data();
+    parse_vpn_value(&data, "server-identity").or_else(|| parse_vpn_value(&data, "address"))
 }
 
 fn nm_status() -> String {
@@ -128,7 +135,12 @@ fn failure_log() -> String {
     )
 }
 
-fn configure_profile(host: &str, username: &str, password: Option<&str>) -> String {
+fn configure_profile(
+    address: &str,
+    server_identity: &str,
+    username: &str,
+    password: Option<&str>,
+) -> String {
     let mut log = String::new();
     let desktop_user = std::env::var("USER").unwrap_or_default();
 
@@ -156,8 +168,11 @@ fn configure_profile(host: &str, username: &str, password: Option<&str>) -> Stri
         log.push('\n');
     }
 
+    // `address` may be a concrete IPv4 selected by compatibility mode, while
+    // `server-identity` always stays the Surfshark hostname so TLS/IKE server
+    // certificate verification is not weakened by endpoint pinning.
     let data = format!(
-        "address = {host}, server-identity = {host}, certificate = {CA_CERT}, encap = yes, ipcomp = no, method = eap, proposal = no, user = {username}, virtual = yes"
+        "address = {address}, server-identity = {server_identity}, certificate = {CA_CERT}, encap = yes, ipcomp = no, method = eap, proposal = no, user = {username}, virtual = yes"
     );
 
     let mut args = vec![
@@ -177,12 +192,75 @@ fn configure_profile(host: &str, username: &str, password: Option<&str>) -> Stri
         args.push(format!("password={password}"));
     }
 
-    log.push_str("[configure IKEv2 location and credentials]\n");
+    log.push_str("[configure IKEv2 endpoint and credentials]\n");
+    log.push_str(&format!("address: {address}\nserver identity: {server_identity}\nforce NAT-T encapsulation: yes\n"));
     log.push_str(&run_owned("nmcli", &args));
     log
 }
 
+fn resolve_ipv4_endpoints(host: &str) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+
+    if let Ok(addrs) = (host, 500).to_socket_addrs() {
+        for socket in addrs {
+            if let IpAddr::V4(ip) = socket.ip() {
+                let value = ip.to_string();
+                if seen.insert(value.clone()) {
+                    out.push(value);
+                }
+            }
+        }
+    }
+    out
+}
+
+fn endpoint_candidates(host: &str, restricted_mode: bool) -> Vec<String> {
+    let mut candidates = vec![host.to_string()];
+    if restricted_mode {
+        for ip in resolve_ipv4_endpoints(host) {
+            if !candidates.iter().any(|candidate| candidate == &ip) {
+                candidates.push(ip);
+            }
+        }
+    }
+    candidates
+}
+
+fn disconnect_quietly() {
+    if nm_active() {
+        let _ = nm(&["--wait", "5", "connection", "down", PROFILE]);
+    }
+}
+
+fn try_endpoint(
+    endpoint: &str,
+    identity: &str,
+    username: &str,
+    password: Option<&str>,
+) -> (bool, String) {
+    disconnect_quietly();
+
+    let mut log = configure_profile(endpoint, identity, username, password);
+    log.push_str("\n[activate]\n");
+    let up = nm(&[
+        "--wait",
+        CONNECT_WAIT_SECONDS,
+        "connection",
+        "up",
+        PROFILE,
+    ]);
+    log.push_str(&up);
+    log.push_str("\n[active check]\n");
+    let active = nm_active();
+    log.push_str(if active { "active\n" } else { "inactive\n" });
+    (active, log)
+}
+
 fn ping_ms(host: &str) -> Option<u32> {
+    if host.is_empty() {
+        return None;
+    }
     let output = Command::new("ping")
         .args(["-n", "-c", "1", "-W", "1", host])
         .output()
@@ -254,6 +332,7 @@ fn install_css() {
          .hero-title { font-size: 28px; font-weight: 800; }\n\
          .status-pill { padding: 7px 12px; border-radius: 999px; background: alpha(@accent_bg_color, .14); }\n\
          .location-box { padding: 14px; border-radius: 14px; }\n\
+         .compat-box { padding: 12px; border-radius: 14px; background: alpha(@warning_bg_color, .08); }\n\
          .primary-connect { min-height: 44px; padding-left: 30px; padding-right: 30px; }\n\
          .ping-note { font-size: 11px; }\n\
          .diag-box { font-size: 12px; }",
@@ -348,6 +427,22 @@ fn build_ui(app: &adw::Application) {
     location_box.append(&location_row);
     location_box.append(&ping_note);
 
+    let restricted_mode = gtk::CheckButton::with_label("Restricted network / Iran compatibility mode");
+    restricted_mode.set_active(true);
+    restricted_mode.set_tooltip_text(Some(
+        "If the normal hostname path fails, rotate through all IPv4 endpoints returned for the selected Surfshark location while keeping certificate verification enabled.",
+    ));
+    let restricted_note = gtk::Label::builder()
+        .label("Tries the normal endpoint first, then pins each resolved IPv4 one-by-one with forced NAT-T. Useful when a network filters only some Surfshark server IPs.")
+        .halign(gtk::Align::Start)
+        .wrap(true)
+        .css_classes(["dim-label", "ping-note"])
+        .build();
+    let restricted_box = gtk::Box::new(Orientation::Vertical, 5);
+    restricted_box.add_css_class("compat-box");
+    restricted_box.append(&restricted_mode);
+    restricted_box.append(&restricted_note);
+
     let user = gtk::Entry::builder()
         .placeholder_text("Surfshark service username")
         .hexpand(true)
@@ -428,6 +523,7 @@ fn build_ui(app: &adw::Application) {
     content.set_margin_end(22);
     content.append(&hero);
     content.append(&location_box);
+    content.append(&restricted_box);
     content.append(&credentials);
     content.append(&actions);
     content.append(&ip_label);
@@ -441,7 +537,7 @@ fn build_ui(app: &adw::Application) {
         .application(app)
         .title("Surfshark IKEv2 for Linux")
         .default_width(760)
-        .default_height(700)
+        .default_height(760)
         .content(&root)
         .build();
 
@@ -459,6 +555,7 @@ fn build_ui(app: &adw::Application) {
     let pass = Rc::new(pass);
     let user = Rc::new(user);
     let location = Rc::new(location);
+    let restricted_mode = Rc::new(restricted_mode);
 
     {
         let status = Rc::clone(&status);
@@ -548,6 +645,7 @@ fn build_ui(app: &adw::Application) {
         let user = Rc::clone(&user);
         let pass = Rc::clone(&pass);
         let location = Rc::clone(&location);
+        let restricted_mode = Rc::clone(&restricted_mode);
         connect.connect_clicked(move |_| {
             let id = location
                 .active_id()
@@ -556,6 +654,7 @@ fn build_ui(app: &adw::Application) {
             let Some(selected) = by_id(&id) else { return; };
             let username = user.text().trim().to_string();
             let password = pass.text().to_string();
+            let restricted = restricted_mode.is_active();
             let tx = tx.clone();
 
             thread::spawn(move || {
@@ -563,7 +662,7 @@ fn build_ui(app: &adw::Application) {
                 let before = public_ip();
 
                 if nm_active() {
-                    let down = nm(&["connection", "down", PROFILE]);
+                    let down = nm(&["--wait", "5", "connection", "down", PROFILE]);
                     let _ = tx.send(Event::Log("SWITCH LOCATION".into(), down));
                 }
 
@@ -593,31 +692,81 @@ fn build_ui(app: &adw::Application) {
                     return;
                 }
 
-                let setup = configure_profile(selected.host, &effective_user, password_opt);
-                let _ = tx.send(Event::Log("PROFILE SETUP".into(), setup));
-
-                let up = nm(&["connection", "up", PROFILE]);
-                let _ = tx.send(Event::Log("NETWORKMANAGER CONNECT".into(), up));
-
-                if !nm_active() {
-                    let log = failure_log();
-                    let _ = tx.send(Event::Log("NETWORKMANAGER FAILURE LOG".into(), log));
-                    let _ = tx.send(Event::Failed("NetworkManager did not activate the VPN.".into()));
-                    return;
+                let candidates = endpoint_candidates(selected.host, restricted);
+                let mut discovery = format!(
+                    "Mode: {}\nSurfshark identity: {}\nCandidates: {}\n",
+                    if restricted { "Restricted network" } else { "Standard" },
+                    selected.host,
+                    candidates.len()
+                );
+                for (index, candidate) in candidates.iter().enumerate() {
+                    discovery.push_str(&format!("  {}. {}\n", index + 1, candidate));
                 }
+                if restricted && candidates.len() == 1 {
+                    discovery.push_str("DNS returned no additional IPv4 endpoints; only the hostname can be attempted.\n");
+                }
+                let _ = tx.send(Event::Log("ENDPOINT DISCOVERY".into(), discovery));
 
-                let after = public_ip();
-                let _ = tx.send(Event::Log("PUBLIC IP BEFORE".into(), before.clone()));
-                let _ = tx.send(Event::Log("PUBLIC IP AFTER".into(), after.clone()));
+                for (index, endpoint) in candidates.iter().enumerate() {
+                    let _ = tx.send(Event::Busy(format!(
+                        "Trying {} · endpoint {}/{}…",
+                        selected.city,
+                        index + 1,
+                        candidates.len()
+                    )));
 
-                if after.trim().is_empty() || after.trim() == before.trim() {
-                    let _ = tx.send(Event::Failed(
-                        "VPN is active but public IPv4 did not change.".into(),
+                    let (active, attempt_log) = try_endpoint(
+                        endpoint,
+                        selected.host,
+                        &effective_user,
+                        password_opt,
+                    );
+                    let _ = tx.send(Event::Log(
+                        format!("IKEV2 ATTEMPT {}/{}", index + 1, candidates.len()),
+                        attempt_log,
                     ));
-                    return;
+
+                    if !active {
+                        continue;
+                    }
+
+                    // Give NetworkManager/charon-nm a short moment to finish route
+                    // and DNS installation before verifying traffic egress.
+                    thread::sleep(Duration::from_millis(900));
+                    let after = public_ip();
+                    let _ = tx.send(Event::Log(
+                        "PUBLIC IP CHECK".into(),
+                        format!("before: {}\nafter: {}\nendpoint: {}", before.trim(), after.trim(), endpoint),
+                    ));
+
+                    if !after.trim().is_empty() && after.trim() != before.trim() {
+                        let mode_note = if endpoint == selected.host {
+                            "hostname"
+                        } else {
+                            "pinned IPv4 fallback"
+                        };
+                        let _ = tx.send(Event::Log(
+                            "COMPATIBILITY RESULT".into(),
+                            format!("Success via {mode_note}: {endpoint}"),
+                        ));
+                        let _ = tx.send(Event::Connected(
+                            after.trim().to_string(),
+                            selected.label.into(),
+                        ));
+                        return;
+                    }
+
+                    // A green NetworkManager state without changed egress is not
+                    // accepted as success. Tear it down and rotate to the next IP.
+                    disconnect_quietly();
                 }
 
-                let _ = tx.send(Event::Connected(after.trim().to_string(), selected.label.into()));
+                let log = failure_log();
+                let _ = tx.send(Event::Log("NETWORKMANAGER FAILURE LOG".into(), log));
+                let _ = tx.send(Event::Failed(format!(
+                    "All {} endpoint candidate(s) failed or did not change public IPv4. Open Advanced diagnostics to see which IKEv2 stage failed.",
+                    candidates.len()
+                )));
             });
         });
     }
@@ -628,7 +777,7 @@ fn build_ui(app: &adw::Application) {
             let tx = tx.clone();
             thread::spawn(move || {
                 let _ = tx.send(Event::Busy("Disconnecting…".into()));
-                let out = nm(&["connection", "down", PROFILE]);
+                let out = nm(&["--wait", "5", "connection", "down", PROFILE]);
                 let _ = tx.send(Event::Log("DISCONNECT".into(), out));
                 if nm_active() {
                     let _ = tx.send(Event::Failed("VPN still appears active.".into()));
