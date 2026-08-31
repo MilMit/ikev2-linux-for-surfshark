@@ -29,6 +29,8 @@ struct AppSettings {
     hotspot_vpn: bool,
     hotspot_iface: String,
     recover_network: bool,
+    kill_switch: bool,
+    routing_mode: String,
 }
 
 impl Default for AppSettings {
@@ -40,6 +42,8 @@ impl Default for AppSettings {
             hotspot_vpn: true,
             hotspot_iface: "auto".to_string(),
             recover_network: true,
+            kill_switch: true,
+            routing_mode: "vpn_all".to_string(),
         }
     }
 }
@@ -131,6 +135,8 @@ fn load_settings() -> AppSettings {
             "hotspot_vpn" => settings.hotspot_vpn = value == "1",
             "hotspot_iface" => if !value.trim().is_empty() { settings.hotspot_iface = value.trim().to_string(); },
             "recover_network" => settings.recover_network = value == "1",
+            "kill_switch" => settings.kill_switch = value == "1",
+            "routing_mode" => if matches!(value, "vpn_all" | "iran_direct") { settings.routing_mode = value.to_string(); },
             _ => {}
         }
     }
@@ -141,13 +147,15 @@ fn save_settings(settings: &AppSettings) {
     let path = settings_path();
     if let Some(parent) = path.parent() { let _ = fs::create_dir_all(parent); }
     let text = format!(
-        "restricted={}\nmss={}\ndns={}\nhotspot_vpn={}\nhotspot_iface={}\nrecover_network={}\n",
+        "restricted={}\nmss={}\ndns={}\nhotspot_vpn={}\nhotspot_iface={}\nrecover_network={}\nkill_switch={}\nrouting_mode={}\n",
         settings.restricted as u8,
         settings.mss,
         settings.dns,
         settings.hotspot_vpn as u8,
         settings.hotspot_iface,
         settings.recover_network as u8,
+        settings.kill_switch as u8,
+        settings.routing_mode,
     );
     let _ = fs::write(path, text);
 }
@@ -211,6 +219,7 @@ fn restricted_connect(endpoint: &str, username: &str, password: &str, settings: 
     let mss = settings.mss.to_string();
     let hotspot = if settings.hotspot_vpn { "1" } else { "0" };
     let recover = if settings.recover_network { "1" } else { "0" };
+    let kill = if settings.kill_switch { "1" } else { "0" };
     let mut child = match Command::new("pkexec")
         .arg("bash")
         .arg(RESTRICTED_CONNECT)
@@ -221,6 +230,8 @@ fn restricted_connect(endpoint: &str, username: &str, password: &str, settings: 
         .arg(hotspot)
         .arg(recover)
         .arg(&settings.hotspot_iface)
+        .arg(kill)
+        .arg(&settings.routing_mode)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -352,6 +363,13 @@ fn build_ui(app: &adw::Application) {
     let pass = gtk::PasswordEntry::builder().placeholder_text("Service password · blank = use saved password").show_peek_icon(true).hexpand(true).build();
     let mss = gtk::SpinButton::with_range(900.0, 1400.0, 10.0); mss.set_value(settings.mss as f64); mss.set_tooltip_text(Some("1200 is the verified safe value for filtered/mobile Iranian networks."));
     let dns = gtk::Entry::builder().text(&settings.dns).placeholder_text(DEFAULT_DNS).hexpand(true).build();
+
+    let routing_mode = gtk::ComboBoxText::new(); routing_mode.set_hexpand(true);
+    routing_mode.append(Some("vpn_all"), "🌐 VPN Everything");
+    routing_mode.append(Some("iran_direct"), "🇮🇷 Iran Direct · Foreign through VPN");
+    routing_mode.set_active_id(Some(&settings.routing_mode));
+    let kill_switch = gtk::CheckButton::with_label("Kill Switch · block public traffic if VPN path fails"); kill_switch.set_active(settings.kill_switch);
+
     let hotspot_vpn = gtk::CheckButton::with_label("Route selected hotspot through VPN"); hotspot_vpn.set_active(settings.hotspot_vpn);
     let hotspot_iface = gtk::ComboBoxText::new(); hotspot_iface.set_hexpand(true);
     hotspot_iface.append(Some("auto"), "⚡ Auto-detect active hotspot");
@@ -360,6 +378,8 @@ fn build_ui(app: &adw::Application) {
     let recover_network = gtk::CheckButton::with_label("Auto-recover Internet after failed connect / disconnect"); recover_network.set_active(settings.recover_network);
     let reset_tuning = gtk::Button::with_label("Reset Iran tuning");
 
+    let routing_row = gtk::Box::new(Orientation::Horizontal, 10);
+    routing_row.append(&gtk::Label::builder().label("Routing mode").width_chars(18).halign(gtk::Align::Start).build()); routing_row.append(&routing_mode);
     let mss_row = gtk::Box::new(Orientation::Horizontal, 10);
     mss_row.append(&gtk::Label::builder().label("TCP MSS").width_chars(18).halign(gtk::Align::Start).build()); mss_row.append(&mss);
     let dns_row = gtk::Box::new(Orientation::Horizontal, 10);
@@ -372,15 +392,17 @@ fn build_ui(app: &adw::Application) {
     settings_box.append(&gtk::Separator::new(Orientation::Horizontal));
     settings_box.append(&gtk::Label::builder().label("Surfshark credentials").halign(gtk::Align::Start).css_classes(["heading"]).build());
     settings_box.append(&user); settings_box.append(&pass);
-    settings_box.append(&gtk::Label::builder().label("The username is stored in your user config. The service password is stored root-only by the privileged helper after first use.").halign(gtk::Align::Start).wrap(true).css_classes(["dim-label", "small-note"]).build());
+    settings_box.append(&gtk::Label::builder().label("Username is stored in your user config. Service password is stored root-only by the privileged helper after first use.").halign(gtk::Align::Start).wrap(true).css_classes(["dim-label", "small-note"]).build());
     settings_box.append(&gtk::Separator::new(Orientation::Horizontal));
+    settings_box.append(&gtk::Label::builder().label("Routing & Iran split").halign(gtk::Align::Start).css_classes(["heading"]).build());
+    settings_box.append(&routing_row); settings_box.append(&kill_switch);
+    settings_box.append(&gtk::Label::builder().label("Iran Direct downloads and caches an Iran IPv4 prefix set through the VPN, then marks Iranian destinations direct and foreign destinations VPN. DNS itself stays on the VPN path.").halign(gtk::Align::Start).wrap(true).css_classes(["dim-label", "small-note"]).build());
     settings_box.append(&gtk::Label::builder().label("Iran / restricted-network tuning").halign(gtk::Align::Start).css_classes(["heading"]).build());
     settings_box.append(&mss_row); settings_box.append(&dns_row);
     settings_box.append(&gtk::Label::builder().label("Hotspot routing").halign(gtk::Align::Start).css_classes(["heading"]).build());
     settings_box.append(&hotspot_row); settings_box.append(&hotspot_vpn);
-    settings_box.append(&gtk::Label::builder().label("Choose the interface that is actually broadcasting the Ubuntu hotspot (for example wlan0/wlo1). When VPN routing is OFF, that hotspot keeps its normal ISP route. Auto only touches an active NetworkManager shared/10.42.x hotspot.").halign(gtk::Align::Start).wrap(true).css_classes(["dim-label", "small-note"]).build());
+    settings_box.append(&gtk::Label::builder().label("Choose the interface broadcasting the Ubuntu hotspot. ON sends that hotspot through the selected routing mode; OFF keeps it direct.").halign(gtk::Align::Start).wrap(true).css_classes(["dim-label", "small-note"]).build());
     settings_box.append(&recover_network); settings_box.append(&reset_tuning);
-    settings_box.append(&gtk::Label::builder().label("Recommended for Iran: MSS 1200 + Surfshark DNS. Select only the hotspot interface you want protected; the uplink itself is not treated as a hotspot unless NetworkManager marks it shared.").halign(gtk::Align::Start).wrap(true).css_classes(["dim-label", "small-note"]).build());
     let settings_expander = gtk::Expander::new(Some("Settings & Iran tuning")); settings_expander.set_child(Some(&settings_box));
 
     let connect = gtk::Button::with_label("Connect securely"); connect.add_css_class("suggested-action"); connect.add_css_class("primary-connect"); connect.set_visible(!initially_active);
@@ -399,17 +421,17 @@ fn build_ui(app: &adw::Application) {
     for w in [&hero, &location_box] { content.append(w); }
     content.append(&settings_expander); content.append(&actions); content.append(&ip_label); content.append(&hotspot_label); content.append(&expander);
     let root = gtk::Box::new(Orientation::Vertical, 0); root.append(&header); root.append(&content);
-    let window = adw::ApplicationWindow::builder().application(app).title("Surfshark IKEv2 for Linux").default_width(800).default_height(840).content(&root).build();
+    let window = adw::ApplicationWindow::builder().application(app).title("Surfshark IKEv2 for Linux").default_width(820).default_height(880).content(&root).build();
 
     let (tx, rx) = mpsc::channel::<Event>();
     let status = Rc::new(status); let status_icon = Rc::new(status_icon); let hero_detail = Rc::new(hero_detail); let spinner = Rc::new(spinner); let progress = Rc::new(progress);
     let connect = Rc::new(connect); let disconnect = Rc::new(disconnect); let refresh = Rc::new(refresh); let ping_button = Rc::new(ping_button); let buffer = Rc::new(buffer); let ip_label = Rc::new(ip_label); let hotspot_label = Rc::new(hotspot_label);
-    let pass = Rc::new(pass); let user = Rc::new(user); let location = Rc::new(location); let restricted_mode = Rc::new(restricted_mode); let mss = Rc::new(mss); let dns = Rc::new(dns); let hotspot_vpn = Rc::new(hotspot_vpn); let hotspot_iface = Rc::new(hotspot_iface); let recover_network = Rc::new(recover_network);
+    let pass = Rc::new(pass); let user = Rc::new(user); let location = Rc::new(location); let restricted_mode = Rc::new(restricted_mode); let mss = Rc::new(mss); let dns = Rc::new(dns); let hotspot_vpn = Rc::new(hotspot_vpn); let hotspot_iface = Rc::new(hotspot_iface); let recover_network = Rc::new(recover_network); let kill_switch = Rc::new(kill_switch); let routing_mode = Rc::new(routing_mode);
 
     {
-        let mss = Rc::clone(&mss); let dns = Rc::clone(&dns); let hotspot_vpn = Rc::clone(&hotspot_vpn); let hotspot_iface = Rc::clone(&hotspot_iface); let recover_network = Rc::clone(&recover_network); let restricted_mode = Rc::clone(&restricted_mode);
+        let mss = Rc::clone(&mss); let dns = Rc::clone(&dns); let hotspot_vpn = Rc::clone(&hotspot_vpn); let hotspot_iface = Rc::clone(&hotspot_iface); let recover_network = Rc::clone(&recover_network); let restricted_mode = Rc::clone(&restricted_mode); let kill_switch = Rc::clone(&kill_switch); let routing_mode = Rc::clone(&routing_mode);
         reset_tuning.connect_clicked(move |_| {
-            mss.set_value(1200.0); dns.set_text(DEFAULT_DNS); hotspot_vpn.set_active(true); hotspot_iface.set_active_id(Some("auto")); recover_network.set_active(true); restricted_mode.set_active(true);
+            mss.set_value(1200.0); dns.set_text(DEFAULT_DNS); hotspot_vpn.set_active(true); hotspot_iface.set_active_id(Some("auto")); recover_network.set_active(true); restricted_mode.set_active(true); kill_switch.set_active(true); routing_mode.set_active_id(Some("vpn_all"));
         });
     }
 
@@ -448,7 +470,7 @@ fn build_ui(app: &adw::Application) {
     }
 
     {
-        let tx = tx.clone(); let user = Rc::clone(&user); let pass = Rc::clone(&pass); let location = Rc::clone(&location); let restricted_mode = Rc::clone(&restricted_mode); let mss = Rc::clone(&mss); let dns = Rc::clone(&dns); let hotspot_vpn = Rc::clone(&hotspot_vpn); let hotspot_iface = Rc::clone(&hotspot_iface); let recover_network = Rc::clone(&recover_network);
+        let tx = tx.clone(); let user = Rc::clone(&user); let pass = Rc::clone(&pass); let location = Rc::clone(&location); let restricted_mode = Rc::clone(&restricted_mode); let mss = Rc::clone(&mss); let dns = Rc::clone(&dns); let hotspot_vpn = Rc::clone(&hotspot_vpn); let hotspot_iface = Rc::clone(&hotspot_iface); let recover_network = Rc::clone(&recover_network); let kill_switch = Rc::clone(&kill_switch); let routing_mode = Rc::clone(&routing_mode);
         connect.connect_clicked(move |_| {
             let id = location.active_id().map(|s| s.to_string()).unwrap_or_else(|| "ee-tll".to_string());
             let Some(selected) = by_id(&id) else { return; };
@@ -461,6 +483,8 @@ fn build_ui(app: &adw::Application) {
                 hotspot_vpn: hotspot_vpn.is_active(),
                 hotspot_iface: hotspot_iface.active_id().map(|s| s.to_string()).unwrap_or_else(|| "auto".into()),
                 recover_network: recover_network.is_active(),
+                kill_switch: kill_switch.is_active(),
+                routing_mode: routing_mode.active_id().map(|s| s.to_string()).unwrap_or_else(|| "vpn_all".into()),
             };
             save_username(&username); save_settings(&current);
             let tx = tx.clone();
@@ -469,7 +493,7 @@ fn build_ui(app: &adw::Application) {
                 if current.restricted {
                     if nm_active() { let _ = nm(&["--wait", "5", "connection", "down", PROFILE]); }
                     let candidates = restricted_candidates(selected.host);
-                    let _ = tx.send(Event::Log("RESTRICTED ENDPOINTS".into(), format!("{} candidate(s):\n{}\nMSS={}\nDNS={}\nHotspot through VPN={}\nHotspot interface={}\nAuto recovery={}", candidates.len(), candidates.join("\n"), current.mss, current.dns, current.hotspot_vpn, current.hotspot_iface, current.recover_network)));
+                    let _ = tx.send(Event::Log("RESTRICTED ENDPOINTS".into(), format!("{} candidate(s):\n{}\nMSS={}\nDNS={}\nRouting mode={}\nKill switch={}\nHotspot through VPN={}\nHotspot interface={}\nAuto recovery={}", candidates.len(), candidates.join("\n"), current.mss, current.dns, current.routing_mode, current.kill_switch, current.hotspot_vpn, current.hotspot_iface, current.recover_network)));
                     if candidates.is_empty() { let _ = tx.send(Event::Failed("No bundled restricted endpoint exists for this location yet.".into())); return; }
                     for (i, endpoint) in candidates.iter().enumerate() {
                         let _ = tx.send(Event::Busy(format!("{} · secure route {}/{}…", selected.city, i + 1, candidates.len())));
@@ -479,7 +503,8 @@ fn build_ui(app: &adw::Application) {
                             let ip = parse_helper_value(&log, "Public IPv4").unwrap_or_else(|| "connected".into());
                             let country = parse_helper_value(&log, "Exit country").unwrap_or_default();
                             let hotspot = parse_helper_value(&log, "Hotspot VPN").unwrap_or_else(|| if current.hotspot_vpn { format!("enabled · {}", current.hotspot_iface) } else { "normal route".into() });
-                            let label = if country.is_empty() { selected.label.to_string() } else { format!("{} · {}", selected.label, country) };
+                            let mode = parse_helper_value(&log, "Routing mode").unwrap_or_else(|| current.routing_mode.clone());
+                            let label = if country.is_empty() { format!("{} · {}", selected.label, mode) } else { format!("{} · {} · {}", selected.label, country, mode) };
                             let _ = tx.send(Event::Connected(ip, label, hotspot)); return;
                         }
                     }
@@ -519,7 +544,7 @@ fn build_ui(app: &adw::Application) {
             thread::spawn(move || {
                 let _ = tx.send(Event::Busy("Refreshing status…".into()));
                 let active = any_vpn_active();
-                let text = format!("restricted_active={}\nnetworkmanager_active={}\nvirtual_ip={}\npublic_ip={}\nhotspot_target={}\nhotspot_iface={}", restricted_active(), nm_active(), state_value("VIRTUAL_IP").unwrap_or_else(|| "—".into()), state_value("PUBLIC_IP").unwrap_or_else(|| if active { public_ip() } else { "—".into() }), state_value("HOTSPOT_IFACE_REQUEST").unwrap_or_else(|| "auto".into()), state_value("HOTSPOT_IFACE").unwrap_or_else(|| "—".into()));
+                let text = format!("restricted_active={}\nnetworkmanager_active={}\nvirtual_ip={}\npublic_ip={}\nrouting_mode={}\nkill_switch={}\niran_prefixes={}\nhotspot_target={}\nhotspot_iface={}", restricted_active(), nm_active(), state_value("VIRTUAL_IP").unwrap_or_else(|| "—".into()), state_value("PUBLIC_IP").unwrap_or_else(|| if active { public_ip() } else { "—".into() }), state_value("ROUTING_MODE").unwrap_or_else(|| "—".into()), state_value("KILL_SWITCH").unwrap_or_else(|| "—".into()), state_value("IRAN_SET_ENTRIES").unwrap_or_else(|| "0".into()), state_value("HOTSPOT_IFACE_REQUEST").unwrap_or_else(|| "auto".into()), state_value("HOTSPOT_IFACE").unwrap_or_else(|| "—".into()));
                 let _ = tx.send(Event::Refreshed(active, text));
             });
         });
