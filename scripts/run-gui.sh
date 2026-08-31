@@ -6,10 +6,10 @@ INSTALLED_CONNECT=/usr/lib/milmit-surfshark/restricted-ikev2-connect.sh
 INSTALLED_DISCONNECT=/usr/lib/milmit-surfshark/restricted-ikev2-disconnect.sh
 EXT_UUID=surfshark-ikev2@milmit.net
 EXT_DIR="/usr/share/gnome-shell/extensions/$EXT_UUID"
-SHIM="$ROOT/scripts/pkexec-shim/pkexec"
 TRAY="$ROOT/scripts/tray-indicator.py"
+RUNTIME_SHIM_DIR="${XDG_RUNTIME_DIR:-/tmp}/milmit-surfshark-$UID"
+RUNTIME_SHIM="$RUNTIME_SHIM_DIR/pkexec"
 
-chmod 0755 "$SHIM"
 chmod 0755 "$TRAY" 2>/dev/null || true
 
 needs_install=0
@@ -32,10 +32,54 @@ if [[ "$needs_install" == 1 ]]; then
   /usr/bin/pkexec /usr/bin/bash "$ROOT/scripts/install-privileged-helper.sh"
 fi
 
+# Never start the GUI against a stale privileged backend. A stale helper can
+# silently fall back to PEAP/IP identity and produce misleading authentication
+# failures, so verify every installed privileged file after installation.
+if [[ ! -x "$HELPER" ]] \
+  || ! cmp -s "$ROOT/scripts/restricted-ikev2-connect.sh" "$INSTALLED_CONNECT" \
+  || ! cmp -s "$ROOT/scripts/restricted-ikev2-disconnect.sh" "$INSTALLED_DISCONNECT" \
+  || ! cmp -s "$ROOT/scripts/milmit-surfshark-helper" "$HELPER"; then
+  echo "ERROR: privileged VPN helper is stale or installation did not complete." >&2
+  echo "Run this launcher again and approve the one-time Ubuntu authorization." >&2
+  exit 78
+fi
+
+echo "MilMit privileged VPN helper: verified and current."
+
+# Build the pkexec compatibility shim in the runtime directory instead of using
+# the tracked repository copy. This avoids local Git conflicts and guarantees
+# the GUI always forwards every current tuning option to the root-owned helper.
+install -d -m 0700 "$RUNTIME_SHIM_DIR"
+cat >"$RUNTIME_SHIM" <<'SHIM'
+#!/usr/bin/env bash
+set -euo pipefail
+REAL_PKEXEC=/usr/bin/pkexec
+HELPER=/usr/libexec/milmit-surfshark-helper
+if [[ "${1:-}" == "bash" && -n "${2:-}" ]]; then
+  script="${2}"
+  case "$script" in
+    */scripts/restricted-ikev2-connect.sh)
+      endpoint="${3:-}"
+      username="${4:-}"
+      mss="${5:-1200}"
+      dns_csv="${6:-162.252.172.57,149.154.159.92}"
+      hotspot_vpn="${7:-1}"
+      recover_network="${8:-1}"
+      hotspot_iface="${9:-auto}"
+      exec "$REAL_PKEXEC" "$HELPER" connect "$endpoint" "$username" "$mss" "$dns_csv" "$hotspot_vpn" "$recover_network" "$hotspot_iface"
+      ;;
+    */scripts/restricted-ikev2-disconnect.sh)
+      exec "$REAL_PKEXEC" "$HELPER" disconnect
+      ;;
+  esac
+fi
+exec "$REAL_PKEXEC" "$@"
+SHIM
+chmod 0755 "$RUNTIME_SHIM"
+
 # Prefer a native GNOME Shell top-bar status icon. On a brand-new extension
 # install, GNOME Shell can require a new login session before it loads the
-# extension. In that case launch an AppIndicator fallback immediately so the
-# user still sees VPN status in Ubuntu's top bar during this session.
+# extension. In that case launch an AppIndicator fallback immediately.
 extension_enabled=0
 if command -v gnome-extensions >/dev/null 2>&1; then
   gnome-extensions enable "$EXT_UUID" >/dev/null 2>&1 || true
@@ -48,6 +92,6 @@ if [[ "$extension_enabled" == 0 ]] && command -v python3 >/dev/null 2>&1; then
   nohup python3 "$TRAY" >/tmp/milmit-surfshark-indicator.log 2>&1 &
 fi
 
-export PATH="$ROOT/scripts/pkexec-shim:$PATH"
+export PATH="$RUNTIME_SHIM_DIR:$PATH"
 cd "$ROOT"
 exec cargo run -p surfshark-ikev2-gui
