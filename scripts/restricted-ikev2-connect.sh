@@ -20,6 +20,12 @@ if [[ $EUID -ne 0 ]]; then echo "This helper must run as root." >&2; exit 77; fi
 if [[ -z "$SERVER_IP" || -z "$SERVICE_USER" ]]; then echo "usage: $0 <server-ip> <service-user> [password-file]" >&2; exit 64; fi
 if ! [[ "$SERVER_IP" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then echo "server must be an IPv4 address" >&2; exit 65; fi
 
+state_get() {
+  local key="$1"
+  [[ -f "$STATE_FILE" ]] || return 0
+  awk -F= -v k="$key" '$1==k {sub(/^[^=]*=/, ""); print; exit}' "$STATE_FILE" 2>/dev/null || true
+}
+
 SERVICE_PASS=""
 if [[ -n "$PASSWORD_FILE" ]]; then
   [[ -f "$PASSWORD_FILE" ]] || { echo "Password handoff file does not exist: $PASSWORD_FILE" >&2; exit 66; }
@@ -42,19 +48,28 @@ else
   exit 66
 fi
 
-# Clear previous temporary network state before a new attempt.
-if [[ -f "$STATE_FILE" ]]; then
-  # shellcheck disable=SC1090
-  source "$STATE_FILE" || true
-  [[ -z "${VIRTUAL_IP:-}" ]] || iptables -t mangle -D OUTPUT -s "$VIRTUAL_IP/32" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "${MSS_VALUE:-1200}" 2>/dev/null || true
-  if [[ -n "${HOTSPOT_IFACE:-}" && -n "${HOTSPOT_SUBNET:-}" && -n "${VIRTUAL_IP:-}" ]]; then
-    iptables -t nat -D POSTROUTING -s "$HOTSPOT_SUBNET" -j SNAT --to-source "$VIRTUAL_IP" 2>/dev/null || true
-    iptables -t mangle -D FORWARD -i "$HOTSPOT_IFACE" -s "$HOTSPOT_SUBNET" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "${MSS_VALUE:-1200}" 2>/dev/null || true
-    iptables -D FORWARD -i "$HOTSPOT_IFACE" -s "$HOTSPOT_SUBNET" -j ACCEPT 2>/dev/null || true
-    iptables -D FORWARD -o "$HOTSPOT_IFACE" -d "$HOTSPOT_SUBNET" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
-  fi
-  [[ -z "${IFACE:-}" ]] || resolvectl revert "$IFACE" 2>/dev/null || true
+# Clear previous temporary network state without sourcing the state file.
+# Values such as "Surfshark IKEv2 (Connected)" are intentionally plain text
+# for the GNOME indicator, so parsing must not execute them as shell code.
+OLD_VIRTUAL_IP="$(state_get VIRTUAL_IP)"
+OLD_IFACE="$(state_get IFACE)"
+OLD_MSS="$(state_get MSS_VALUE)"
+OLD_HOTSPOT_IFACE="$(state_get HOTSPOT_IFACE)"
+OLD_HOTSPOT_SUBNET="$(state_get HOTSPOT_SUBNET)"
+if [[ -n "$OLD_VIRTUAL_IP" ]]; then
+  iptables -t mangle -D OUTPUT -s "$OLD_VIRTUAL_IP/32" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "${OLD_MSS:-1200}" 2>/dev/null || true
 fi
+if [[ -n "$OLD_HOTSPOT_IFACE" && -n "$OLD_HOTSPOT_SUBNET" && -n "$OLD_VIRTUAL_IP" ]]; then
+  iptables -t nat -D POSTROUTING -s "$OLD_HOTSPOT_SUBNET" -j SNAT --to-source "$OLD_VIRTUAL_IP" 2>/dev/null || true
+  iptables -t mangle -D FORWARD -i "$OLD_HOTSPOT_IFACE" -s "$OLD_HOTSPOT_SUBNET" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "${OLD_MSS:-1200}" 2>/dev/null || true
+  iptables -D FORWARD -i "$OLD_HOTSPOT_IFACE" -s "$OLD_HOTSPOT_SUBNET" -j ACCEPT 2>/dev/null || true
+  iptables -D FORWARD -o "$OLD_HOTSPOT_IFACE" -d "$OLD_HOTSPOT_SUBNET" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
+fi
+if [[ -n "$OLD_IFACE" ]] && command -v resolvectl >/dev/null 2>&1; then
+  resolvectl revert "$OLD_IFACE" 2>/dev/null || true
+fi
+rm -f "$STATE_FILE"
+
 if command -v nmcli >/dev/null 2>&1; then
   nmcli connection down "$NM_MARKER" >/dev/null 2>&1 || true
   nmcli connection delete "$NM_MARKER" >/dev/null 2>&1 || true
@@ -71,8 +86,15 @@ connections {
         fragmentation = yes
         mobike = yes
         send_certreq = yes
-        local { auth = eap-mschapv2; eap_id = $SERVICE_USER; id = $SERVICE_USER }
-        remote { auth = pubkey; id = $SERVER_IP }
+        local {
+            auth = eap-mschapv2
+            eap_id = $SERVICE_USER
+            id = $SERVICE_USER
+        }
+        remote {
+            auth = pubkey
+            id = $SERVER_IP
+        }
         children {
             $CHILD_NAME {
                 local_ts = 0.0.0.0/0
@@ -86,7 +108,12 @@ connections {
         dpd_delay = 30s
     }
 }
-secrets { eap-milmit-surfshark { id = $SERVICE_USER; secret = "$SERVICE_PASS" } }
+secrets {
+    eap-milmit-surfshark {
+        id = $SERVICE_USER
+        secret = "$SERVICE_PASS"
+    }
+}
 EOF
 chmod 0600 "$CONF"
 
@@ -110,24 +137,24 @@ if command -v resolvectl >/dev/null 2>&1 && [[ -n "$IFACE" ]]; then
   resolvectl flush-caches || true
 fi
 
-# Detect an active NetworkManager shared connection (Ubuntu Hotspot/Ethernet sharing)
-# and NAT clients to the Surfshark virtual IP so forwarded traffic matches the IPsec SA.
 HOTSPOT_IFACE=""
 HOTSPOT_SUBNET=""
-while IFS=: read -r ACTIVE_NAME ACTIVE_DEVICE; do
-  [[ -n "$ACTIVE_NAME" && -n "$ACTIVE_DEVICE" && "$ACTIVE_DEVICE" != "--" ]] || continue
-  METHOD="$(nmcli -g ipv4.method connection show "$ACTIVE_NAME" 2>/dev/null | head -n1 || true)"
-  [[ "$METHOD" == "shared" ]] || continue
-  CIDR="$(ip -4 -o addr show dev "$ACTIVE_DEVICE" scope global 2>/dev/null | awk '{print $4}' | head -n1)"
-  [[ -n "$CIDR" ]] || continue
-  HOTSPOT_IFACE="$ACTIVE_DEVICE"
-  HOTSPOT_SUBNET="$(python3 - "$CIDR" <<'PY'
+if command -v nmcli >/dev/null 2>&1; then
+  while IFS=: read -r ACTIVE_NAME ACTIVE_DEVICE; do
+    [[ -n "$ACTIVE_NAME" && -n "$ACTIVE_DEVICE" && "$ACTIVE_DEVICE" != "--" ]] || continue
+    METHOD="$(nmcli -g ipv4.method connection show "$ACTIVE_NAME" 2>/dev/null | head -n1 || true)"
+    [[ "$METHOD" == "shared" ]] || continue
+    CIDR="$(ip -4 -o addr show dev "$ACTIVE_DEVICE" scope global 2>/dev/null | awk '{print $4}' | head -n1)"
+    [[ -n "$CIDR" ]] || continue
+    HOTSPOT_IFACE="$ACTIVE_DEVICE"
+    HOTSPOT_SUBNET="$(python3 - "$CIDR" <<'PY'
 import ipaddress, sys
 print(ipaddress.ip_interface(sys.argv[1]).network)
 PY
 )"
-  break
-done < <(nmcli -t -f NAME,DEVICE connection show --active 2>/dev/null || true)
+    break
+  done < <(nmcli -t -f NAME,DEVICE connection show --active 2>/dev/null || true)
+fi
 
 if [[ -n "$HOTSPOT_IFACE" && -n "$HOTSPOT_SUBNET" ]]; then
   sysctl -w net.ipv4.ip_forward=1 >/dev/null
@@ -159,10 +186,10 @@ VIRTUAL_IP=$VIRTUAL_IP
 IFACE=$IFACE
 MSS_VALUE=$MSS
 SERVER_IP=$SERVER_IP
-PUBLIC_IP=$PUBLIC_IP
-EXIT_COUNTRY=$EXIT_COUNTRY
 NM_MARKER=$NM_MARKER
 NM_MARKER_ACTIVE=$NM_MARKER_ACTIVE
+PUBLIC_IP=$PUBLIC_IP
+EXIT_COUNTRY=$EXIT_COUNTRY
 HOTSPOT_IFACE=$HOTSPOT_IFACE
 HOTSPOT_SUBNET=$HOTSPOT_SUBNET
 EOF
