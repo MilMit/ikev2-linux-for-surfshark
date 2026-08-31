@@ -2,6 +2,11 @@
 set -euo pipefail
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 HELPER=/usr/libexec/milmit-surfshark-helper
+SHIM="$ROOT/scripts/pkexec-shim/pkexec"
+
+# GitHub Contents API does not preserve executable mode for newly-added files,
+# so make the user-owned shim executable before putting it on PATH.
+chmod 0755 "$SHIM"
 
 if [[ ! -x "$HELPER" ]]; then
   echo "First-run setup: Ubuntu will ask for your password once to install the restricted VPN helper."
