@@ -4,6 +4,8 @@ ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 HELPER=/usr/libexec/milmit-surfshark-helper
 INSTALLED_CONNECT=/usr/lib/milmit-surfshark/restricted-ikev2-connect.sh
 INSTALLED_DISCONNECT=/usr/lib/milmit-surfshark/restricted-ikev2-disconnect.sh
+INSTALLED_DEVICE_POLICY=/usr/lib/milmit-surfshark/hotspot-device-policy.sh
+INSTALLED_DEVICE_MANAGER=/usr/lib/milmit-surfshark/hotspot-device-manager.py
 EXT_UUID=surfshark-ikev2@milmit.net
 EXT_DIR="/usr/share/gnome-shell/extensions/$EXT_UUID"
 TRAY="$ROOT/scripts/tray-indicator.py"
@@ -13,13 +15,17 @@ RUNTIME_SHIM="$RUNTIME_SHIM_DIR/pkexec"
 chmod 0755 "$TRAY" 2>/dev/null || true
 
 needs_install=0
-if [[ ! -x "$HELPER" || ! -f "$INSTALLED_CONNECT" || ! -f "$INSTALLED_DISCONNECT" ]]; then
+if [[ ! -x "$HELPER" || ! -f "$INSTALLED_CONNECT" || ! -f "$INSTALLED_DISCONNECT" || ! -x "$INSTALLED_DEVICE_POLICY" || ! -x "$INSTALLED_DEVICE_MANAGER" ]]; then
   needs_install=1
 elif [[ ! -f "$EXT_DIR/extension.js" || ! -f "$EXT_DIR/metadata.json" ]]; then
   needs_install=1
 elif ! cmp -s "$ROOT/scripts/restricted-ikev2-connect.sh" "$INSTALLED_CONNECT"; then
   needs_install=1
 elif ! cmp -s "$ROOT/scripts/restricted-ikev2-disconnect.sh" "$INSTALLED_DISCONNECT"; then
+  needs_install=1
+elif ! cmp -s "$ROOT/scripts/hotspot-device-policy.sh" "$INSTALLED_DEVICE_POLICY"; then
+  needs_install=1
+elif ! cmp -s "$ROOT/scripts/hotspot-device-manager.py" "$INSTALLED_DEVICE_MANAGER"; then
   needs_install=1
 elif ! cmp -s "$ROOT/scripts/milmit-surfshark-helper" "$HELPER"; then
   needs_install=1
@@ -28,20 +34,22 @@ elif ! cmp -s "$ROOT/packaging/gnome-shell-extension/extension.js" "$EXT_DIR/ext
 fi
 
 if [[ "$needs_install" == 1 ]]; then
-  echo "VPN helper/indicator install or update: Ubuntu may ask for your password once."
+  echo "VPN helper/device manager/indicator install or update: Ubuntu may ask for your password once."
   /usr/bin/pkexec /usr/bin/bash "$ROOT/scripts/install-privileged-helper.sh"
 fi
 
 if [[ ! -x "$HELPER" ]] \
   || ! cmp -s "$ROOT/scripts/restricted-ikev2-connect.sh" "$INSTALLED_CONNECT" \
   || ! cmp -s "$ROOT/scripts/restricted-ikev2-disconnect.sh" "$INSTALLED_DISCONNECT" \
+  || ! cmp -s "$ROOT/scripts/hotspot-device-policy.sh" "$INSTALLED_DEVICE_POLICY" \
+  || ! cmp -s "$ROOT/scripts/hotspot-device-manager.py" "$INSTALLED_DEVICE_MANAGER" \
   || ! cmp -s "$ROOT/scripts/milmit-surfshark-helper" "$HELPER"; then
-  echo "ERROR: privileged VPN helper is stale or installation did not complete." >&2
+  echo "ERROR: privileged VPN backend/device manager is stale or installation did not complete." >&2
   echo "Run this launcher again and approve the one-time Ubuntu authorization." >&2
   exit 78
 fi
 
-echo "MilMit privileged VPN helper: verified and current."
+echo "MilMit privileged VPN helper and hotspot device manager: verified and current."
 
 install -d -m 0700 "$RUNTIME_SHIM_DIR"
 cat >"$RUNTIME_SHIM" <<'SHIM'
