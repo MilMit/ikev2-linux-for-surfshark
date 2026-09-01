@@ -47,7 +47,7 @@ fn ping_ms(host: &str) -> Option<u32> {
 fn ping_text(ms: Option<u32>) -> String { ms.map(|v| format!("{v} ms")).unwrap_or_else(|| "—".into()) }
 
 #[derive(Clone)]
-struct RowParts { ping: gtk::Label, root: gtk::ListBoxRow, star: gtk::Button }
+struct RowParts { ping: gtk::Label }
 
 fn add_recent(id: &str) {
     let mut q = VecDeque::from(read_lines(recents_path()));
@@ -65,6 +65,15 @@ fn set_favorite(id: &str, on: bool) {
     write_lines(favorites_path(), v);
 }
 
+fn select_location(id: &str, selected: &Rc<RefCell<String>>, home_label: &gtk::Label, stack: &gtk::Stack) {
+    if let Some(l) = by_id(id) {
+        *selected.borrow_mut() = id.to_string();
+        add_recent(id);
+        home_label.set_label(&format!("{} · {}", l.country, l.city));
+        stack.set_visible_child_name("home");
+    }
+}
+
 fn location_row(
     id: &'static str,
     country: &'static str,
@@ -74,7 +83,7 @@ fn location_row(
     home_label: gtk::Label,
     stack: gtk::Stack,
     favorites: Rc<RefCell<HashSet<String>>>,
-) -> (gtk::ListBoxRow, gtk::Label, gtk::Button) {
+) -> (gtk::ListBoxRow, gtk::Label) {
     let row = gtk::ListBoxRow::new();
     let box_ = gtk::Box::new(Orientation::Horizontal, 8);
     box_.add_css_class("location-city-row");
@@ -89,15 +98,13 @@ fn location_row(
     let star = gtk::Button::with_label(if favorites.borrow().contains(id) { "★" } else { "☆" });
     star.add_css_class("star-button");
     let id_s = id.to_string();
-    let label = format!("{} · {}", country, city);
     let sel = selected.clone(); let ll = home_label.clone(); let st = stack.clone();
-    choose.connect_clicked(move |_| { *sel.borrow_mut() = id_s.clone(); add_recent(&id_s); ll.set_label(&label); st.set_visible_child_name("home"); });
+    choose.connect_clicked(move |_| { select_location(&id_s, &sel, &ll, &st); });
     let favs = favorites.clone(); let sid = id.to_string(); let star_clone = star.clone();
     star.connect_clicked(move |_| { let now = !favs.borrow().contains(&sid); if now { favs.borrow_mut().insert(sid.clone()); } else { favs.borrow_mut().remove(&sid); } set_favorite(&sid, now); star_clone.set_label(if now { "★" } else { "☆" }); });
 
-    // Right-click context actions: select, ping now, favorite and copy hostname.
     let gesture = gtk::GestureClick::new(); gesture.set_button(3);
-    let host_s = host.to_string(); let id_ctx = id.to_string(); let country_s = country.to_string(); let city_s = city.to_string();
+    let host_s = host.to_string(); let id_ctx = id.to_string();
     let ping_ctx = ping.clone(); let favs_ctx = favorites.clone(); let ll_ctx = home_label.clone(); let st_ctx = stack.clone(); let sel_ctx = selected.clone(); let star_ctx = star.clone();
     gesture.connect_pressed(move |g,_,x,y| {
         let pop = gtk::Popover::new();
@@ -110,8 +117,8 @@ fn location_row(
         let fav_b = gtk::Button::with_label(if favs_ctx.borrow().contains(&id_ctx) { "Remove favorite" } else { "Add favorite" });
         let copy_b = gtk::Button::with_label("Copy hostname");
         for b in [&select_b,&ping_b,&fav_b,&copy_b] { b.add_css_class("context-button"); menu.append(b); }
-        let id1=id_ctx.clone(); let label1=format!("{} · {}",country_s,city_s); let sel1=sel_ctx.clone(); let ll1=ll_ctx.clone(); let st1=st_ctx.clone(); let p1=pop.clone();
-        select_b.connect_clicked(move |_| { *sel1.borrow_mut()=id1.clone(); add_recent(&id1); ll1.set_label(&label1); p1.popdown(); st1.set_visible_child_name("home"); });
+        let id1=id_ctx.clone(); let sel1=sel_ctx.clone(); let ll1=ll_ctx.clone(); let st1=st_ctx.clone(); let p1=pop.clone();
+        select_b.connect_clicked(move |_| { select_location(&id1,&sel1,&ll1,&st1); p1.popdown(); });
         let h1=host_s.clone(); let pl=ping_ctx.clone(); let p2=pop.clone();
         ping_b.connect_clicked(move |_| { pl.set_label("…"); let (tx,rx)=mpsc::channel(); let h=h1.clone(); thread::spawn(move || { let _=tx.send(ping_ms(&h)); }); let pl2=pl.clone(); glib::timeout_add_local(Duration::from_millis(80), move || match rx.try_recv(){Ok(v)=>{pl2.set_label(&ping_text(v));glib::ControlFlow::Break},Err(mpsc::TryRecvError::Empty)=>glib::ControlFlow::Continue,Err(_)=>glib::ControlFlow::Break}); p2.popdown(); });
         let favs2=favs_ctx.clone(); let sid=id_ctx.clone(); let sbtn=star_ctx.clone(); let p3=pop.clone();
@@ -122,7 +129,7 @@ fn location_row(
     box_.add_controller(gesture);
     box_.append(&choose); box_.append(&ping); box_.append(&star);
     row.set_child(Some(&box_));
-    (row,ping,star)
+    (row,ping)
 }
 
 pub fn build(
@@ -134,6 +141,7 @@ pub fn build(
     let top = gtk::Box::new(Orientation::Horizontal, 8); top.add_css_class("top");
     let back=gtk::Button::from_icon_name("go-previous-symbolic"); back.add_css_class("back"); let st=stack.clone(); back.connect_clicked(move |_|st.set_visible_child_name("home")); top.append(&back);
     top.append(&gtk::Label::builder().label("Select location").hexpand(true).halign(gtk::Align::Start).css_classes(["brand"]).build());
+    let fastest=gtk::Button::with_label("Fastest"); fastest.add_css_class("back"); top.append(&fastest);
     let scan=gtk::Button::with_label("Scan all"); scan.add_css_class("back"); top.append(&scan); page.append(&top);
 
     let body=gtk::Box::new(Orientation::Vertical,10); body.add_css_class("page");
@@ -143,44 +151,53 @@ pub fn build(
     let favorites: Rc<RefCell<HashSet<String>>> = Rc::new(RefCell::new(read_lines(favorites_path()).into_iter().collect()));
     let recents=read_lines(recents_path());
     let rows: Rc<RefCell<HashMap<String,RowParts>>> = Rc::new(RefCell::new(HashMap::new()));
+    let latency: Rc<RefCell<HashMap<String,Option<u32>>>> = Rc::new(RefCell::new(HashMap::new()));
     let country_widgets: Rc<RefCell<Vec<(gtk::Expander,String)>>> = Rc::new(RefCell::new(Vec::new()));
 
     if !favorites.borrow().is_empty() {
         body.append(&gtk::Label::builder().label("FAVORITES").halign(gtk::Align::Start).css_classes(["section"]).build());
         let favbox=gtk::ListBox::new(); favbox.add_css_class("location-list"); favbox.set_selection_mode(gtk::SelectionMode::None);
         let ids=favorites.borrow().iter().cloned().collect::<Vec<_>>();
-        for id in ids { if let Some(l)=by_id(&id) { let (r,p,s)=location_row(l.id,l.country,l.city,l.host,selected.clone(),home_label.clone(),stack.clone(),favorites.clone()); favbox.append(&r); rows.borrow_mut().insert(format!("fav:{}",l.id),RowParts{ping:p,root:r,star:s}); } }
+        for id in ids { if let Some(l)=by_id(&id) { let (r,p)=location_row(l.id,l.country,l.city,l.host,selected.clone(),home_label.clone(),stack.clone(),favorites.clone()); favbox.append(&r); rows.borrow_mut().insert(format!("fav:{}",l.id),RowParts{ping:p}); } }
         body.append(&favbox);
     }
     if !recents.is_empty() {
         body.append(&gtk::Label::builder().label("RECENT").halign(gtk::Align::Start).css_classes(["section"]).build());
         let recentbox=gtk::ListBox::new(); recentbox.add_css_class("location-list"); recentbox.set_selection_mode(gtk::SelectionMode::None);
-        for id in recents { if let Some(l)=by_id(&id) { let (r,p,s)=location_row(l.id,l.country,l.city,l.host,selected.clone(),home_label.clone(),stack.clone(),favorites.clone()); recentbox.append(&r); rows.borrow_mut().insert(format!("recent:{}",l.id),RowParts{ping:p,root:r,star:s}); } }
+        for id in recents { if let Some(l)=by_id(&id) { let (r,p)=location_row(l.id,l.country,l.city,l.host,selected.clone(),home_label.clone(),stack.clone(),favorites.clone()); recentbox.append(&r); rows.borrow_mut().insert(format!("recent:{}",l.id),RowParts{ping:p}); } }
         body.append(&recentbox);
     }
 
     body.append(&gtk::Label::builder().label("ALL LOCATIONS").halign(gtk::Align::Start).css_classes(["section"]).build());
     let mut countries:BTreeMap<&'static str,Vec<_>>=BTreeMap::new(); for l in LOCATIONS { countries.entry(l.country).or_default().push(l); }
     for (country, mut locs) in countries { locs.sort_by_key(|l|l.city); let exp=gtk::Expander::builder().label(country).build(); exp.add_css_class("country-expander"); let list=gtk::ListBox::new(); list.add_css_class("location-list"); list.set_selection_mode(gtk::SelectionMode::None); let mut search_blob=country.to_lowercase();
-        for l in locs { search_blob.push(' '); search_blob.push_str(&format!("{} {}",l.city,l.host).to_lowercase()); let (r,p,s)=location_row(l.id,l.country,l.city,l.host,selected.clone(),home_label.clone(),stack.clone(),favorites.clone()); list.append(&r); rows.borrow_mut().insert(l.id.to_string(),RowParts{ping:p,root:r,star:s}); }
+        for l in locs { search_blob.push(' '); search_blob.push_str(&format!("{} {}",l.city,l.host).to_lowercase()); let (r,p)=location_row(l.id,l.country,l.city,l.host,selected.clone(),home_label.clone(),stack.clone(),favorites.clone()); list.append(&r); rows.borrow_mut().insert(l.id.to_string(),RowParts{ping:p}); }
         exp.set_child(Some(&list)); body.append(&exp); country_widgets.borrow_mut().push((exp,search_blob));
     }
 
     let countries_filter=country_widgets.clone(); search.connect_search_changed(move |e| { let q=e.text().to_lowercase(); for (exp,blob) in countries_filter.borrow().iter(){ let show=q.is_empty()||blob.contains(&q); exp.set_visible(show); if !q.is_empty()&&show{exp.set_expanded(true);} } });
 
     let run_scan = {
-        let rows=rows.clone(); let banner=banner.clone();
+        let rows=rows.clone(); let banner=banner.clone(); let latency=latency.clone();
         move || {
             banner.set_title("Scanning location latency…"); banner.set_revealed(true);
+            latency.borrow_mut().clear();
             for parts in rows.borrow().values(){parts.ping.set_label("…");}
             let (tx,rx)=mpsc::channel::<(String,Option<u32>)>();
             thread::spawn(move || { for l in LOCATIONS { let _=tx.send((l.id.to_string(),ping_ms(l.host))); } });
-            let rows2=rows.clone(); let banner2=banner.clone(); let mut completed=0usize; let total=LOCATIONS.len();
-            glib::timeout_add_local(Duration::from_millis(45), move || { while let Ok((id,ms))=rx.try_recv(){ completed+=1; let text=ping_text(ms); for key in [id.clone(),format!("fav:{id}"),format!("recent:{id}")] { if let Some(parts)=rows2.borrow().get(&key){parts.ping.set_label(&text);} } } if completed>=total { banner2.set_title("Latency scan complete. Lower is better."); return glib::ControlFlow::Break; } glib::ControlFlow::Continue });
+            let rows2=rows.clone(); let banner2=banner.clone(); let latency2=latency.clone(); let mut completed=0usize; let total=LOCATIONS.len();
+            glib::timeout_add_local(Duration::from_millis(45), move || { while let Ok((id,ms))=rx.try_recv(){ completed+=1; latency2.borrow_mut().insert(id.clone(),ms); let text=ping_text(ms); for key in [id.clone(),format!("fav:{id}"),format!("recent:{id}")] { if let Some(parts)=rows2.borrow().get(&key){parts.ping.set_label(&text);} } } if completed>=total { let best=latency2.borrow().iter().filter_map(|(id,ms)|ms.map(|v|(id.clone(),v))).min_by_key(|(_,v)|*v); if let Some((id,ms))=best { if let Some(l)=by_id(&id){banner2.set_title(&format!("Fastest: {} · {} · {} ms",l.country,l.city,ms));} } else { banner2.set_title("Latency scan complete; no reachable endpoints answered ICMP."); } return glib::ControlFlow::Break; } glib::ControlFlow::Continue });
         }
     };
     let run_scan=Rc::new(run_scan); let rs=run_scan.clone(); scan.connect_clicked(move |_|rs());
-    // Start a background scan shortly after opening so numbers appear automatically.
+
+    let latency_fast=latency.clone(); let sel_fast=selected.clone(); let ll_fast=home_label.clone(); let st_fast=stack.clone(); let bn_fast=banner.clone(); let rs_fast=run_scan.clone();
+    fastest.connect_clicked(move |_| {
+        let best=latency_fast.borrow().iter().filter_map(|(id,ms)|ms.map(|v|(id.clone(),v))).min_by_key(|(_,v)|*v);
+        if let Some((id,_))=best { select_location(&id,&sel_fast,&ll_fast,&st_fast); }
+        else { bn_fast.set_title("Scanning first — press Fastest again when latency numbers appear."); bn_fast.set_revealed(true); rs_fast(); }
+    });
+
     let rs2=run_scan.clone(); glib::timeout_add_local_once(Duration::from_millis(550), move || rs2());
 
     let scroll=gtk::ScrolledWindow::builder().child(&body).vexpand(true).build(); page.append(&scroll); page
