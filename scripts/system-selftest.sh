@@ -29,7 +29,26 @@ if [[ -f "$STATE" ]]; then
   mark=$(awk -F= '$1=="MARK_VPN"{print $2;exit}' "$STATE"); mark="${mark:-$MARK}"
   [[ -n "$vip" ]] && ok "virtual IP: $vip" || bad 'virtual IP missing'
   [[ -n "$pub" ]] && ok "recorded public IP: $pub" || bad 'public IP missing'
-  swanctl --list-sas 2>/dev/null | grep -q 'milmit-surfshark-restricted.*ESTABLISHED' && ok 'IKE SA established' || bad 'IKE SA not established'
+
+  # Direct swanctl access can be denied for a normal desktop user because the
+  # VICI socket is privileged. Prefer it when readable, then fall back to the
+  # already-authorized root helper used by the GUI.
+  sa_text=$(swanctl --list-sas 2>/dev/null || true)
+  if ! printf '%s\n' "$sa_text" | grep -q 'milmit-surfshark-restricted:.*ESTABLISHED'; then
+    if command -v pkexec >/dev/null 2>&1 && [[ -x "$HELPER" ]]; then
+      sa_text=$(pkexec "$HELPER" status 2>/dev/null || true)
+    fi
+  fi
+  if printf '%s\n' "$sa_text" | grep -q 'milmit-surfshark-restricted:.*ESTABLISHED'; then
+    ok 'IKE SA established'
+  elif [[ -n "$vip" ]] && ip link show "$XFRM" >/dev/null 2>&1; then
+    # Do not produce a false hard failure if VICI remains inaccessible while
+    # the kernel XFRM path and end-to-end VPN checks below are healthy.
+    warn 'IKE SA status unavailable to this user; validating kernel/data path instead'
+  else
+    bad 'IKE SA not established'
+  fi
+
   ip link show "$XFRM" >/dev/null 2>&1 && ok 'XFRM interface exists' || bad 'XFRM interface missing'
   route=$(ip -4 route get 1.1.1.1 mark "$mark" 2>&1 || true)
   printf '%s\n' "$route" | grep -q "dev $XFRM" && ok 'marked Internet route selects XFRM VPN' || bad "marked route wrong: $route"
