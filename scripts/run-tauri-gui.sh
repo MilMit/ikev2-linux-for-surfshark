@@ -23,10 +23,10 @@ if ((${#missing_modules[@]})); then echo "ERROR: pkg-config still cannot find: $
 echo "Tauri native dependencies detected:"; pkg-config --modversion webkit2gtk-4.1 libsoup-3.0 javascriptcoregtk-4.1
 
 # Compare the complete privileged stack, not only the helper entrypoint. This
-# prevents a changed watchdog/router/desktop-feature script from silently using
-# an older installed copy.
+# prevents a changed watchdog/router/desktop-feature/doctor script from silently
+# using an older installed copy.
 backend_changed=0
-backend_files=(restricted-ikev2-connect.sh restricted-ikev2-connect-v2.sh restricted-ikev2-disconnect.sh hotspot-device-policy.sh milmit-surfshark-watchdog.sh control-center.py router-features.py advanced-router.py rules-update.py status-portal.py desktop-features.py)
+backend_files=(restricted-ikev2-connect.sh restricted-ikev2-connect-v2.sh restricted-ikev2-disconnect.sh hotspot-device-policy.sh milmit-surfshark-watchdog.sh control-center.py router-features.py advanced-router.py rules-update.py status-portal.py desktop-features.py hotspot-doctor.py)
 for f in "${backend_files[@]}"; do
   [[ -f "/usr/lib/milmit-surfshark/$f" ]] && cmp -s "$ROOT/scripts/$f" "/usr/lib/milmit-surfshark/$f" || backend_changed=1
 done
