@@ -7,13 +7,26 @@
   <vendor_url>https://github.com/MilMit/ikev2-linux-for-surfshark</vendor_url>
   <action id="net.milmit.surfshark-ikev2.manage">
     <description>Manage MilMit Surfshark IKEv2 connection</description>
-    <message>Authentication is required to install or manage Surfshark IKEv2</message>
+    <message>Authentication is required once to install or authorize MilMit Secure</message>
     <defaults>
       <allow_any>no</allow_any>
       <allow_inactive>no</allow_inactive>
       <allow_active>yes</allow_active>
     </defaults>
     <annotate key="org.freedesktop.policykit.exec.path">/usr/libexec/milmit-surfshark-helper</annotate>
+    <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
+  </action>
+
+  <action id="net.milmit.surfshark-ikev2.install">
+    <description>Install or update MilMit Secure privileged components</description>
+    <message>Authentication is required to install or update MilMit Secure</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/bin/bash</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">/usr/lib/milmit-surfshark/install-privileged-helper.sh</annotate>
     <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
   </action>
 </policyconfig>
