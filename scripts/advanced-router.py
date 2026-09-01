@@ -35,17 +35,35 @@ def verify():
     rc,trace=run(['curl','-4','--connect-timeout','5','--max-time','12','-ks','https://1.1.1.1/cdn-cgi/trace'],15)
     checks['https']=rc==0 and 'ip=' in trace
     hs=load_router().hotspot_info();checks['hotspot']=True
+    hotspot_detail={}
     if hs.get('iface') and hs.get('subnet'):
-        fwd=run(['iptables','-w','-t','filter','-C','FORWARD','-i',hs['iface'],'-s',hs['subnet'],'-j','ACCEPT'],5)[0]==0
-        checks['hotspot_forward']=fwd
-    return {'ok':all(checks.values()),'checks':checks,'route':route,'trace':trace[-500:]}
+        iface,subnet=hs['iface'],hs['subnet']
+        st={}
+        try:
+            for line in STATE.read_text(errors='replace').splitlines():
+                if '=' in line:
+                    k,v=line.split('=',1);st[k]=v
+        except OSError:pass
+        vip=st.get('VIRTUAL_IP','')
+        ipf=run(['sysctl','-n','net.ipv4.ip_forward'],4)[1].strip()=='1'
+        mark_hook=run(['iptables','-w','-t','mangle','-C','PREROUTING','-i',iface,'-s',subnet,'-j','MILMIT_HOTSPOT_MARK'],5)[0]==0
+        fwd_hook=run(['iptables','-w','-t','filter','-C','FORWARD','-j','MILMIT_HOTSPOT_FWD'],5)[0]==0
+        fwd_vpn=run(['iptables','-w','-t','filter','-C','MILMIT_HOTSPOT_FWD','-i',iface,'-s',subnet,'-o','milmitxfrm0','-j','ACCEPT'],5)[0]==0
+        dns_hook=run(['iptables','-w','-t','nat','-C','PREROUTING','-i',iface,'-s',subnet,'-j','MILMIT_HOTSPOT_DNS'],5)[0]==0
+        snat=True
+        if st.get('HOTSPOT_VPN','1')=='1' and vip:
+            snat=run(['iptables','-w','-t','nat','-C','POSTROUTING','-s',subnet,'-o','milmitxfrm0','-j','SNAT','--to-source',vip],5)[0]==0
+        checks['hotspot_forward']=all((ipf,mark_hook,fwd_hook,fwd_vpn,dns_hook,snat))
+        hotspot_detail={'ip_forward':ipf,'mark_hook':mark_hook,'forward_hook':fwd_hook,'vpn_accept':fwd_vpn,'dns_hook':dns_hook,'snat':snat,
+                        'forward_chain':run(['iptables','-w','-t','filter','-L','MILMIT_HOTSPOT_FWD','-vnx'],5)[1][-1800:],
+                        'mark_chain':run(['iptables','-w','-t','mangle','-L','MILMIT_HOTSPOT_MARK','-vnx'],5)[1][-1800:]}
+    return {'ok':all(checks.values()),'checks':checks,'route':route,'trace':trace[-500:],'hotspot_detail':hotspot_detail}
 
 def apply_safe():
     snapshot();m=load_router();result=m.apply();v=verify()
     if result.get('ok') and v.get('ok'):
         run(['/usr/libexec/milmit-surfshark-helper','save-lkg'],8)
         return {'ok':True,'applied':result,'verification':v,'rollback':False}
-    # Conservative rollback: remove only advanced policy engine and re-apply previous config when saved.
     for table,base,chain in [('mangle','OUTPUT','MILMIT_ADV_POLICY'),('mangle','PREROUTING','MILMIT_ADV_POLICY'),('filter','OUTPUT','MILMIT_ADV_BLOCK'),('filter','FORWARD','MILMIT_ADV_BLOCK'),('filter','FORWARD','MILMIT_DEVICE_BLOCK')]:
         for _ in range(10):
             rc,_=run(['iptables','-w','-t',table,'-D',base,'-j',chain],4)
