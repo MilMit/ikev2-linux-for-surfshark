@@ -5,6 +5,7 @@ STATE_DIR=/run/milmit-surfshark
 STATE_FILE="$STATE_DIR/restricted.state"
 LIVE_FILE="$STATE_DIR/live.state"
 LAST_FILE=/var/lib/milmit-surfshark/last-profile.state
+USAGE_FILE=/var/lib/milmit-surfshark/traffic-usage.state
 DISCONNECTING="$STATE_DIR/disconnecting"
 MANUAL_DISCONNECTED="$STATE_DIR/manual-disconnected"
 RECOVERING="$STATE_DIR/watchdog-recovering"
@@ -28,6 +29,34 @@ UPDATED=$(date +%s)
 EOF
 chmod 0644 "$tmp"; mv -f "$tmp" "$LIVE_FILE"; }
 persist_profile(){ [[ -f "$STATE_FILE" ]] || return 0; local tmp="${LAST_FILE}.tmp"; cp "$STATE_FILE" "$tmp" 2>/dev/null || return 0; chmod 0600 "$tmp"; mv -f "$tmp" "$LAST_FILE"; }
+usage_reset_session(){ [[ -f "$USAGE_FILE" ]] || return 0; local tmp="${USAGE_FILE}.tmp"; awk -F= 'BEGIN{OFS="="} $1=="LAST_RX"{$2=0} $1=="LAST_TX"{$2=0} {print $1,$2}' "$USAGE_FILE" >"$tmp" 2>/dev/null || return 0; chmod 0644 "$tmp"; mv -f "$tmp" "$USAGE_FILE"; }
+update_usage(){
+  local rx="$1" tx="$2" today month all_rx all_tx day day_rx day_tx mon mon_rx mon_tx last_rx last_tx dr=0 dt=0 tmp
+  today="$(date +%F)"; month="$(date +%Y-%m)"
+  all_rx="$(state_get "$USAGE_FILE" ALL_RX_BYTES)"; all_rx="${all_rx:-0}"; all_tx="$(state_get "$USAGE_FILE" ALL_TX_BYTES)"; all_tx="${all_tx:-0}"
+  day="$(state_get "$USAGE_FILE" DAY)"; day_rx="$(state_get "$USAGE_FILE" DAY_RX_BYTES)"; day_rx="${day_rx:-0}"; day_tx="$(state_get "$USAGE_FILE" DAY_TX_BYTES)"; day_tx="${day_tx:-0}"
+  mon="$(state_get "$USAGE_FILE" MONTH)"; mon_rx="$(state_get "$USAGE_FILE" MONTH_RX_BYTES)"; mon_rx="${mon_rx:-0}"; mon_tx="$(state_get "$USAGE_FILE" MONTH_TX_BYTES)"; mon_tx="${mon_tx:-0}"
+  last_rx="$(state_get "$USAGE_FILE" LAST_RX)"; last_rx="${last_rx:-0}"; last_tx="$(state_get "$USAGE_FILE" LAST_TX)"; last_tx="${last_tx:-0}"
+  [[ "$day" == "$today" ]] || { day="$today"; day_rx=0; day_tx=0; }
+  [[ "$mon" == "$month" ]] || { mon="$month"; mon_rx=0; mon_tx=0; }
+  if ((last_rx>0 && rx>=last_rx)); then dr=$((rx-last_rx)); fi
+  if ((last_tx>0 && tx>=last_tx)); then dt=$((tx-last_tx)); fi
+  all_rx=$((all_rx+dr)); all_tx=$((all_tx+dt)); day_rx=$((day_rx+dr)); day_tx=$((day_tx+dt)); mon_rx=$((mon_rx+dr)); mon_tx=$((mon_tx+dt))
+  tmp="${USAGE_FILE}.tmp"; cat >"$tmp" <<EOF
+ALL_RX_BYTES=$all_rx
+ALL_TX_BYTES=$all_tx
+DAY=$day
+DAY_RX_BYTES=$day_rx
+DAY_TX_BYTES=$day_tx
+MONTH=$mon
+MONTH_RX_BYTES=$mon_rx
+MONTH_TX_BYTES=$mon_tx
+LAST_RX=$rx
+LAST_TX=$tx
+UPDATED=$(date +%s)
+EOF
+  chmod 0644 "$tmp"; mv -f "$tmp" "$USAGE_FILE"
+}
 quick_reconnect(){
   [[ -x "$CONNECT" && -f "$LAST_FILE" && -f "$CRED_FILE" ]] || return 1
   [[ ! -e "$DISCONNECTING" && ! -e "$RECOVERING" && ! -e "$MANUAL_DISCONNECTED" ]] || return 1
@@ -47,34 +76,19 @@ quick_reconnect(){
 prev_rx=0; prev_tx=0; prev_ts=$(date +%s); failures=0; maintenance_tick=0
 while true; do
   sleep 3; now=$(date +%s); maintenance_tick=$((maintenance_tick+1))
-
-  # An explicit user disconnect is authoritative. Keep the watchdog idle until a
-  # new successful connection creates runtime state; then clear the marker and
-  # resume normal protection/recovery for that new session.
-  if [[ -e "$MANUAL_DISCONNECTED" && ! -f "$STATE_FILE" ]]; then
-    failures=0; prev_rx=0; prev_tx=0; prev_ts=$now; write_live DISCONNECTED 0 0 0 0 manual-disconnect; continue
-  fi
+  if [[ -e "$MANUAL_DISCONNECTED" && ! -f "$STATE_FILE" ]]; then failures=0; prev_rx=0; prev_tx=0; prev_ts=$now; usage_reset_session; write_live DISCONNECTED 0 0 0 0 manual-disconnect; continue; fi
   if [[ -e "$MANUAL_DISCONNECTED" && -f "$STATE_FILE" && -e "/sys/class/net/$XFRM_IF" ]]; then rm -f "$MANUAL_DISCONNECTED"; fi
-
-  if [[ ! -f "$STATE_FILE" ]]; then failures=0; prev_rx=0; prev_tx=0; prev_ts=$now; write_live DISCONNECTED 0 0 0 0 idle; continue; fi
+  if [[ ! -f "$STATE_FILE" ]]; then failures=0; prev_rx=0; prev_tx=0; prev_ts=$now; usage_reset_session; write_live DISCONNECTED 0 0 0 0 idle; continue; fi
   persist_profile
   vip="$(state_get "$STATE_FILE" VIRTUAL_IP)"; mark="$(state_get "$STATE_FILE" MARK_VPN)"; mark="${mark:-$MARK_VPN}"
   rx=$(cat "/sys/class/net/$XFRM_IF/statistics/rx_bytes" 2>/dev/null || echo 0); tx=$(cat "/sys/class/net/$XFRM_IF/statistics/tx_bytes" 2>/dev/null || echo 0); dt=$((now-prev_ts)); ((dt>0)) || dt=1
   if ((prev_rx>0 && rx>=prev_rx)); then rx_bps=$(((rx-prev_rx)/dt)); else rx_bps=0; fi
   if ((prev_tx>0 && tx>=prev_tx)); then tx_bps=$(((tx-prev_tx)/dt)); else tx_bps=0; fi
-  prev_rx=$rx; prev_tx=$tx; prev_ts=$now
+  prev_rx=$rx; prev_tx=$tx; prev_ts=$now; update_usage "$rx" "$tx"
   sa_ok=0; swanctl --list-sas 2>/dev/null | grep -q 'milmit-surfshark-restricted.*ESTABLISHED' && sa_ok=1
   route_ok=0; ip -4 route get 1.1.1.1 2>/dev/null | grep -q "dev $XFRM_IF" && route_ok=1
   latency=0; ping_line=$(ping -n -c 1 -W 1 1.1.1.1 2>/dev/null | grep -oE 'time=[0-9.]+' | head -n1 || true); [[ -n "$ping_line" ]] && latency="${ping_line#time=}"
-
-  if ((maintenance_tick>=10)); then
-    maintenance_tick=0
-    if [[ -x "$ROUTER" ]]; then "$ROUTER" quota-enforce >>/var/log/milmit-surfshark-watchdog.log 2>&1 || true; "$ROUTER" apply >>/var/log/milmit-surfshark-watchdog.log 2>&1 || true; fi
-  fi
-
+  if ((maintenance_tick>=10)); then maintenance_tick=0; if [[ -x "$ROUTER" ]]; then "$ROUTER" quota-enforce >>/var/log/milmit-surfshark-watchdog.log 2>&1 || true; "$ROUTER" apply >>/var/log/milmit-surfshark-watchdog.log 2>&1 || true; fi; fi
   if [[ "$sa_ok" == 1 && "$route_ok" == 1 && -n "$vip" ]]; then failures=0; write_live OK "$rx_bps" "$tx_bps" "$latency" 0 protected
-  else
-    failures=$((failures+1)); write_live DEGRADED "$rx_bps" "$tx_bps" "$latency" "$failures" "sa=$sa_ok route=$route_ok"
-    if ((failures>=3)) && [[ ! -e "$DISCONNECTING" && ! -e "$MANUAL_DISCONNECTED" ]]; then write_live RECOVERING "$rx_bps" "$tx_bps" "$latency" "$failures" auto-reconnect; if quick_reconnect; then failures=0; else sleep 5; fi; fi
-  fi
+  else failures=$((failures+1)); write_live DEGRADED "$rx_bps" "$tx_bps" "$latency" "$failures" "sa=$sa_ok route=$route_ok"; if ((failures>=3)) && [[ ! -e "$DISCONNECTING" && ! -e "$MANUAL_DISCONNECTED" ]]; then write_live RECOVERING "$rx_bps" "$tx_bps" "$latency" "$failures" auto-reconnect; if quick_reconnect; then failures=0; else sleep 5; fi; fi; fi
 done
