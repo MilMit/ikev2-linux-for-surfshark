@@ -1,6 +1,9 @@
 use serde::Serialize;
 use std::process::Command;
 
+#[path = "../../../../crates/gui/src/bundled_endpoints.rs"]
+mod bundled_endpoints;
+
 const HELPER: &str = "/usr/libexec/milmit-surfshark-helper";
 const LOCATION_SOURCE: &str = include_str!("../../../../crates/gui/src/locations.rs");
 const ALLOWED: &[&str] = &[
@@ -43,13 +46,25 @@ fn list_locations() -> Vec<UiLocation> {
         .collect()
 }
 
+fn ping_target(host: &str) -> String {
+    if host == "ee-tll.prod.surfshark.com" {
+        return "185.174.159.123".to_string();
+    }
+    bundled_endpoints::for_host(host)
+        .first()
+        .copied()
+        .unwrap_or(host)
+        .to_string()
+}
+
 #[tauri::command]
 fn ping_location(host: String) -> Result<Option<u32>, String> {
     if host.len() > 255 || !host.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-')) {
         return Err("invalid location hostname".into());
     }
+    let target = ping_target(&host);
     let output = Command::new("ping")
-        .args(["-n", "-c", "1", "-W", "1", &host])
+        .args(["-n", "-c", "1", "-W", "1", &target])
         .output()
         .map_err(|e| e.to_string())?;
     if !output.status.success() {
