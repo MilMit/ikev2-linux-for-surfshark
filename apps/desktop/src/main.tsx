@@ -1,34 +1,95 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { invoke } from '@tauri-apps/api/core';
 import { ChevronLeft, ChevronRight, CirclePower, Gauge, LockKeyhole, MapPin, Search, Settings, Shield, Star, Wifi, Activity, ListPlus, Laptop, Network, Server, RefreshCw } from 'lucide-react';
 import './styles.css';
 
 type Page = 'home' | 'locations' | 'settings' | 'vpn' | 'split' | 'splitApps' | 'policies' | 'devices' | 'deviceList' | 'guest' | 'advanced' | 'customLists' | 'diagnostics';
-type Location = { id: string; country: string; city: string; ping: number; favorite?: boolean };
-const demoLocations: Location[] = [
-  { id: 'ee-tll', country: 'Estonia', city: 'Tallinn', ping: 82, favorite: true },
-  { id: 'fi-hel', country: 'Finland', city: 'Helsinki', ping: 91 },
-  { id: 'de-ber', country: 'Germany', city: 'Berlin', ping: 104 },
-  { id: 'nl-ams', country: 'Netherlands', city: 'Amsterdam', ping: 111 },
-];
+type Location = { id: string; country: string; city: string; host: string; ping?: number | null };
+const FALLBACK_LOCATION: Location = { id: 'ee-tll', country: 'Estonia', city: 'Tallinn', host: 'ee-tll.prod.surfshark.com', ping: null };
 
 function Row({ title, subtitle, onClick, right }: { title: string; subtitle?: string; onClick?: () => void; right?: React.ReactNode }) {
   return <button className="settings-row" onClick={onClick}><span><b>{title}</b>{subtitle && <small>{subtitle}</small>}</span>{right ?? <ChevronRight size={18}/>}</button>;
+}
+
+function pingLabel(value?: number | null) {
+  return typeof value === 'number' ? `${value} ms` : '—';
 }
 
 function App() {
   const [page, setPage] = useState<Page>('home');
   const [connected, setConnected] = useState(false);
   const [busy, setBusy] = useState(false);
-  const [selected, setSelected] = useState(demoLocations[0]);
+  const [locations, setLocations] = useState<Location[]>([FALLBACK_LOCATION]);
+  const [selected, setSelected] = useState<Location>(FALLBACK_LOCATION);
   const [query, setQuery] = useState('');
   const [toast, setToast] = useState('');
   const [diag, setDiag] = useState('');
   const [policyTarget, setPolicyTarget] = useState('');
   const [guestMinutes, setGuestMinutes] = useState('60');
   const [guestSsid, setGuestSsid] = useState('MilMit Guest');
-  const filtered = useMemo(() => demoLocations.filter(x => `${x.country} ${x.city}`.toLowerCase().includes(query.toLowerCase())), [query]);
+  const [favorites, setFavorites] = useState<Set<string>>(() => new Set(JSON.parse(localStorage.getItem('milmit-favorites') || '[]')));
+  const [scanning, setScanning] = useState(false);
+
+  useEffect(() => {
+    void invoke<Location[]>('list_locations').then(list => {
+      if (!list.length) return;
+      const sorted = [...list].sort((a,b) => a.country.localeCompare(b.country) || a.city.localeCompare(b.city));
+      setLocations(sorted);
+      const saved = localStorage.getItem('milmit-selected-location');
+      const next = sorted.find(x => x.id === saved) || sorted.find(x => x.id === 'ee-tll') || sorted[0];
+      setSelected(next);
+    }).catch(e => setToast(`Could not load location catalog: ${String(e)}`));
+  }, []);
+
+  useEffect(() => {
+    if (page !== 'locations' || scanning || locations.length < 2) return;
+    setScanning(true);
+    let cancelled = false;
+    void (async () => {
+      const copy = [...locations];
+      for (let i = 0; i < copy.length && !cancelled; i += 8) {
+        const chunk = copy.slice(i, i + 8);
+        const results = await Promise.all(chunk.map(async loc => {
+          try { return [loc.id, await invoke<number | null>('ping_location', { host: loc.host })] as const; }
+          catch { return [loc.id, null] as const; }
+        }));
+        if (cancelled) break;
+        setLocations(prev => prev.map(loc => {
+          const hit = results.find(([id]) => id === loc.id);
+          return hit ? { ...loc, ping: hit[1] } : loc;
+        }));
+      }
+      if (!cancelled) setScanning(false);
+    })();
+    return () => { cancelled = true; setScanning(false); };
+  }, [page]);
+
+  const filtered = useMemo(() => locations.filter(x => `${x.country} ${x.city} ${x.host}`.toLowerCase().includes(query.toLowerCase())), [locations, query]);
+  const grouped = useMemo(() => {
+    const map = new Map<string, Location[]>();
+    for (const loc of filtered) {
+      const arr = map.get(loc.country) || [];
+      arr.push(loc);
+      map.set(loc.country, arr);
+    }
+    return [...map.entries()];
+  }, [filtered]);
+
+  function toggleFavorite(id: string) {
+    setFavorites(prev => {
+      const next = new Set(prev);
+      next.has(id) ? next.delete(id) : next.add(id);
+      localStorage.setItem('milmit-favorites', JSON.stringify([...next]));
+      return next;
+    });
+  }
+
+  function chooseLocation(loc: Location) {
+    setSelected(loc);
+    localStorage.setItem('milmit-selected-location', loc.id);
+    setPage('home');
+  }
 
   async function helper(name: string, args: string[] = [], showResult = false) {
     setBusy(true);
@@ -61,9 +122,11 @@ function App() {
   const toastView = toast ? <div className="toast" onClick={()=>setToast('')}>{toast}</div> : null;
 
   if (page === 'locations') return <main className="app-shell">{header('Select location','home')}{toastView}<section className="page-pad">
-    <div className="search"><Search size={17}/><input value={query} onChange={e=>setQuery(e.target.value)} placeholder="Search country or city"/></div>
-    <div className="section-title">LOCATIONS</div>
-    <div className="location-list">{filtered.map(loc => <button key={loc.id} className="location-row" onClick={()=>{setSelected(loc);setPage('home')}}><span className="flag-dot"/><span className="loc-main"><b>{loc.country}</b><small>{loc.city}</small></span><span className="ping">{loc.ping} ms</span>{loc.favorite ? <Star size={16} fill="currentColor"/> : <Star size={16}/>}</button>)}</div>
+    <div className="search"><Search size={17}/><input value={query} onChange={e=>setQuery(e.target.value)} placeholder="Search country, city or hostname"/></div>
+    <div className="section-title">{scanning ? 'SCANNING LATENCY…' : `${locations.length} LOCATIONS`}</div>
+    {[...favorites].length > 0 && <><div className="section-title">FAVORITES</div><div className="location-list">{locations.filter(x=>favorites.has(x.id)).map(loc => <button key={`fav-${loc.id}`} className="location-row" onClick={()=>chooseLocation(loc)}><span className="flag-dot"/><span className="loc-main"><b>{loc.country}</b><small>{loc.city}</small></span><span className="ping">{pingLabel(loc.ping)}</span><Star size={16} fill="currentColor" onClick={e=>{e.stopPropagation();toggleFavorite(loc.id)}}/></button>)}</div></>}
+    <div className="section-title">ALL LOCATIONS</div>
+    <div className="country-list">{grouped.map(([country, locs]) => <details className="country-group" key={country} open={query.length > 0}><summary><span>{country}</span><small>{locs.length}</small></summary><div className="location-list">{locs.map(loc => <button key={loc.id} className="location-row" onClick={()=>chooseLocation(loc)}><span className="flag-dot"/><span className="loc-main"><b>{loc.city}</b><small>{loc.host}</small></span><span className="ping">{pingLabel(loc.ping)}</span><Star size={16} fill={favorites.has(loc.id) ? 'currentColor' : 'none'} onClick={e=>{e.stopPropagation();toggleFavorite(loc.id)}}/></button>)}</div></details>)}</div>
   </section></main>;
 
   if (page === 'settings') return <main className="app-shell">{header('Settings','home')}{toastView}<section className="page-pad stack-list">
@@ -128,8 +191,8 @@ function App() {
   </section></main>;
 
   if (page === 'customLists') return <main className="app-shell">{header('Custom location lists','advanced')}{toastView}<section className="page-pad stack-list">
-    <div className="info-card"><ListPlus size={20}/><span><b>Custom lists</b><small>This screen now opens correctly. Persistent list editing will be connected to the real location catalog next.</small></span></div>
-    <Row title="Favorites" subtitle={`${demoLocations.filter(x=>x.favorite).length} saved locations`} right={<Star size={18}/>}/>
+    <div className="info-card"><ListPlus size={20}/><span><b>Custom lists</b><small>Favorites now use the full real location catalog.</small></span></div>
+    <Row title="Favorites" subtitle={`${favorites.size} saved locations`} right={<Star size={18}/>}/>
     <button className="secondary-btn" disabled>Create new list — backend next</button>
   </section></main>;
 
@@ -143,9 +206,9 @@ function App() {
     <header className="topbar"><div className="brand"><Shield size={20}/><b>MilMit Secure</b></div><button className="icon-btn" onClick={()=>setPage('settings')}><Settings/></button></header>{toastView}
     <section className="hero-area"><div className="status-orb"><LockKeyhole size={44}/></div><h2>{busy ? 'WORKING…' : connected ? 'SECURE CONNECTION' : 'UNSECURED CONNECTION'}</h2><p>{connected ? 'Your traffic is protected' : 'Connect to protect your traffic'}</p></section>
     <section className="home-actions">
-      <button className="location-card" onClick={()=>setPage('locations')}><MapPin/><span><b>{selected.country}</b><small>{selected.city}</small></span><span className="ping">{selected.ping} ms</span><ChevronRight/></button>
+      <button className="location-card" onClick={()=>setPage('locations')}><MapPin/><span><b>{selected.country}</b><small>{selected.city}</small></span><span className="ping">{pingLabel(locations.find(x=>x.id===selected.id)?.ping)}</span><ChevronRight/></button>
       <button disabled={busy} className={connected ? 'disconnect-btn' : 'connect-btn'} onClick={()=>void toggleConnection()}><CirclePower size={20}/>{connected ? 'Disconnect' : 'Secure my connection'}</button>
-      <div className="metrics"><div><Gauge/><b>{selected.ping} ms</b><small>Latency</small></div><div><Shield/><b>{connected ? 'Protected' : 'Direct'}</b><small>Route</small></div></div>
+      <div className="metrics"><div><Gauge/><b>{pingLabel(locations.find(x=>x.id===selected.id)?.ping)}</b><small>Latency</small></div><div><Shield/><b>{connected ? 'Protected' : 'Direct'}</b><small>Route</small></div></div>
     </section>
   </main>;
 }
