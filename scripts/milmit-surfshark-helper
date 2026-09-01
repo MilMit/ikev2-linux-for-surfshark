@@ -27,19 +27,27 @@ save_credentials(){
   chown root:root "$CRED_FILE"; chmod 0600 "$CRED_FILE"
   echo "Surfshark service credentials saved securely."
 }
-quick_connect(){
-  [[ -f "$LAST_PROFILE" ]] || { echo "No previous successful VPN profile is available yet." >&2; exit 69; }
-  [[ -f "$CRED_FILE" ]] || { echo "Saved Surfshark credentials are unavailable." >&2; exit 66; }
+profile_value(){ local key="$1" fallback="$2" v=""; v="$(state_get "$LAST_PROFILE" "$key")"; printf '%s' "${v:-$fallback}"; }
+connect_saved(){
+  local endpoint="${1:-}" identity="${2:-}"
+  [[ "$endpoint" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || { echo "invalid IPv4 endpoint" >&2; exit 64; }
+  [[ -n "$identity" && "$identity" =~ ^[A-Za-z0-9.-]+$ ]] || { echo "invalid server identity" >&2; exit 64; }
+  [[ -s "$CRED_FILE" ]] || { echo "Saved Surfshark credentials are unavailable. Save service credentials first." >&2; exit 66; }
   # shellcheck disable=SC1090
   source "$CRED_FILE"
-  local endpoint identity mss dns hotspot recover hotspot_iface kill mode vpn_macs direct_macs
-  endpoint="$(state_get "$LAST_PROFILE" SERVER_IP)"; identity="$(state_get "$LAST_PROFILE" SERVER_IDENTITY)"; identity="${identity:-ee-tll.prod.surfshark.com}"
-  mss="$(state_get "$LAST_PROFILE" MSS_VALUE)"; mss="${mss:-1200}"; dns="$(state_get "$LAST_PROFILE" DNS_CSV)"; dns="${dns:-162.252.172.57,149.154.159.92}"
-  hotspot="$(state_get "$LAST_PROFILE" HOTSPOT_VPN)"; hotspot="${hotspot:-1}"; recover="$(state_get "$LAST_PROFILE" RECOVER_NETWORK)"; recover="${recover:-1}"
-  hotspot_iface="$(state_get "$LAST_PROFILE" HOTSPOT_IFACE_REQUEST)"; hotspot_iface="${hotspot_iface:-auto}"; kill="$(state_get "$LAST_PROFILE" KILL_SWITCH)"; kill="${kill:-1}"
-  mode="$(state_get "$LAST_PROFILE" ROUTING_MODE)"; mode="${mode:-vpn_all}"; vpn_macs="$(state_get "$LAST_PROFILE" HOTSPOT_VPN_MACS)"; direct_macs="$(state_get "$LAST_PROFILE" HOTSPOT_DIRECT_MACS)"
-  [[ -n "$endpoint" && -n "${SERVICE_USER:-}" ]] || { echo "Saved quick-connect profile is incomplete." >&2; exit 69; }
+  [[ -n "${SERVICE_USER:-}" ]] || { echo "Saved Surfshark service username is unavailable." >&2; exit 66; }
+  local mss dns hotspot recover hotspot_iface kill mode vpn_macs direct_macs
+  mss="$(profile_value MSS_VALUE 1200)"; dns="$(profile_value DNS_CSV 162.252.172.57,149.154.159.92)"
+  hotspot="$(profile_value HOTSPOT_VPN 1)"; recover="$(profile_value RECOVER_NETWORK 1)"; hotspot_iface="$(profile_value HOTSPOT_IFACE_REQUEST auto)"
+  kill="$(profile_value KILL_SWITCH 1)"; mode="$(profile_value ROUTING_MODE vpn_all)"; vpn_macs="$(profile_value HOTSPOT_VPN_MACS '')"; direct_macs="$(profile_value HOTSPOT_DIRECT_MACS '')"
   exec "$CONNECT" "$endpoint" "$SERVICE_USER" "$mss" "$dns" "$hotspot" "$recover" "$hotspot_iface" "$kill" "$mode" "$vpn_macs" "$direct_macs" "$identity" </dev/null
+}
+quick_connect(){
+  [[ -f "$LAST_PROFILE" ]] || { echo "No previous successful VPN profile is available yet." >&2; exit 69; }
+  local endpoint identity
+  endpoint="$(state_get "$LAST_PROFILE" SERVER_IP)"; identity="$(state_get "$LAST_PROFILE" SERVER_IDENTITY)"; identity="${identity:-ee-tll.prod.surfshark.com}"
+  [[ -n "$endpoint" ]] || { echo "Saved quick-connect profile is incomplete." >&2; exit 69; }
+  connect_saved "$endpoint" "$identity"
 }
 control(){ [[ -x "$CONTROL" ]] || { echo "control center is not installed" >&2; exit 69; }; exec "$CONTROL" "$@"; }
 router(){ [[ -x "$ROUTER" ]] || { echo "router feature engine is not installed" >&2; exit 69; }; exec "$ROUTER" "$@"; }
@@ -50,6 +58,7 @@ cmd="${1:-}"
 case "$cmd" in
   credentials-save) save_credentials "${2:-}" ;;
   credentials-status) if [[ -s "$CRED_FILE" ]]; then echo "SAVED=1"; else echo "SAVED=0"; fi ;;
+  connect-saved) connect_saved "${2:-}" "${3:-}" ;;
   connect)
     endpoint="${2:-}"; username="${3:-}"; mss="${4:-1200}"; dns_csv="${5:-162.252.172.57,149.154.159.92}"; hotspot_vpn="${6:-1}"; recover_network="${7:-1}"; hotspot_iface="${8:-auto}"; kill_switch="${9:-0}"; routing_mode="${10:-vpn_all}"; hotspot_vpn_macs="${11:-}"; hotspot_direct_macs="${12:-}"; server_identity="${13:-ee-tll.prod.surfshark.com}"
     [[ "$endpoint" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || { echo "invalid IPv4 endpoint" >&2; exit 64; }
@@ -92,7 +101,7 @@ case "$cmd" in
   rules-update) rules update-force ;;
   rules-status) rules status ;;
   *)
-    echo "usage: $0 {credentials-save USER|credentials-status|connect|quick-connect|disconnect|health|route-test|router-status|router-apply|apply-safe|full-live-test|hotspot-repair|policy-add TARGET direct|vpn|block [scope]|policy-remove TARGET [scope]|device-set MAC default|vpn|direct|block [speed_kbit] [quota_mb] [notify|throttle|block] [paused0/1]|router-options force_dns quic_block isolation ipv6_policy|guest-start [minutes] [ssid]|guest-stop|guest-status|candidates|candidate-action ADDRESS direct|vpn|block|dismiss|route-explain TARGET|rules-update|rules-status|low-power MODE|emergency-stop}" >&2
+    echo "usage: $0 {credentials-save USER|credentials-status|connect-saved ENDPOINT IDENTITY|connect|quick-connect|disconnect|health|route-test|router-status|router-apply|apply-safe|full-live-test|hotspot-repair|policy-add TARGET direct|vpn|block [scope]|policy-remove TARGET [scope]|device-set MAC default|vpn|direct|block [speed_kbit] [quota_mb] [notify|throttle|block] [paused0/1]|router-options force_dns quic_block isolation ipv6_policy|guest-start [minutes] [ssid]|guest-stop|guest-status|candidates|candidate-action ADDRESS direct|vpn|block|dismiss|route-explain TARGET|rules-update|rules-status|low-power MODE|emergency-stop}" >&2
     exit 64
     ;;
 esac
