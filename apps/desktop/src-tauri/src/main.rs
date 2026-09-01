@@ -2,10 +2,11 @@ use std::process::Command;
 
 const HELPER: &str = "/usr/libexec/milmit-surfshark-helper";
 const ALLOWED: &[&str] = &[
-    "status","connect","disconnect","watchdog-status","router-status","hotspot-repair",
+    "status","connect","quick-connect","disconnect","watchdog-status","router-status","hotspot-status","hotspot-repair",
     "rules-status","rules-update","health","apply-safe","full-live-test","speed-test",
     "dns-test","mtu-test","save-lkg","support-bundle","emergency-stop","candidates",
-    "route-explain","policy-add","router-options","guest-start","credentials-save"
+    "route-explain","route-test","policy-add","policy-remove","router-options","device-set",
+    "guest-start","guest-stop","guest-status","credentials-status","credentials-save"
 ];
 
 #[tauri::command]
