@@ -22,5 +22,70 @@
     ],
     "security": { "csp": null }
   },
-  "bundle": { "active": false }
+  "bundle": {
+    "active": true,
+    "targets": ["deb", "appimage"],
+    "category": "Utility",
+    "shortDescription": "Native Linux IKEv2 VPN and protected hotspot client",
+    "longDescription": "MilMit Secure is a native Linux IKEv2 VPN client with direct-IP Surfshark connectivity, protected hotspot routing, Iran bypass policies, diagnostics, split routing and persistent traffic accounting.",
+    "license": "MIT",
+    "licenseFile": "../../../LICENSE",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.png"
+    ],
+    "linux": {
+      "deb": {
+        "depends": [
+          "strongswan-swanctl",
+          "strongswan-charon",
+          "iproute2",
+          "iptables",
+          "ipset",
+          "conntrack",
+          "network-manager",
+          "python3",
+          "curl",
+          "polkitd",
+          "procps",
+          "iputils-ping",
+          "qrencode"
+        ],
+        "postInstallScript": "deb/postinstall.sh",
+        "preRemoveScript": "deb/preremove.sh",
+        "postRemoveScript": "deb/postremove.sh",
+        "files": {
+          "/usr/lib/milmit-surfshark/restricted-ikev2-connect.sh": "../../../scripts/restricted-ikev2-connect.sh",
+          "/usr/lib/milmit-surfshark/restricted-ikev2-connect-v2.sh": "../../../scripts/restricted-ikev2-connect-v2.sh",
+          "/usr/lib/milmit-surfshark/restricted-ikev2-disconnect.sh": "../../../scripts/restricted-ikev2-disconnect.sh",
+          "/usr/lib/milmit-surfshark/hotspot-device-policy.sh": "../../../scripts/hotspot-device-policy.sh",
+          "/usr/lib/milmit-surfshark/milmit-surfshark-watchdog.sh": "../../../scripts/milmit-surfshark-watchdog.sh",
+          "/usr/lib/milmit-surfshark/control-center.py": "../../../scripts/control-center.py",
+          "/usr/lib/milmit-surfshark/router-features.py": "../../../scripts/router-features.py",
+          "/usr/lib/milmit-surfshark/advanced-router.py": "../../../scripts/advanced-router.py",
+          "/usr/lib/milmit-surfshark/rules-update.py": "../../../scripts/rules-update.py",
+          "/usr/lib/milmit-surfshark/status-portal.py": "../../../scripts/status-portal.py",
+          "/usr/lib/milmit-surfshark/desktop-features.py": "../../../scripts/desktop-features.py",
+          "/usr/lib/milmit-surfshark/hotspot-doctor.py": "../../../scripts/hotspot-doctor.py",
+          "/usr/lib/milmit-surfshark/hotspot-device-manager.py": "../../../scripts/hotspot-device-manager.py",
+          "/usr/lib/milmit-surfshark/install-privileged-helper.sh": "../../../scripts/install-privileged-helper.sh",
+          "/usr/libexec/milmit-surfshark-helper": "../../../scripts/milmit-surfshark-helper",
+          "/usr/share/polkit-1/actions/net.milmit.surfshark-ikev2.policy": "../../../packaging/net.milmit.surfshark-ikev2.policy",
+          "/etc/systemd/system/milmit-surfshark-watchdog.service": "../../../packaging/milmit-surfshark-watchdog.service",
+          "/etc/systemd/system/milmit-surfshark-rules-update.service": "../../../packaging/milmit-surfshark-rules-update.service",
+          "/etc/systemd/system/milmit-surfshark-rules-update.timer": "../../../packaging/milmit-surfshark-rules-update.timer",
+          "/etc/systemd/system/milmit-surfshark-portal.service": "../../../packaging/milmit-surfshark-portal.service",
+          "/etc/systemd/system/milmit-surfshark-keepawake.service": "../../../packaging/milmit-surfshark-keepawake.service",
+          "/etc/systemd/system/milmit-surfshark-autoconnect.service": "../../../packaging/milmit-surfshark-autoconnect.service"
+        }
+      },
+      "appimage": {
+        "files": {
+          "/usr/share/doc/milmit-secure/README-BACKEND.txt": "appimage/README-BACKEND.txt"
+        }
+      }
+    }
+  }
 }

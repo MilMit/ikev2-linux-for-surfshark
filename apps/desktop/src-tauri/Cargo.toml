@@ -2,6 +2,9 @@
 name = "milmit-secure-desktop"
 version = "0.1.0"
 edition = "2021"
+description = "Native Linux IKEv2 VPN and protected hotspot client"
+license = "MIT"
+authors = ["MilMit"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

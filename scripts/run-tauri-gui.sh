@@ -3,7 +3,6 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 APP="$ROOT/apps/desktop"
-TAURI_DIR="$APP/src-tauri"
 cd "$APP"
 
 if ! command -v npm >/dev/null 2>&1; then echo "npm is required for the new desktop UI." >&2; exit 1; fi
@@ -37,12 +36,12 @@ if ((backend_changed)); then
   pkexec /bin/bash "$ROOT/scripts/install-privileged-helper.sh"
 fi
 
-ICON_SVG="$TAURI_DIR/icons/icon.svg"
-ICON_PNG="$TAURI_DIR/icons/icon.png"
-if [[ -f "$ICON_SVG" && ( ! -f "$ICON_PNG" || "$ICON_SVG" -nt "$ICON_PNG" ) ]]; then
-  if ! command -v rsvg-convert >/dev/null 2>&1; then echo "Installing SVG icon renderer once..."; sudo apt-get update; sudo apt-get install -y librsvg2-bin; fi
-  echo "Rendering MilMit Secure application icon..."; rsvg-convert -w 512 -h 512 "$ICON_SVG" -o "$ICON_PNG"
+if ! command -v rsvg-convert >/dev/null 2>&1; then
+  echo "Installing SVG icon renderer once..."
+  sudo apt-get update
+  sudo apt-get install -y librsvg2-bin
 fi
+"$ROOT/scripts/prepare-tauri-icons.sh"
 
 [ -d node_modules ] || npm install
 exec npm run tauri dev
