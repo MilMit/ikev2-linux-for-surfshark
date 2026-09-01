@@ -9,6 +9,7 @@ ROUTER=/usr/lib/milmit-surfshark/router-features.py
 ADV=/usr/lib/milmit-surfshark/advanced-router.py
 RULES=/usr/lib/milmit-surfshark/rules-update.py
 DESKTOP=/usr/lib/milmit-surfshark/desktop-features.py
+DOCTOR=/usr/lib/milmit-surfshark/hotspot-doctor.py
 LAST_PROFILE=/var/lib/milmit-surfshark/last-profile.state
 CRED_DIR=/etc/milmit-surfshark
 CRED_FILE=$CRED_DIR/credentials
@@ -54,6 +55,7 @@ router(){ [[ -x "$ROUTER" ]] || { echo "router feature engine is not installed" 
 adv(){ [[ -x "$ADV" ]] || { echo "advanced router is not installed" >&2; exit 69; }; exec "$ADV" "$@"; }
 rules(){ [[ -x "$RULES" ]] || { echo "rules updater is not installed" >&2; exit 69; }; exec "$RULES" "$@"; }
 desktop(){ [[ -x "$DESKTOP" ]] || { echo "desktop feature engine is not installed" >&2; exit 69; }; exec "$DESKTOP" "$@"; }
+doctor(){ [[ -x "$DOCTOR" ]] || { echo "hotspot doctor is not installed" >&2; exit 69; }; exec "$DOCTOR" "$@"; }
 
 cmd="${1:-}"
 case "$cmd" in
@@ -84,6 +86,7 @@ case "$cmd" in
   route-test) target="${2:-1.1.1.1}"; [[ ${#target} -le 255 && "$target" != *$'\n'* ]] || { echo "invalid target" >&2; exit 64; }; control route-test "$target" ;;
   router-status|hotspot-status) router status ;;
   router-apply|hotspot-repair) router apply ;;
+  hotspot-doctor) doctor ;;
   quota-enforce) router quota-enforce ;;
   policy-add) router policy-add "${2:?target required}" "${3:?policy required}" "${4:-both}" ;;
   policy-remove) router policy-remove "${2:?target required}" "${3:-both}" ;;
