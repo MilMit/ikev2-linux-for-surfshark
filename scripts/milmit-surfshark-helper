@@ -54,6 +54,8 @@ case "$cmd" in
   disconnect) exec "$DISCONNECT" ;;
   status) exec /usr/sbin/swanctl --list-sas ;;
   watchdog-status) [[ -f "$LIVE_STATE" ]] && cat "$LIVE_STATE" || echo "HEALTH=UNKNOWN" ;;
+  watchdog-start) exec systemctl start milmit-surfshark-watchdog.service ;;
+  portal-start) exec systemctl start milmit-surfshark-portal.service ;;
   health|speed-test|dns-test|mtu-test|save-lkg|lkg-status|emergency-stop|recent-destinations|support-bundle|history) control "$cmd" ;;
   route-test) target="${2:-1.1.1.1}"; [[ ${#target} -le 255 && "$target" != *$'\n'* ]] || { echo "invalid target" >&2; exit 64; }; control route-test "$target" ;;
   router-status|hotspot-status) router status ;;
