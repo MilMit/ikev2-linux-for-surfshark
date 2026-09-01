@@ -6,6 +6,7 @@ import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 
 const STATE = '/run/milmit-surfshark/restricted.state';
+const DEVICE_MANAGER = '/usr/lib/milmit-surfshark/hotspot-device-manager.py';
 
 export default class SurfsharkIkev2Status extends Extension {
     enable() {
@@ -15,9 +16,19 @@ export default class SurfsharkIkev2Status extends Extension {
         this._statusItem = new PopupMenu.PopupMenuItem('Surfshark IKEv2: disconnected', {reactive: false});
         this._ipItem = new PopupMenu.PopupMenuItem('Public IP: —', {reactive: false});
         this._hotspotItem = new PopupMenu.PopupMenuItem('Hotspot sharing: off', {reactive: false});
+        this._deviceItem = new PopupMenu.PopupMenuItem('Manage hotspot devices…');
+        this._deviceItem.connect('activate', () => {
+            try {
+                GLib.spawn_command_line_async(`python3 ${DEVICE_MANAGER}`);
+            } catch (e) {
+                logError(e, 'Unable to open MilMit hotspot device manager');
+            }
+        });
         this._indicator.menu.addMenuItem(this._statusItem);
         this._indicator.menu.addMenuItem(this._ipItem);
         this._indicator.menu.addMenuItem(this._hotspotItem);
+        this._indicator.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
+        this._indicator.menu.addMenuItem(this._deviceItem);
         Main.panel.addToStatusArea(this.uuid, this._indicator);
         this._refresh();
         this._timer = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 2, () => {
@@ -47,8 +58,10 @@ export default class SurfsharkIkev2Status extends Extension {
             ? `Surfshark IKEv2: connected${values.EXIT_COUNTRY ? ' · ' + values.EXIT_COUNTRY : ''}`
             : 'Surfshark IKEv2: disconnected';
         this._ipItem.label.text = `Public IP: ${values.PUBLIC_IP || '—'}`;
+        const vpnCount = values.HOTSPOT_VPN_MAC_COUNT || '0';
+        const directCount = values.HOTSPOT_DIRECT_MAC_COUNT || '0';
         this._hotspotItem.label.text = values.HOTSPOT_IFACE
-            ? `Hotspot sharing: on · ${values.HOTSPOT_IFACE}`
+            ? `Hotspot: ${values.HOTSPOT_IFACE} · VPN ${vpnCount} · Direct ${directCount}`
             : 'Hotspot sharing: off';
     }
 
