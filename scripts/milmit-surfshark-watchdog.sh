@@ -16,6 +16,7 @@ DESKTOP=/usr/lib/milmit-surfshark/desktop-features.py
 CRED_FILE=/etc/milmit-surfshark/credentials
 XFRM_IF=milmitxfrm0
 MARK_VPN=0x112
+MARK_DIRECT=0x113
 
 mkdir -p "$STATE_DIR" /var/lib/milmit-surfshark; chmod 0755 "$STATE_DIR" /var/lib/milmit-surfshark
 state_get(){ local file="$1" key="$2"; [[ -f "$file" ]] || return 0; awk -F= -v k="$key" '$1==k {sub(/^[^=]*=/, ""); print; exit}' "$file" 2>/dev/null || true; }
@@ -30,19 +31,39 @@ UPDATED=$(date +%s)
 EOF
 chmod 0644 "$tmp"; mv -f "$tmp" "$LIVE_FILE"; }
 persist_profile(){ [[ -f "$STATE_FILE" ]] || return 0; local tmp="${LAST_FILE}.tmp"; cp "$STATE_FILE" "$tmp" 2>/dev/null || return 0; chmod 0600 "$tmp"; mv -f "$tmp" "$LAST_FILE"; }
-usage_reset_session(){ [[ -f "$USAGE_FILE" ]] || return 0; local tmp="${USAGE_FILE}.tmp"; awk -F= 'BEGIN{OFS="="} $1=="LAST_RX"{$2=0} $1=="LAST_TX"{$2=0} {print $1,$2}' "$USAGE_FILE" >"$tmp" 2>/dev/null || return 0; chmod 0644 "$tmp"; mv -f "$tmp" "$USAGE_FILE"; }
+usage_reset_session(){ [[ -f "$USAGE_FILE" ]] || return 0; local tmp="${USAGE_FILE}.tmp"; awk -F= 'BEGIN{OFS="="} $1=="LAST_RX"||$1=="LAST_TX"||$1=="LAST_DIRECT_RX"||$1=="LAST_DIRECT_TX"{$2=0} {print $1,$2}' "$USAGE_FILE" >"$tmp" 2>/dev/null || return 0; chmod 0644 "$tmp"; mv -f "$tmp" "$USAGE_FILE"; }
+# XFRM counters already contain host traffic plus hotspot traffic sent through
+# the VPN. Only hotspot traffic deliberately routed Direct bypasses XFRM, so we
+# read just those FORWARD counters and add them to the persistent totals. This
+# avoids double-counting VPN-routed hotspot clients.
+direct_hotspot_counters(){
+  local phys hot subnet dump line bytes up=0 down=0
+  phys="$(state_get "$STATE_FILE" IFACE)"; hot="$(state_get "$STATE_FILE" HOTSPOT_IFACE)"; subnet="$(state_get "$STATE_FILE" HOTSPOT_SUBNET)"
+  [[ -n "$phys" && -n "$hot" && -n "$subnet" ]] || { echo "0 0"; return; }
+  dump="$(iptables-save -c -t filter 2>/dev/null || true)"
+  while IFS= read -r line; do
+    [[ "$line" == *"-A MILMIT_HOTSPOT_FWD"* ]] || continue
+    [[ "$line" =~ ^\[([0-9]+):([0-9]+)\] ]] || continue; bytes="${BASH_REMATCH[2]}"
+    if [[ "$line" == *"-i $hot"* && "$line" == *"-o $phys"* && "$line" == *"--mark $MARK_DIRECT"* ]]; then up=$((up+bytes)); fi
+    if [[ "$line" == *"-i $phys"* && "$line" == *"-o $hot"* && "$line" == *"-d $subnet"* && "$line" == *"ESTABLISHED,RELATED"* ]]; then down=$((down+bytes)); fi
+  done <<< "$dump"
+  echo "$down $up"
+}
 update_usage(){
-  local rx="$1" tx="$2" today month all_rx all_tx day day_rx day_tx mon mon_rx mon_tx last_rx last_tx dr=0 dt=0 tmp
+  local rx="$1" tx="$2" direct_rx="$3" direct_tx="$4" today month all_rx all_tx day day_rx day_tx mon mon_rx mon_tx last_rx last_tx last_direct_rx last_direct_tx dr=0 dt=0 ddr=0 ddt=0 tmp
   today="$(date +%F)"; month="$(date +%Y-%m)"
   all_rx="$(state_get "$USAGE_FILE" ALL_RX_BYTES)"; all_rx="${all_rx:-0}"; all_tx="$(state_get "$USAGE_FILE" ALL_TX_BYTES)"; all_tx="${all_tx:-0}"
   day="$(state_get "$USAGE_FILE" DAY)"; day_rx="$(state_get "$USAGE_FILE" DAY_RX_BYTES)"; day_rx="${day_rx:-0}"; day_tx="$(state_get "$USAGE_FILE" DAY_TX_BYTES)"; day_tx="${day_tx:-0}"
   mon="$(state_get "$USAGE_FILE" MONTH)"; mon_rx="$(state_get "$USAGE_FILE" MONTH_RX_BYTES)"; mon_rx="${mon_rx:-0}"; mon_tx="$(state_get "$USAGE_FILE" MONTH_TX_BYTES)"; mon_tx="${mon_tx:-0}"
   last_rx="$(state_get "$USAGE_FILE" LAST_RX)"; last_rx="${last_rx:-0}"; last_tx="$(state_get "$USAGE_FILE" LAST_TX)"; last_tx="${last_tx:-0}"
+  last_direct_rx="$(state_get "$USAGE_FILE" LAST_DIRECT_RX)"; last_direct_rx="${last_direct_rx:-0}"; last_direct_tx="$(state_get "$USAGE_FILE" LAST_DIRECT_TX)"; last_direct_tx="${last_direct_tx:-0}"
   [[ "$day" == "$today" ]] || { day="$today"; day_rx=0; day_tx=0; }
   [[ "$mon" == "$month" ]] || { mon="$month"; mon_rx=0; mon_tx=0; }
   if ((last_rx>0 && rx>=last_rx)); then dr=$((rx-last_rx)); fi
   if ((last_tx>0 && tx>=last_tx)); then dt=$((tx-last_tx)); fi
-  all_rx=$((all_rx+dr)); all_tx=$((all_tx+dt)); day_rx=$((day_rx+dr)); day_tx=$((day_tx+dt)); mon_rx=$((mon_rx+dr)); mon_tx=$((mon_tx+dt))
+  if ((last_direct_rx>0)); then if ((direct_rx>=last_direct_rx)); then ddr=$((direct_rx-last_direct_rx)); else ddr=$direct_rx; fi; fi
+  if ((last_direct_tx>0)); then if ((direct_tx>=last_direct_tx)); then ddt=$((direct_tx-last_direct_tx)); else ddt=$direct_tx; fi; fi
+  all_rx=$((all_rx+dr+ddr)); all_tx=$((all_tx+dt+ddt)); day_rx=$((day_rx+dr+ddr)); day_tx=$((day_tx+dt+ddt)); mon_rx=$((mon_rx+dr+ddr)); mon_tx=$((mon_tx+dt+ddt))
   tmp="${USAGE_FILE}.tmp"; cat >"$tmp" <<EOF
 ALL_RX_BYTES=$all_rx
 ALL_TX_BYTES=$all_tx
@@ -54,6 +75,8 @@ MONTH_RX_BYTES=$mon_rx
 MONTH_TX_BYTES=$mon_tx
 LAST_RX=$rx
 LAST_TX=$tx
+LAST_DIRECT_RX=$direct_rx
+LAST_DIRECT_TX=$direct_tx
 UPDATED=$(date +%s)
 EOF
   chmod 0644 "$tmp"; mv -f "$tmp" "$USAGE_FILE"
@@ -85,7 +108,9 @@ while true; do
   rx=$(cat "/sys/class/net/$XFRM_IF/statistics/rx_bytes" 2>/dev/null || echo 0); tx=$(cat "/sys/class/net/$XFRM_IF/statistics/tx_bytes" 2>/dev/null || echo 0); dt=$((now-prev_ts)); ((dt>0)) || dt=1
   if ((prev_rx>0 && rx>=prev_rx)); then rx_bps=$(((rx-prev_rx)/dt)); else rx_bps=0; fi
   if ((prev_tx>0 && tx>=prev_tx)); then tx_bps=$(((tx-prev_tx)/dt)); else tx_bps=0; fi
-  prev_rx=$rx; prev_tx=$tx; prev_ts=$now; update_usage "$rx" "$tx"
+  prev_rx=$rx; prev_tx=$tx; prev_ts=$now
+  read -r direct_rx direct_tx <<< "$(direct_hotspot_counters)"; direct_rx="${direct_rx:-0}"; direct_tx="${direct_tx:-0}"
+  update_usage "$rx" "$tx" "$direct_rx" "$direct_tx"
   sa_ok=0; swanctl --list-sas 2>/dev/null | grep -q 'milmit-surfshark-restricted.*ESTABLISHED' && sa_ok=1
   route_ok=0; ip -4 route get 1.1.1.1 2>/dev/null | grep -q "dev $XFRM_IF" && route_ok=1
   latency=0; ping_line=$(ping -n -c 1 -W 1 1.1.1.1 2>/dev/null | grep -oE 'time=[0-9.]+' | head -n1 || true); [[ -n "$ping_line" ]] && latency="${ping_line#time=}"
