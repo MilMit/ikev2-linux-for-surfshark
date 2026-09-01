@@ -13,6 +13,7 @@ INSTALLED_ROUTER=/usr/lib/milmit-surfshark/router-features.py
 INSTALLED_ADV=/usr/lib/milmit-surfshark/advanced-router.py
 INSTALLED_RULES=/usr/lib/milmit-surfshark/rules-update.py
 INSTALLED_PORTAL=/usr/lib/milmit-surfshark/status-portal.py
+INSTALLED_INSTALLER=/usr/lib/milmit-surfshark/install-privileged-helper.sh
 WATCHDOG_UNIT=/etc/systemd/system/milmit-surfshark-watchdog.service
 RULES_TIMER=/etc/systemd/system/milmit-surfshark-rules-update.timer
 PORTAL_UNIT=/etc/systemd/system/milmit-surfshark-portal.service
@@ -24,7 +25,7 @@ RUNTIME_SHIM="$RUNTIME_SHIM_DIR/pkexec"
 chmod 0755 "$TRAY" 2>/dev/null || true
 
 needs_install=0
-for spec in "$HELPER:$ROOT/scripts/milmit-surfshark-helper" "$INSTALLED_CONNECT:$ROOT/scripts/restricted-ikev2-connect.sh" "$INSTALLED_CONNECT_V2:$ROOT/scripts/restricted-ikev2-connect-v2.sh" "$INSTALLED_DISCONNECT:$ROOT/scripts/restricted-ikev2-disconnect.sh" "$INSTALLED_DEVICE_POLICY:$ROOT/scripts/hotspot-device-policy.sh" "$INSTALLED_DEVICE_MANAGER:$ROOT/scripts/hotspot-device-manager.py" "$INSTALLED_WATCHDOG:$ROOT/scripts/milmit-surfshark-watchdog.sh" "$INSTALLED_CONTROL:$ROOT/scripts/control-center.py" "$INSTALLED_ROUTER:$ROOT/scripts/router-features.py" "$INSTALLED_ADV:$ROOT/scripts/advanced-router.py" "$INSTALLED_RULES:$ROOT/scripts/rules-update.py" "$INSTALLED_PORTAL:$ROOT/scripts/status-portal.py"; do
+for spec in "$HELPER:$ROOT/scripts/milmit-surfshark-helper" "$INSTALLED_CONNECT:$ROOT/scripts/restricted-ikev2-connect.sh" "$INSTALLED_CONNECT_V2:$ROOT/scripts/restricted-ikev2-connect-v2.sh" "$INSTALLED_DISCONNECT:$ROOT/scripts/restricted-ikev2-disconnect.sh" "$INSTALLED_DEVICE_POLICY:$ROOT/scripts/hotspot-device-policy.sh" "$INSTALLED_DEVICE_MANAGER:$ROOT/scripts/hotspot-device-manager.py" "$INSTALLED_WATCHDOG:$ROOT/scripts/milmit-surfshark-watchdog.sh" "$INSTALLED_CONTROL:$ROOT/scripts/control-center.py" "$INSTALLED_ROUTER:$ROOT/scripts/router-features.py" "$INSTALLED_ADV:$ROOT/scripts/advanced-router.py" "$INSTALLED_RULES:$ROOT/scripts/rules-update.py" "$INSTALLED_PORTAL:$ROOT/scripts/status-portal.py" "$INSTALLED_INSTALLER:$ROOT/scripts/install-privileged-helper.sh"; do
   installed="${spec%%:*}"; source="${spec#*:}"
   if [[ ! -x "$installed" ]] || ! cmp -s "$source" "$installed"; then needs_install=1; break; fi
 done
@@ -41,8 +42,8 @@ for spec in "$HELPER:$ROOT/scripts/milmit-surfshark-helper" "$INSTALLED_CONNECT_
   installed="${spec%%:*}"; source="${spec#*:}"
   if [[ ! -x "$installed" ]] || ! cmp -s "$source" "$installed"; then echo "ERROR: privileged router stack is stale or installation did not complete: $installed" >&2; exit 78; fi
 done
-systemctl is-active --quiet milmit-surfshark-watchdog.service 2>/dev/null || /usr/bin/pkexec /usr/bin/systemctl start milmit-surfshark-watchdog.service >/dev/null 2>&1 || true
-systemctl is-active --quiet milmit-surfshark-portal.service 2>/dev/null || /usr/bin/pkexec /usr/bin/systemctl start milmit-surfshark-portal.service >/dev/null 2>&1 || true
+systemctl is-active --quiet milmit-surfshark-watchdog.service 2>/dev/null || /usr/bin/pkexec "$HELPER" watchdog-start >/dev/null 2>&1 || true
+systemctl is-active --quiet milmit-surfshark-portal.service 2>/dev/null || /usr/bin/pkexec "$HELPER" portal-start >/dev/null 2>&1 || true
 echo "MilMit VPN + native router protection stack: verified and current."
 
 install -d -m 0700 "$RUNTIME_SHIM_DIR"
@@ -51,14 +52,13 @@ cat >"$RUNTIME_SHIM" <<'SHIM'
 set -euo pipefail
 REAL_PKEXEC=/usr/bin/pkexec
 HELPER=/usr/libexec/milmit-surfshark-helper
-CONNECT_V2=/usr/lib/milmit-surfshark/restricted-ikev2-connect-v2.sh
 if [[ "${1:-}" == "bash" && -n "${2:-}" ]]; then
   script="${2}"
   case "$script" in
     */scripts/restricted-ikev2-connect.sh)
       endpoint="${3:-}"; username="${4:-}"; mss="${5:-1200}"; dns_csv="${6:-162.252.172.57,149.154.159.92}"; hotspot_vpn="${7:-1}"; recover_network="${8:-1}"; hotspot_iface="${9:-auto}"; kill_switch="${10:-0}"; routing_mode="${11:-vpn_all}"; hotspot_vpn_macs="${12:-}"; hotspot_direct_macs="${13:-}"
-      echo "MILMIT_BACKEND=v2-direct" >&2
-      exec "$REAL_PKEXEC" /usr/bin/bash "$CONNECT_V2" "$endpoint" "$username" "$mss" "$dns_csv" "$hotspot_vpn" "$recover_network" "$hotspot_iface" "$kill_switch" "$routing_mode" "$hotspot_vpn_macs" "$hotspot_direct_macs"
+      echo "MILMIT_BACKEND=v2-helper" >&2
+      exec "$REAL_PKEXEC" "$HELPER" connect "$endpoint" "$username" "$mss" "$dns_csv" "$hotspot_vpn" "$recover_network" "$hotspot_iface" "$kill_switch" "$routing_mode" "$hotspot_vpn_macs" "$hotspot_direct_macs"
       ;;
     */scripts/restricted-ikev2-disconnect.sh) exec "$REAL_PKEXEC" "$HELPER" disconnect ;;
   esac
