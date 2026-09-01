@@ -14,17 +14,15 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
-const PROFILE: &str = "MilMit Surfshark IKEv2";
-const CA_CERT: &str = "/etc/swanctl/x509ca/surfshark_ikev2.crt";
 const RESTRICTED_CONNECT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../scripts/restricted-ikev2-connect.sh");
 const RESTRICTED_DISCONNECT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../scripts/restricted-ikev2-disconnect.sh");
 const RESTRICTED_STATE: &str = "/run/milmit-surfshark/restricted.state";
 const LIVE_STATE: &str = "/run/milmit-surfshark/live.state";
+const HELPER: &str = "/usr/libexec/milmit-surfshark-helper";
 const DEFAULT_DNS: &str = "162.252.172.57,149.154.159.92";
 
 #[derive(Clone)]
 struct AppSettings {
-    restricted: bool,
     mss: u32,
     dns: String,
     hotspot_vpn: bool,
@@ -35,444 +33,102 @@ struct AppSettings {
     hotspot_vpn_macs: String,
     hotspot_direct_macs: String,
 }
-
 impl Default for AppSettings {
-    fn default() -> Self {
-        Self {
-            restricted: true,
-            mss: 1200,
-            dns: DEFAULT_DNS.to_string(),
-            hotspot_vpn: true,
-            hotspot_iface: "auto".to_string(),
-            recover_network: true,
-            kill_switch: true,
-            routing_mode: "vpn_all".to_string(),
-            hotspot_vpn_macs: String::new(),
-            hotspot_direct_macs: String::new(),
-        }
-    }
+    fn default() -> Self { Self { mss:1200, dns:DEFAULT_DNS.into(), hotspot_vpn:true, hotspot_iface:"auto".into(), recover_network:true, kill_switch:true, routing_mode:"vpn_all".into(), hotspot_vpn_macs:String::new(), hotspot_direct_macs:String::new() } }
 }
 
 #[derive(Debug)]
 enum Event {
-    Busy(String),
-    Log(String, String),
-    Connected(String, String, String),
-    Disconnected,
-    Failed(String),
-    Refreshed(bool, String),
-    PingStarted,
-    PingResults(Vec<(String, Option<u32>)>),
+    Busy(String), Log(String,String), Connected(String,String), Disconnected, Failed(String), Tool(String,String), PingResults(Vec<(String,Option<u32>)>),
 }
 
-fn run(cmd: &str, args: &[&str]) -> String {
+fn run(cmd:&str,args:&[&str])->String {
     match Command::new(cmd).args(args).output() {
-        Ok(out) => {
-            let mut text = String::new();
-            if !out.stdout.is_empty() { text.push_str(&String::from_utf8_lossy(&out.stdout)); }
-            if !out.stderr.is_empty() {
-                if !text.is_empty() { text.push('\n'); }
-                text.push_str(&String::from_utf8_lossy(&out.stderr));
-            }
-            if text.trim().is_empty() { format!("exit: {}", out.status) } else { text }
-        }
-        Err(e) => format!("Failed to run {cmd}: {e}"),
+        Ok(out)=>{ let mut s=String::from_utf8_lossy(&out.stdout).to_string(); if !out.stderr.is_empty(){if !s.is_empty(){s.push('\n');}s.push_str(&String::from_utf8_lossy(&out.stderr));} s.trim().to_string() },
+        Err(e)=>format!("Failed to run {cmd}: {e}")
     }
 }
+fn file_value(path:&str,key:&str)->Option<String>{ let text=fs::read_to_string(path).ok()?; text.lines().find_map(|l|{let(k,v)=l.split_once('=')?;(k==key).then(||v.trim().to_string())}).filter(|v|!v.is_empty()) }
+fn state_value(key:&str)->Option<String>{file_value(RESTRICTED_STATE,key)}
+fn live_value(key:&str)->Option<String>{file_value(LIVE_STATE,key)}
+fn active()->bool{ state_value("VIRTUAL_IP").map(|v|run("ip",&["-4","addr","show"]).contains(&v)).unwrap_or(false) }
+fn config_dir()->PathBuf{ std::env::var("XDG_CONFIG_HOME").map(PathBuf::from).or_else(|_|std::env::var("HOME").map(|h|PathBuf::from(h).join(".config"))).unwrap_or_else(|_|PathBuf::from(".")).join("milmit-surfshark") }
+fn username_path()->PathBuf{config_dir().join("username")}
+fn settings_path()->PathBuf{config_dir().join("settings.conf")}
+fn saved_username()->Option<String>{fs::read_to_string(username_path()).ok().map(|v|v.trim().to_string()).filter(|v|!v.is_empty())}
+fn save_username(v:&str){let p=username_path();if let Some(x)=p.parent(){let _=fs::create_dir_all(x);}let _=fs::write(p,v);}
+fn normalize_mac_csv(v:&str)->String{let mut out=Vec::<String>::new();for x in v.split(','){let m=x.trim().to_ascii_uppercase();if !m.is_empty()&&!out.contains(&m){out.push(m)}}out.join(",")}
+fn load_settings()->AppSettings{let mut s=AppSettings::default();if let Ok(t)=fs::read_to_string(settings_path()){for l in t.lines(){if let Some((k,v))=l.split_once('='){match k{"mss"=>if let Ok(n)=v.parse::<u32>(){if(900..=1400).contains(&n){s.mss=n}},"dns"=>if !v.is_empty(){s.dns=v.into()},"hotspot_vpn"=>s.hotspot_vpn=v=="1","hotspot_iface"=>if !v.is_empty(){s.hotspot_iface=v.into()},"recover_network"=>s.recover_network=v=="1","kill_switch"=>s.kill_switch=v=="1","routing_mode"=>if matches!(v,"vpn_all"|"iran_direct"){s.routing_mode=v.into()},"hotspot_vpn_macs"=>s.hotspot_vpn_macs=normalize_mac_csv(v),"hotspot_direct_macs"=>s.hotspot_direct_macs=normalize_mac_csv(v),_=>{}}}}}s}
+fn save_settings(s:&AppSettings){let p=settings_path();if let Some(x)=p.parent(){let _=fs::create_dir_all(x);}let text=format!("mss={}\ndns={}\nhotspot_vpn={}\nhotspot_iface={}\nrecover_network={}\nkill_switch={}\nrouting_mode={}\nhotspot_vpn_macs={}\nhotspot_direct_macs={}\n",s.mss,s.dns,s.hotspot_vpn as u8,s.hotspot_iface,s.recover_network as u8,s.kill_switch as u8,s.routing_mode,s.hotspot_vpn_macs,s.hotspot_direct_macs);let _=fs::write(p,text);}
 
-fn nm(args: &[&str]) -> String { run("nmcli", args) }
-fn nm_active() -> bool {
-    nm(&["-t", "-f", "NAME,TYPE", "connection", "show", "--active"])
-        .lines().any(|line| line == format!("{PROFILE}:vpn"))
-}
-fn profile_exists() -> bool {
-    nm(&["-t", "-f", "NAME", "connection", "show"])
-        .lines().any(|line| line == PROFILE)
-}
+fn restricted_candidates(host:&str)->Vec<String>{let mut o=Vec::new();if host=="ee-tll.prod.surfshark.com"{o.push("185.174.159.123".into())}for ip in bundled_for_host(host){if !o.iter().any(|v|v==ip){o.push((*ip).into())}}o}
+fn restricted_connect(endpoint:&str,username:&str,password:&str,s:&AppSettings)->(bool,String){let mss=s.mss.to_string();let hotspot=if s.hotspot_vpn{"1"}else{"0"};let recover=if s.recover_network{"1"}else{"0"};let kill=if s.kill_switch{"1"}else{"0"};let mut c=match Command::new("pkexec").arg("bash").arg(RESTRICTED_CONNECT).arg(endpoint).arg(username).arg(&mss).arg(&s.dns).arg(hotspot).arg(recover).arg(&s.hotspot_iface).arg(kill).arg(&s.routing_mode).arg(&s.hotspot_vpn_macs).arg(&s.hotspot_direct_macs).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn(){Ok(c)=>c,Err(e)=>return(false,e.to_string())};if let Some(stdin)=c.stdin.as_mut(){let _=writeln!(stdin,"{password}");}match c.wait_with_output(){Ok(o)=>{let mut t=String::from_utf8_lossy(&o.stdout).to_string();t.push_str(&String::from_utf8_lossy(&o.stderr));(o.status.success()&&t.contains("Data-path test: OK"),t)},Err(e)=>(false,e.to_string())}}
+fn disconnect()->String{run("pkexec",&["bash",RESTRICTED_DISCONNECT])}
+fn helper(args:&[&str])->String{let mut c=Command::new("pkexec");c.arg(HELPER).args(args);match c.output(){Ok(o)=>{let mut t=String::from_utf8_lossy(&o.stdout).to_string();if !o.stderr.is_empty(){t.push_str(&String::from_utf8_lossy(&o.stderr));}t},Err(e)=>e.to_string()}}
+fn parse_colon(text:&str,key:&str)->Option<String>{text.lines().find_map(|l|{let(k,v)=l.split_once(':')?;(k.trim()==key).then(||v.trim().to_string())}).filter(|v|!v.is_empty())}
+fn json_number(text:&str,key:&str)->Option<u32>{let needle=format!("\"{key}\":");let p=text.find(&needle)?+needle.len();let r=&text[p..];let n=r.trim_start().chars().take_while(|c|c.is_ascii_digit()).collect::<String>();n.parse().ok()}
+fn json_string(text:&str,key:&str)->Option<String>{let needle=format!("\"{key}\":");let p=text.find(&needle)?+needle.len();let r=text[p..].trim_start();let r=r.strip_prefix('"')?;Some(r.chars().take_while(|c|*c!='"').collect())}
+fn fmt_rate(raw:Option<String>)->String{let n=raw.and_then(|v|v.parse::<f64>().ok()).unwrap_or(0.0);if n>=1_048_576.0{format!("{:.1} MB/s",n/1_048_576.0)}else if n>=1024.0{format!("{:.0} KB/s",n/1024.0)}else{format!("{:.0} B/s",n)}}
+fn ping_ms(host:&str)->Option<u32>{let target=if host=="ee-tll.prod.surfshark.com"{"185.174.159.123"}else{bundled_for_host(host).first().copied().unwrap_or(host)};let o=Command::new("ping").args(["-n","-c","1","-W","1",target]).output().ok()?;if !o.status.success(){return None}let t=String::from_utf8_lossy(&o.stdout);let st=t.find("time=")?+5;let r=&t[st..];let en=r.find(|c:char|c==' '||c=='\n').unwrap_or(r.len());r[..en].parse::<f64>().ok().map(|v|v.round()as u32)}
+fn scan_latencies()->Vec<(String,Option<u32>)>{LOCATIONS.iter().map(|x|(x.id.to_string(),ping_ms(x.host))).collect()}
 
-fn file_value(path: &str, key: &str) -> Option<String> {
-    let state = fs::read_to_string(path).ok()?;
-    state.lines().find_map(|line| {
-        let (k, v) = line.split_once('=')?;
-        (k == key).then(|| v.trim().to_string())
-    }).filter(|v| !v.is_empty())
-}
-fn state_value(key: &str) -> Option<String> { file_value(RESTRICTED_STATE, key) }
-fn live_value(key: &str) -> Option<String> { file_value(LIVE_STATE, key) }
+fn install_css(){let p=gtk::CssProvider::new();p.load_from_data("window{background:@window_bg_color}.shell{background:linear-gradient(145deg,alpha(@window_bg_color,.98),alpha(@view_bg_color,.92))}.sidebar{min-width:188px;padding:20px 12px;background:alpha(@card_bg_color,.58);border-right:1px solid alpha(@borders,.45)}.brand{font-size:19px;font-weight:900;letter-spacing:1px}.brand-sub{font-size:10px;opacity:.55}.nav{min-height:44px;border-radius:13px;background:transparent;box-shadow:none;padding:0 14px}.nav:hover{background:alpha(@accent_bg_color,.10)}.nav-active{background:alpha(@accent_bg_color,.17);font-weight:900}.page{padding:22px 26px 28px}.hero{padding:26px;border-radius:28px;background:linear-gradient(135deg,alpha(@accent_bg_color,.17),alpha(@card_bg_color,.72));border:1px solid alpha(@accent_bg_color,.24)}.orb{min-width:176px;min-height:176px;border-radius:999px;background:radial-gradient(circle,alpha(@accent_bg_color,.30),alpha(@accent_bg_color,.06));border:2px solid alpha(@accent_bg_color,.52);box-shadow:0 0 28px alpha(@accent_bg_color,.16)}.orb-pulse{box-shadow:0 0 46px alpha(@accent_bg_color,.30);border-color:alpha(@accent_bg_color,.82)}.orb-ok{background:radial-gradient(circle,alpha(@success_color,.28),alpha(@success_color,.05));border-color:alpha(@success_color,.58)}.orb-error{background:radial-gradient(circle,alpha(@error_color,.24),alpha(@error_color,.05));border-color:alpha(@error_color,.62)}.orb-icon{-gtk-icon-size:60px}.status{font-size:22px;font-weight:900}.sub{font-size:11px;opacity:.64}.connect{min-height:50px;min-width:210px;border-radius:999px;font-weight:900}.metric{padding:14px 16px;border-radius:16px;background:alpha(@card_bg_color,.72);border:1px solid alpha(@borders,.42)}.metric-value{font-size:16px;font-weight:900}.metric-name{font-size:9px;opacity:.58;letter-spacing:.6px}.card{padding:17px;border-radius:19px;background:alpha(@card_bg_color,.68);border:1px solid alpha(@borders,.42)}.card-title{font-size:14px;font-weight:900}.tiny{font-size:10px;opacity:.60}.pill{padding:7px 11px;border-radius:999px;background:alpha(@accent_bg_color,.12);font-size:10px;font-weight:800}.health-score{font-size:30px;font-weight:950}.danger-card{padding:17px;border-radius:19px;background:alpha(@error_color,.07);border:1px solid alpha(@error_color,.30)}entry,spinbutton,combobox button{min-height:40px;border-radius:11px}.tool{min-height:43px;border-radius:12px}.diag{font-size:11px;padding:12px}.progress trough{min-height:5px;border-radius:999px}.progress progress{min-height:5px;border-radius:999px}");if let Some(d)=gtk::gdk::Display::default(){gtk::style_context_add_provider_for_display(&d,&p,gtk::STYLE_PROVIDER_PRIORITY_APPLICATION)}}
+fn title(t:&str,s:&str)->gtk::Box{let b=gtk::Box::new(Orientation::Vertical,2);b.append(&gtk::Label::builder().label(t).halign(gtk::Align::Start).css_classes(["card-title"]).build());b.append(&gtk::Label::builder().label(s).halign(gtk::Align::Start).wrap(true).css_classes(["tiny"]).build());b}
+fn metric(name:&str,val:&gtk::Label)->gtk::Box{let b=gtk::Box::new(Orientation::Vertical,3);b.add_css_class("metric");b.set_hexpand(true);val.add_css_class("metric-value");b.append(val);b.append(&gtk::Label::builder().label(name).halign(gtk::Align::Start).css_classes(["metric-name"]).build());b}
+fn nav_button(label:&str)->gtk::Button{let b=gtk::Button::with_label(label);b.add_css_class("nav");b.set_halign(gtk::Align::Fill);b}
 
-fn restricted_active() -> bool {
-    let Some(vip) = state_value("VIRTUAL_IP") else { return false; };
-    run("ip", &["-4", "addr", "show"]).contains(&vip)
-}
-fn any_vpn_active() -> bool { restricted_active() || nm_active() }
+fn main()->glib::ExitCode{let app=adw::Application::builder().application_id("net.milmit.SurfsharkIkev2").build();app.connect_activate(build_ui);app.run()}
+fn build_ui(app:&adw::Application){
+    install_css();let settings=load_settings();let is_active=active();
+    let header=adw::HeaderBar::new();header.set_title_widget(Some(&adw::WindowTitle::new("MilMit Secure","Adaptive IKEv2 Protection Control Center")));
 
-fn config_dir() -> PathBuf {
-    std::env::var("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|_| std::env::var("HOME").map(|h| PathBuf::from(h).join(".config")))
-        .unwrap_or_else(|_| PathBuf::from("."))
-        .join("milmit-surfshark")
-}
-fn username_path() -> PathBuf { config_dir().join("username") }
-fn settings_path() -> PathBuf { config_dir().join("settings.conf") }
-fn saved_username() -> Option<String> {
-    fs::read_to_string(username_path()).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
-}
-fn save_username(value: &str) {
-    let path = username_path();
-    if let Some(parent) = path.parent() { let _ = fs::create_dir_all(parent); }
-    let _ = fs::write(path, value);
-}
-fn normalize_mac_csv(value: &str) -> String {
-    let mut out: Vec<String> = Vec::new();
-    for item in value.split(',') {
-        let mac = item.trim().to_ascii_uppercase();
-        if mac.is_empty() { continue; }
-        if !out.iter().any(|v| v == &mac) { out.push(mac); }
+    let status_icon=gtk::Image::from_icon_name(if is_active{"network-vpn-symbolic"}else{"network-offline-symbolic"});status_icon.add_css_class("orb-icon");let orb=gtk::Box::new(Orientation::Vertical,0);orb.set_halign(gtk::Align::Center);orb.set_valign(gtk::Align::Center);orb.add_css_class("orb");if is_active{orb.add_css_class("orb-ok")}orb.append(&status_icon);
+    let status=gtk::Label::builder().label(if is_active{"Protected"}else{"Ready"}).css_classes(["status"]).build();let detail=gtk::Label::builder().label(if is_active{"Encrypted IKEv2 path is active"}else{"Choose a location and start protection"}).css_classes(["sub"]).build();
+    let spinner=gtk::Spinner::new();let progress=gtk::ProgressBar::new();progress.add_css_class("progress");progress.set_visible(false);
+    let connect=gtk::Button::with_label("Connect securely");connect.add_css_class("suggested-action");connect.add_css_class("connect");connect.set_visible(!is_active);let disconnect_btn=gtk::Button::with_label("Disconnect");disconnect_btn.add_css_class("destructive-action");disconnect_btn.add_css_class("connect");disconnect_btn.set_visible(is_active);
+    let actions=gtk::Box::new(Orientation::Horizontal,8);actions.set_halign(gtk::Align::Center);actions.append(&connect);actions.append(&disconnect_btn);
+    let ip_val=gtk::Label::builder().label(state_value("PUBLIC_IP").unwrap_or_else(||"—".into())).halign(gtk::Align::Start).build();let down_val=gtk::Label::builder().label("0 B/s").halign(gtk::Align::Start).build();let up_val=gtk::Label::builder().label("0 B/s").halign(gtk::Align::Start).build();let lat_val=gtk::Label::builder().label("— ms").halign(gtk::Align::Start).build();
+    let metrics=gtk::Box::new(Orientation::Horizontal,10);metrics.append(&metric("PUBLIC IP",&ip_val));metrics.append(&metric("DOWNLOAD",&down_val));metrics.append(&metric("UPLOAD",&up_val));metrics.append(&metric("LATENCY",&lat_val));
+    let hero=gtk::Box::new(Orientation::Vertical,10);hero.add_css_class("hero");hero.append(&orb);hero.append(&status);hero.append(&detail);hero.append(&spinner);hero.append(&progress);hero.append(&actions);hero.append(&metrics);
+
+    let location=gtk::ComboBoxText::new();location.set_hexpand(true);for x in LOCATIONS{location.append(Some(x.id),x.label)}location.set_active_id(Some("ee-tll"));let scan=gtk::Button::with_label("Scan latency");scan.add_css_class("tool");let lr=gtk::Box::new(Orientation::Horizontal,8);lr.append(&location);lr.append(&scan);let loc_card=gtk::Box::new(Orientation::Vertical,10);loc_card.add_css_class("card");loc_card.append(&title("Smart location","Direct-IP candidates with latency scan for restricted networks"));loc_card.append(&lr);
+    let health_score=gtk::Label::builder().label("—").css_classes(["health-score"]).build();let health_state=gtk::Label::builder().label("Checking…").css_classes(["pill"]).build();let health_refresh=gtk::Button::with_label("Protection health");health_refresh.add_css_class("tool");let hrow=gtk::Box::new(Orientation::Horizontal,12);hrow.append(&health_score);hrow.append(&health_state);hrow.append(&health_refresh);let health_card=gtk::Box::new(Orientation::Vertical,9);health_card.add_css_class("card");health_card.append(&title("Protection Health","IKE + XFRM + route + exit-IP + watchdog + DNS + kill-switch evidence"));health_card.append(&hrow);
+    let topo=gtk::Label::builder().label("Device  →  Linux  →  XFRM  →  Surfshark  →  Internet").wrap(true).css_classes(["pill"]).build();let topo_card=gtk::Box::new(Orientation::Vertical,8);topo_card.add_css_class("card");topo_card.append(&title("Live protected path","Topology follows the active policy route and hotspot state"));topo_card.append(&topo);
+    let dashboard=gtk::Box::new(Orientation::Vertical,14);dashboard.add_css_class("page");dashboard.append(&hero);dashboard.append(&loc_card);dashboard.append(&health_card);dashboard.append(&topo_card);
+
+    let user=gtk::Entry::builder().placeholder_text("Surfshark service username").hexpand(true).build();if let Some(u)=saved_username(){user.set_text(&u)}let pass=gtk::PasswordEntry::builder().placeholder_text("Service password · blank = saved root credential").show_peek_icon(true).hexpand(true).build();let routing=gtk::ComboBoxText::new();routing.append(Some("vpn_all"),"VPN Everything");routing.append(Some("iran_direct"),"Iran Direct · Foreign through VPN");routing.set_active_id(Some(&settings.routing_mode));let kill=gtk::CheckButton::with_label("Kill Switch · fail closed if protected route disappears");kill.set_active(settings.kill_switch);let recover=gtk::CheckButton::with_label("Auto recovery after network changes");recover.set_active(settings.recover_network);let mss=gtk::SpinButton::with_range(900.0,1400.0,10.0);mss.set_value(settings.mss as f64);let dns=gtk::Entry::builder().text(&settings.dns).hexpand(true).build();
+    let cred=gtk::Box::new(Orientation::Vertical,9);cred.add_css_class("card");cred.append(&title("Credentials","Service credentials are separate from the Surfshark account login"));cred.append(&user);cred.append(&pass);let route_card=gtk::Box::new(Orientation::Vertical,9);route_card.add_css_class("card");route_card.append(&title("Routing & leak protection","Policy routing tuned for filtered/mobile networks"));route_card.append(&routing);route_card.append(&kill);route_card.append(&recover);let tune=gtk::Box::new(Orientation::Vertical,9);tune.add_css_class("card");tune.append(&title("Compatibility tuning","MSS 1200 is the verified baseline on restricted links; MTU probe can refine it"));let mr=gtk::Box::new(Orientation::Horizontal,8);mr.append(&gtk::Label::new(Some("TCP MSS")));mr.append(&mss);tune.append(&mr);tune.append(&dns);let routing_page=gtk::Box::new(Orientation::Vertical,14);routing_page.add_css_class("page");routing_page.append(&cred);routing_page.append(&route_card);routing_page.append(&tune);
+
+    let hotspot=gtk::CheckButton::with_label("Unlisted hotspot devices use VPN");hotspot.set_active(settings.hotspot_vpn);let iface=gtk::Entry::builder().text(&settings.hotspot_iface).placeholder_text("auto or hotspot interface").build();let vpn_macs=gtk::Entry::builder().text(&settings.hotspot_vpn_macs).placeholder_text("Force VPN MACs · comma separated").build();let direct_macs=gtk::Entry::builder().text(&settings.hotspot_direct_macs).placeholder_text("Direct MACs · comma separated").build();let dev_card=gtk::Box::new(Orientation::Vertical,9);dev_card.add_css_class("card");dev_card.append(&title("Per-device hotspot policy","Direct and VPN policy lists are enforced before the default device policy"));dev_card.append(&iface);dev_card.append(&hotspot);dev_card.append(&vpn_macs);dev_card.append(&direct_macs);let manage=gtk::Button::with_label("Open visual hotspot device manager");manage.add_css_class("tool");let recent=gtk::Button::with_label("Recent Internet destinations");recent.add_css_class("tool");dev_card.append(&manage);dev_card.append(&recent);let devices_page=gtk::Box::new(Orientation::Vertical,14);devices_page.add_css_class("page");devices_page.append(&dev_card);
+
+    let speed=gtk::Button::with_label("Speed + TTFB test");let dns_test=gtk::Button::with_label("DNS leak evidence");let mtu=gtk::Button::with_label("Adaptive MTU/MSS probe");let save_lkg=gtk::Button::with_label("Save Last Known Good");let support=gtk::Button::with_label("Create redacted support bundle");for b in [&speed,&dns_test,&mtu,&save_lkg,&support]{b.add_css_class("tool")};let grid=gtk::Grid::builder().row_spacing(8).column_spacing(8).build();grid.attach(&speed,0,0,1,1);grid.attach(&dns_test,1,0,1,1);grid.attach(&mtu,0,1,1,1);grid.attach(&save_lkg,1,1,1,1);grid.attach(&support,0,2,2,1);let tool_card=gtk::Box::new(Orientation::Vertical,10);tool_card.add_css_class("card");tool_card.append(&title("Adaptive protection tools","Bounded diagnostics inspired by the router engine: no blind route changes"));tool_card.append(&grid);
+    let route_target=gtk::Entry::builder().placeholder_text("Route Tester · domain, IP or URL").hexpand(true).build();let route_test=gtk::Button::with_label("Test route");route_test.add_css_class("tool");let rr=gtk::Box::new(Orientation::Horizontal,8);rr.append(&route_target);rr.append(&route_test);let rt_card=gtk::Box::new(Orientation::Vertical,9);rt_card.add_css_class("card");rt_card.append(&title("Route Tester","Shows intended VPN/Direct path vs the actual Linux route; Iran cache aware"));rt_card.append(&rr);
+    let emergency=gtk::Button::with_label("STOP EVERYTHING");emergency.add_css_class("destructive-action");emergency.add_css_class("tool");let danger=gtk::Box::new(Orientation::Vertical,9);danger.add_css_class("danger-card");danger.append(&title("Emergency stop","Removes MilMit-owned XFRM/policy routing and disconnects the tunnel"));danger.append(&emergency);let tools_page=gtk::Box::new(Orientation::Vertical,14);tools_page.add_css_class("page");tools_page.append(&tool_card);tools_page.append(&rt_card);tools_page.append(&danger);
+
+    let text=gtk::TextView::builder().editable(false).monospace(true).wrap_mode(gtk::WrapMode::WordChar).css_classes(["diag"]).build();let buffer=text.buffer();buffer.set_text("MilMit Secure · operation monitor\n");let scroll=gtk::ScrolledWindow::builder().vexpand(true).child(&text).build();let diag_card=gtk::Box::new(Orientation::Vertical,9);diag_card.add_css_class("card");diag_card.append(&title("Operation Monitor","Connection logs, diagnostics, route tests and tool output stream here"));diag_card.append(&scroll);let diagnostics=gtk::Box::new(Orientation::Vertical,14);diagnostics.add_css_class("page");diagnostics.append(&diag_card);
+
+    let stack=gtk::Stack::new();stack.set_transition_type(gtk::StackTransitionType::SlideLeftRight);stack.set_transition_duration(300);stack.set_hexpand(true);stack.set_vexpand(true);stack.add_named(&dashboard,Some("dashboard"));stack.add_named(&routing_page,Some("routing"));stack.add_named(&devices_page,Some("devices"));stack.add_named(&tools_page,Some("tools"));stack.add_named(&diagnostics,Some("diagnostics"));
+    let brand=gtk::Box::new(Orientation::Vertical,1);brand.append(&gtk::Label::builder().label("MILMIT").halign(gtk::Align::Start).css_classes(["brand"]).build());brand.append(&gtk::Label::builder().label("SECURE CONTROL").halign(gtk::Align::Start).css_classes(["brand-sub"]).build());let n1=nav_button("◉   Dashboard");let n2=nav_button("⌁   Routing");let n3=nav_button("◇   Devices");let n4=nav_button("✦   Protection Tools");let n5=nav_button("≡   Diagnostics");n1.add_css_class("nav-active");let side=gtk::Box::new(Orientation::Vertical,9);side.add_css_class("sidebar");side.append(&brand);side.append(&gtk::Separator::new(Orientation::Horizontal));for n in [&n1,&n2,&n3,&n4,&n5]{side.append(n)}let sp=gtk::Box::new(Orientation::Vertical,0);sp.set_vexpand(true);side.append(&sp);side.append(&gtk::Label::builder().label("IKEv2 · strongSwan\nXFRM policy router\nIran-ready").halign(gtk::Align::Start).css_classes(["tiny"]).build());let shell=gtk::Box::new(Orientation::Horizontal,0);shell.add_css_class("shell");shell.append(&side);shell.append(&stack);let root=gtk::Box::new(Orientation::Vertical,0);root.append(&header);root.append(&shell);let window=adw::ApplicationWindow::builder().application(app).title("MilMit Secure").default_width(1040).default_height(820).content(&root).build();
+
+    let navs=[n1.clone(),n2.clone(),n3.clone(),n4.clone(),n5.clone()];for (i,(btn,name)) in [(&n1,"dashboard"),(&n2,"routing"),(&n3,"devices"),(&n4,"tools"),(&n5,"diagnostics")].into_iter().enumerate(){let st=stack.clone();let ns=navs.clone();btn.connect_clicked(move |_|{st.set_visible_child_name(name);for (j,n) in ns.iter().enumerate(){if i==j{n.add_css_class("nav-active")}else{n.remove_css_class("nav-active")}}});}
+
+    let (tx,rx)=mpsc::channel::<Event>();
+    let status=Rc::new(status);let detail=Rc::new(detail);let status_icon=Rc::new(status_icon);let orb=Rc::new(orb);let spinner=Rc::new(spinner);let progress=Rc::new(progress);let connect=Rc::new(connect);let disconnect_btn=Rc::new(disconnect_btn);let ip_val=Rc::new(ip_val);let down_val=Rc::new(down_val);let up_val=Rc::new(up_val);let lat_val=Rc::new(lat_val);let health_score=Rc::new(health_score);let health_state=Rc::new(health_state);let buffer=Rc::new(buffer);
+    let pulse=Rc::new(std::cell::Cell::new(false));{
+        let status=Rc::clone(&status);let detail=Rc::clone(&detail);let status_icon=Rc::clone(&status_icon);let orb=Rc::clone(&orb);let spinner=Rc::clone(&spinner);let progress=Rc::clone(&progress);let connect=Rc::clone(&connect);let disconnect_btn=Rc::clone(&disconnect_btn);let ip_val=Rc::clone(&ip_val);let down_val=Rc::clone(&down_val);let up_val=Rc::clone(&up_val);let lat_val=Rc::clone(&lat_val);let health_score=Rc::clone(&health_score);let health_state=Rc::clone(&health_state);let buffer=Rc::clone(&buffer);let pulse=Rc::clone(&pulse);
+        glib::timeout_add_local(Duration::from_millis(120),move||{if spinner.is_spinning(){progress.pulse()}down_val.set_label(&fmt_rate(live_value("RX_BPS")));up_val.set_label(&fmt_rate(live_value("TX_BPS")));let l=live_value("LATENCY_MS").unwrap_or_else(||"0".into());lat_val.set_label(if l=="0"{"— ms"}else{&format!("{l} ms")});while let Ok(e)=rx.try_recv(){match e{Event::Busy(m)=>{status.set_label(&m);detail.set_label("Negotiating tunnel and validating protected data path…");spinner.start();progress.set_visible(true);connect.set_sensitive(false);disconnect_btn.set_sensitive(false);orb.remove_css_class("orb-error");},Event::Log(t,b)=>{let mut it=buffer.end_iter();buffer.insert(&mut it,&format!("\n╭─ {t}\n{b}\n╰────────────────────────\n"));},Event::Connected(ip,label)=>{spinner.stop();progress.set_visible(false);status.set_label("Protected");detail.set_label(&label);status_icon.set_icon_name(Some("network-vpn-symbolic"));ip_val.set_label(&ip);orb.add_css_class("orb-ok");connect.set_visible(false);disconnect_btn.set_visible(true);connect.set_sensitive(true);disconnect_btn.set_sensitive(true);},Event::Disconnected=>{spinner.stop();progress.set_visible(false);status.set_label("Disconnected");detail.set_label("Network restored · ready");status_icon.set_icon_name(Some("network-offline-symbolic"));orb.remove_css_class("orb-ok");connect.set_visible(true);disconnect_btn.set_visible(false);connect.set_sensitive(true);disconnect_btn.set_sensitive(true);ip_val.set_label("—");},Event::Failed(m)=>{spinner.stop();progress.set_visible(false);status.set_label("Connection failed");detail.set_label("Backend recovered the route. Review Operation Monitor.");orb.add_css_class("orb-error");connect.set_visible(true);disconnect_btn.set_visible(false);connect.set_sensitive(true);disconnect_btn.set_sensitive(true);let mut it=buffer.end_iter();buffer.insert(&mut it,&format!("\nERROR\n{m}\n"));},Event::Tool(name,out)=>{if name=="Protection Health"{if let Some(n)=json_number(&out,"score"){health_score.set_label(&format!("{n}/100"));}if let Some(s)=json_string(&out,"state"){health_state.set_label(&s)}}let mut it=buffer.end_iter();buffer.insert(&mut it,&format!("\n╭─ {name}\n{out}\n╰────────────────────────\n"));},Event::PingResults(r)=>{let mut it=buffer.end_iter();buffer.insert(&mut it,&format!("\nLatency scan: {}/{} locations replied\n",r.iter().filter(|x|x.1.is_some()).count(),r.len()));}}}if pulse.get(){orb.add_css_class("orb-pulse")}else{orb.remove_css_class("orb-pulse")};glib::ControlFlow::Continue});
     }
-    out.join(",")
-}
+    {let pulse=Rc::clone(&pulse);glib::timeout_add_local(Duration::from_millis(780),move||{pulse.set(!pulse.get());glib::ControlFlow::Continue});}
 
-fn load_settings() -> AppSettings {
-    let mut settings = AppSettings::default();
-    let Ok(text) = fs::read_to_string(settings_path()) else { return settings; };
-    for line in text.lines() {
-        let Some((key, value)) = line.split_once('=') else { continue; };
-        match key {
-            "restricted" => settings.restricted = value == "1",
-            "mss" => if let Ok(v) = value.parse::<u32>() { if (900..=1400).contains(&v) { settings.mss = v; } },
-            "dns" => if !value.trim().is_empty() { settings.dns = value.trim().to_string(); },
-            "hotspot_vpn" => settings.hotspot_vpn = value == "1",
-            "hotspot_iface" => if !value.trim().is_empty() { settings.hotspot_iface = value.trim().to_string(); },
-            "recover_network" => settings.recover_network = value == "1",
-            "kill_switch" => settings.kill_switch = value == "1",
-            "routing_mode" => if matches!(value, "vpn_all" | "iran_direct") { settings.routing_mode = value.to_string(); },
-            "hotspot_vpn_macs" => settings.hotspot_vpn_macs = normalize_mac_csv(value),
-            "hotspot_direct_macs" => settings.hotspot_direct_macs = normalize_mac_csv(value),
-            _ => {}
-        }
-    }
-    settings
-}
-
-fn save_settings(settings: &AppSettings) {
-    let path = settings_path();
-    if let Some(parent) = path.parent() { let _ = fs::create_dir_all(parent); }
-    let text = format!(
-        "restricted={}\nmss={}\ndns={}\nhotspot_vpn={}\nhotspot_iface={}\nrecover_network={}\nkill_switch={}\nrouting_mode={}\nhotspot_vpn_macs={}\nhotspot_direct_macs={}\n",
-        settings.restricted as u8, settings.mss, settings.dns, settings.hotspot_vpn as u8,
-        settings.hotspot_iface, settings.recover_network as u8, settings.kill_switch as u8,
-        settings.routing_mode, settings.hotspot_vpn_macs, settings.hotspot_direct_macs,
-    );
-    let _ = fs::write(path, text);
-}
-
-fn public_ip() -> String { run("curl", &["-4", "--max-time", "8", "-sS", "https://api.ipify.org"]) }
-fn network_interfaces() -> Vec<(String, String)> {
-    let mut out = Vec::new();
-    let text = nm(&["-t", "-f", "DEVICE,TYPE,STATE", "device", "status"]);
-    for line in text.lines() {
-        let mut parts = line.splitn(3, ':');
-        let dev = parts.next().unwrap_or("").trim();
-        let kind = parts.next().unwrap_or("").trim();
-        let state = parts.next().unwrap_or("").trim();
-        if dev.is_empty() || dev == "lo" || matches!(kind, "loopback" | "dummy" | "tun") { continue; }
-        if !matches!(kind, "wifi" | "ethernet" | "bridge") { continue; }
-        let icon = if kind == "wifi" { "◉" } else { "◆" };
-        out.push((dev.to_string(), format!("{icon} {dev}  ·  {kind}  ·  {state}")));
-    }
-    out
-}
-
-fn configure_nm_profile(address: &str, identity: &str, username: &str, password: Option<&str>) -> String {
-    let mut log = String::new();
-    if !profile_exists() {
-        log.push_str(&nm(&["connection", "add", "type", "vpn", "ifname", "--", "vpn-type", "strongswan", "connection.id", PROFILE, "connection.autoconnect", "no"]));
-        log.push('\n');
-    }
-    let data = format!("address = {address}, server-identity = {identity}, certificate = {CA_CERT}, encap = yes, ipcomp = no, method = eap, proposal = no, user = {username}, virtual = yes");
-    let mut cmd = Command::new("nmcli");
-    cmd.args(["connection", "modify", PROFILE, "vpn.data", &data, "ipv4.never-default", "no", "ipv6.method", "disabled"]);
-    if let Some(password) = password { cmd.args(["vpn.secrets", &format!("password={password}")]); }
-    match cmd.output() {
-        Ok(out) => { log.push_str(&String::from_utf8_lossy(&out.stdout)); log.push_str(&String::from_utf8_lossy(&out.stderr)); }
-        Err(e) => log.push_str(&format!("nmcli failed: {e}")),
-    }
-    log
-}
-fn standard_connect(host: &str, username: &str, password: Option<&str>) -> (bool, String) {
-    if nm_active() { let _ = nm(&["--wait", "5", "connection", "down", PROFILE]); }
-    let mut log = configure_nm_profile(host, host, username, password);
-    log.push('\n'); log.push_str(&nm(&["--wait", "15", "connection", "up", PROFILE]));
-    (nm_active(), log)
-}
-fn restricted_candidates(host: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    if host == "ee-tll.prod.surfshark.com" { out.push("185.174.159.123".to_string()); }
-    for ip in bundled_for_host(host) { if !out.iter().any(|v| v == ip) { out.push((*ip).to_string()); } }
-    out
-}
-fn restricted_connect(endpoint: &str, username: &str, password: &str, settings: &AppSettings) -> (bool, String) {
-    let mss = settings.mss.to_string();
-    let hotspot = if settings.hotspot_vpn { "1" } else { "0" };
-    let recover = if settings.recover_network { "1" } else { "0" };
-    let kill = if settings.kill_switch { "1" } else { "0" };
-    let mut child = match Command::new("pkexec")
-        .arg("bash").arg(RESTRICTED_CONNECT).arg(endpoint).arg(username).arg(&mss)
-        .arg(&settings.dns).arg(hotspot).arg(recover).arg(&settings.hotspot_iface).arg(kill)
-        .arg(&settings.routing_mode).arg(&settings.hotspot_vpn_macs).arg(&settings.hotspot_direct_macs)
-        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn() {
-        Ok(child) => child,
-        Err(e) => return (false, format!("Could not start restricted helper: {e}")),
-    };
-    if let Some(stdin) = child.stdin.as_mut() { let _ = writeln!(stdin, "{password}"); }
-    match child.wait_with_output() {
-        Ok(out) => {
-            let mut text = String::from_utf8_lossy(&out.stdout).to_string();
-            if !out.stderr.is_empty() { if !text.is_empty() { text.push('\n'); } text.push_str(&String::from_utf8_lossy(&out.stderr)); }
-            (out.status.success() && text.contains("Data-path test: OK"), text)
-        }
-        Err(e) => (false, format!("Restricted helper failed: {e}")),
-    }
-}
-fn restricted_disconnect() -> String { run("pkexec", &["bash", RESTRICTED_DISCONNECT]) }
-fn parse_helper_value(text: &str, key: &str) -> Option<String> {
-    text.lines().find_map(|line| { let (k, v) = line.split_once(':')?; (k.trim() == key).then(|| v.trim().to_string()) }).filter(|v| !v.is_empty())
-}
-fn ping_ms(host: &str) -> Option<u32> {
-    let target = if host == "ee-tll.prod.surfshark.com" { "185.174.159.123" } else { bundled_for_host(host).first().copied().unwrap_or(host) };
-    let output = Command::new("ping").args(["-n", "-c", "1", "-W", "1", target]).output().ok()?;
-    if !output.status.success() { return None; }
-    let text = String::from_utf8_lossy(&output.stdout); let start = text.find("time=")? + 5; let rest = &text[start..];
-    let end = rest.find(|c: char| c == ' ' || c == '\n').unwrap_or(rest.len());
-    rest[..end].parse::<f64>().ok().map(|v| v.round() as u32)
-}
-fn scan_latencies() -> Vec<(String, Option<u32>)> { LOCATIONS.iter().map(|item| (item.id.to_string(), ping_ms(item.host))).collect() }
-fn repopulate_locations(combo: &gtk::ComboBoxText, results: &[(String, Option<u32>)]) {
-    let active = combo.active_id().map(|s| s.to_string()); combo.remove_all();
-    for item in LOCATIONS {
-        let latency = results.iter().find(|(id, _)| id == item.id).and_then(|(_, value)| *value);
-        let label = match latency { Some(ms) if ms < 100 => format!("●  {}  ·  {} ms", item.label, ms), Some(ms) if ms < 220 => format!("◐  {}  ·  {} ms", item.label, ms), Some(ms) => format!("○  {}  ·  {} ms", item.label, ms), None => format!("·  {}  ·  no ping", item.label) };
-        combo.append(Some(item.id), &label);
-    }
-    if let Some(id) = active { combo.set_active_id(Some(&id)); } else { combo.set_active(Some(0)); }
-}
-fn append_log(buffer: &gtk::TextBuffer, title: &str, body: &str) {
-    let mut end = buffer.end_iter(); buffer.insert(&mut end, &format!("\n╭─ {title}\n{body}\n╰────────────────────────\n"));
-}
-fn fmt_rate(raw: Option<String>) -> String {
-    let n = raw.and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0);
-    if n >= 1_048_576.0 { format!("{:.1} MB/s", n / 1_048_576.0) }
-    else if n >= 1024.0 { format!("{:.0} KB/s", n / 1024.0) } else { format!("{:.0} B/s", n) }
-}
-
-fn install_css() {
-    let provider = gtk::CssProvider::new();
-    provider.load_from_data(
-        "window { background: @window_bg_color; }\n\
-         .shell { background: linear-gradient(145deg, alpha(@window_bg_color,.98), alpha(@view_bg_color,.90)); }\n\
-         .sidebar { min-width: 172px; padding: 18px 12px; background: alpha(@card_bg_color,.62); border-right: 1px solid alpha(@borders,.50); }\n\
-         .brand { font-size: 18px; font-weight: 900; letter-spacing: .8px; }\n\
-         .brand-sub { font-size: 10px; opacity: .62; }\n\
-         .nav-button { min-height: 42px; padding: 0 14px; border-radius: 12px; background: transparent; box-shadow: none; }\n\
-         .nav-button:hover { background: alpha(@accent_bg_color,.11); }\n\
-         .nav-active { background: alpha(@accent_bg_color,.18); font-weight: 800; }\n\
-         .page { padding: 22px 26px 26px 26px; }\n\
-         .hero-card { padding: 24px; border-radius: 24px; background: linear-gradient(135deg, alpha(@accent_bg_color,.16), alpha(@card_bg_color,.68)); border: 1px solid alpha(@accent_bg_color,.20); }\n\
-         .hero-title { font-size: 26px; font-weight: 900; letter-spacing: -.4px; }\n\
-         .hero-subtitle { font-size: 12px; opacity: .66; }\n\
-         .orb { min-width: 164px; min-height: 164px; border-radius: 999px; background: radial-gradient(circle, alpha(@accent_bg_color,.28), alpha(@accent_bg_color,.08)); border: 2px solid alpha(@accent_bg_color,.48); box-shadow: 0 0 24px alpha(@accent_bg_color,.16); }\n\
-         .orb-connected { background: radial-gradient(circle, alpha(@success_color,.30), alpha(@success_color,.08)); border-color: alpha(@success_color,.58); }\n\
-         .orb-busy { background: radial-gradient(circle, alpha(@accent_bg_color,.34), alpha(@accent_bg_color,.10)); border-color: alpha(@accent_bg_color,.78); }\n\
-         .orb-error { background: radial-gradient(circle, alpha(@error_color,.24), alpha(@error_color,.06)); border-color: alpha(@error_color,.58); }\n\
-         .orb-icon { -gtk-icon-size: 56px; }\n\
-         .status-title { font-size: 20px; font-weight: 900; }\n\
-         .status-detail { font-size: 11px; opacity: .68; }\n\
-         .connect-btn { min-height: 48px; min-width: 190px; padding: 0 28px; border-radius: 999px; font-weight: 900; }\n\
-         .metric { padding: 13px 15px; border-radius: 15px; background: alpha(@card_bg_color,.70); border: 1px solid alpha(@borders,.45); }\n\
-         .metric-value { font-size: 15px; font-weight: 800; }\n\
-         .metric-name { font-size: 10px; opacity: .60; }\n\
-         .section-card { padding: 16px; border-radius: 18px; background: alpha(@card_bg_color,.68); border: 1px solid alpha(@borders,.44); }\n\
-         .section-title { font-size: 14px; font-weight: 850; }\n\
-         .section-sub { font-size: 10px; opacity: .62; }\n\
-         .soft-pill { padding: 6px 10px; border-radius: 999px; background: alpha(@accent_bg_color,.12); font-size: 10px; font-weight: 700; }\n\
-         .tiny { font-size: 10px; opacity: .62; }\n\
-         .diag { font-size: 11px; padding: 12px; }\n\
-         .progress-rail trough { min-height: 5px; border-radius: 999px; }\n\
-         .progress-rail progress { min-height: 5px; border-radius: 999px; }\n\
-         entry, spinbutton, combobox button { min-height: 38px; border-radius: 10px; }"
-    );
-    if let Some(display) = gtk::gdk::Display::default() { gtk::style_context_add_provider_for_display(&display, &provider, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION); }
-}
-
-fn metric_card(title: &str, value: &gtk::Label) -> gtk::Box {
-    let boxx = gtk::Box::new(Orientation::Vertical, 3); boxx.add_css_class("metric"); boxx.set_hexpand(true);
-    value.add_css_class("metric-value");
-    boxx.append(value); boxx.append(&gtk::Label::builder().label(title).halign(gtk::Align::Start).css_classes(["metric-name"]).build()); boxx
-}
-fn section_header(title: &str, sub: &str) -> gtk::Box {
-    let b = gtk::Box::new(Orientation::Vertical, 2);
-    b.append(&gtk::Label::builder().label(title).halign(gtk::Align::Start).css_classes(["section-title"]).build());
-    b.append(&gtk::Label::builder().label(sub).halign(gtk::Align::Start).css_classes(["section-sub"]).build()); b
-}
-
-fn main() -> glib::ExitCode {
-    let app = adw::Application::builder().application_id("net.milmit.SurfsharkIkev2").build();
-    app.connect_activate(build_ui); app.run()
-}
-
-fn build_ui(app: &adw::Application) {
-    install_css();
-    let settings = load_settings();
-    let initially_active = any_vpn_active();
-
-    let header = adw::HeaderBar::new();
-    header.set_title_widget(Some(&adw::WindowTitle::new("MilMit Secure", "Surfshark IKEv2 · Linux")));
-
-    let status_icon = gtk::Image::from_icon_name(if initially_active { "network-vpn-symbolic" } else { "network-offline-symbolic" });
-    status_icon.add_css_class("orb-icon");
-    let orb = gtk::Box::new(Orientation::Vertical, 0); orb.set_halign(gtk::Align::Center); orb.set_valign(gtk::Align::Center); orb.add_css_class("orb"); if initially_active { orb.add_css_class("orb-connected"); } orb.append(&status_icon);
-    let status = gtk::Label::builder().label(if initially_active { "Connected" } else { "Ready" }).css_classes(["status-title"]).build();
-    let hero_detail = gtk::Label::builder().label(if initially_active { "Encrypted IKEv2 tunnel active" } else { "Choose a location and start protection" }).css_classes(["status-detail"]).build();
-    let spinner = gtk::Spinner::new();
-    let progress = gtk::ProgressBar::new(); progress.add_css_class("progress-rail"); progress.set_visible(false); progress.set_pulse_step(0.08);
-
-    let connect = gtk::Button::with_label("Connect securely"); connect.add_css_class("suggested-action"); connect.add_css_class("connect-btn"); connect.set_visible(!initially_active);
-    let disconnect = gtk::Button::with_label("Disconnect"); disconnect.add_css_class("destructive-action"); disconnect.add_css_class("connect-btn"); disconnect.set_visible(initially_active);
-    let refresh = gtk::Button::from_icon_name("view-refresh-symbolic"); refresh.set_tooltip_text(Some("Refresh status"));
-
-    let public_value = gtk::Label::builder().label(state_value("PUBLIC_IP").unwrap_or_else(|| "—".into())).halign(gtk::Align::Start).build();
-    let down_value = gtk::Label::builder().label("0 B/s").halign(gtk::Align::Start).build();
-    let up_value = gtk::Label::builder().label("0 B/s").halign(gtk::Align::Start).build();
-    let ping_value = gtk::Label::builder().label("— ms").halign(gtk::Align::Start).build();
-
-    let metrics = gtk::Box::new(Orientation::Horizontal, 10);
-    metrics.append(&metric_card("PUBLIC IP", &public_value)); metrics.append(&metric_card("DOWNLOAD", &down_value)); metrics.append(&metric_card("UPLOAD", &up_value)); metrics.append(&metric_card("LATENCY", &ping_value));
-
-    let hero_actions = gtk::Box::new(Orientation::Horizontal, 8); hero_actions.set_halign(gtk::Align::Center); hero_actions.append(&connect); hero_actions.append(&disconnect); hero_actions.append(&refresh);
-    let hero = gtk::Box::new(Orientation::Vertical, 10); hero.add_css_class("hero-card"); hero.set_halign(gtk::Align::Fill);
-    hero.append(&orb); hero.append(&status); hero.append(&hero_detail); hero.append(&spinner); hero.append(&progress); hero.append(&hero_actions); hero.append(&metrics);
-
-    let location = gtk::ComboBoxText::new(); location.set_hexpand(true); for item in LOCATIONS { location.append(Some(item.id), item.label); } location.set_active_id(Some("ee-tll"));
-    let ping_button = gtk::Button::with_label("Scan latency");
-    let loc_row = gtk::Box::new(Orientation::Horizontal, 8); loc_row.append(&location); loc_row.append(&ping_button);
-    let location_card = gtk::Box::new(Orientation::Vertical, 10); location_card.add_css_class("section-card"); location_card.append(&section_header("Location", "Select a Surfshark region or scan all locations")); location_card.append(&loc_row);
-
-    let watchdog_value = gtk::Label::builder().label("Waiting").css_classes(["soft-pill"]).build();
-    let route_value = gtk::Label::builder().label(state_value("ROUTING_MODE").unwrap_or_else(|| "VPN everything".into())).css_classes(["soft-pill"]).build();
-    let hotspot_value = gtk::Label::builder().label(state_value("HOTSPOT_IFACE").unwrap_or_else(|| "Off".into())).css_classes(["soft-pill"]).build();
-    let health_row = gtk::Box::new(Orientation::Horizontal, 8); health_row.set_halign(gtk::Align::Center); health_row.append(&watchdog_value); health_row.append(&route_value); health_row.append(&hotspot_value);
-    let health_card = gtk::Box::new(Orientation::Vertical, 10); health_card.add_css_class("section-card"); health_card.append(&section_header("Live protection", "Watchdog, policy routing and hotspot state")); health_card.append(&health_row);
-
-    let dashboard = gtk::Box::new(Orientation::Vertical, 14); dashboard.add_css_class("page"); dashboard.append(&hero); dashboard.append(&location_card); dashboard.append(&health_card);
-
-    let restricted_mode = gtk::CheckButton::with_label("Restricted network / Iran compatibility mode"); restricted_mode.set_active(settings.restricted);
-    let user = gtk::Entry::builder().placeholder_text("Surfshark service username").hexpand(true).build(); if let Some(name) = saved_username() { user.set_text(&name); }
-    let pass = gtk::PasswordEntry::builder().placeholder_text("Service password · blank = use saved").show_peek_icon(true).hexpand(true).build();
-    let mss = gtk::SpinButton::with_range(900.0, 1400.0, 10.0); mss.set_value(settings.mss as f64);
-    let dns = gtk::Entry::builder().text(&settings.dns).placeholder_text(DEFAULT_DNS).hexpand(true).build();
-    let routing_mode = gtk::ComboBoxText::new(); routing_mode.set_hexpand(true); routing_mode.append(Some("vpn_all"), "VPN Everything"); routing_mode.append(Some("iran_direct"), "Iran Direct · Foreign through VPN"); routing_mode.set_active_id(Some(&settings.routing_mode));
-    let kill_switch = gtk::CheckButton::with_label("Kill Switch · block public traffic if VPN path fails"); kill_switch.set_active(settings.kill_switch);
-    let hotspot_vpn = gtk::CheckButton::with_label("Unlisted hotspot devices use VPN policy"); hotspot_vpn.set_active(settings.hotspot_vpn);
-    let hotspot_iface = gtk::ComboBoxText::new(); hotspot_iface.set_hexpand(true); hotspot_iface.append(Some("auto"), "Auto-detect active hotspot"); for (iface, label) in network_interfaces() { hotspot_iface.append(Some(&iface), &label); } if !hotspot_iface.set_active_id(Some(&settings.hotspot_iface)) { hotspot_iface.set_active_id(Some("auto")); }
-    let hotspot_vpn_macs = gtk::Entry::builder().text(&settings.hotspot_vpn_macs).placeholder_text("VPN devices · MAC addresses").hexpand(true).build();
-    let hotspot_direct_macs = gtk::Entry::builder().text(&settings.hotspot_direct_macs).placeholder_text("Direct devices · MAC addresses").hexpand(true).build();
-    let recover_network = gtk::CheckButton::with_label("Auto-recover network after failed connect / disconnect"); recover_network.set_active(settings.recover_network);
-    let reset_tuning = gtk::Button::with_label("Reset recommended values");
-
-    let credentials_card = gtk::Box::new(Orientation::Vertical, 10); credentials_card.add_css_class("section-card"); credentials_card.append(&section_header("Surfshark credentials", "Stored locally; password is kept by the root-owned helper")); credentials_card.append(&user); credentials_card.append(&pass);
-    let routing_card = gtk::Box::new(Orientation::Vertical, 10); routing_card.add_css_class("section-card"); routing_card.append(&section_header("Routing & protection", "Iran-aware policy routing with optional leak protection")); routing_card.append(&routing_mode); routing_card.append(&kill_switch); routing_card.append(&restricted_mode);
-    let iran_card = gtk::Box::new(Orientation::Vertical, 10); iran_card.add_css_class("section-card"); iran_card.append(&section_header("Iran tuning", "Safe defaults for filtered and mobile networks"));
-    let mss_row = gtk::Box::new(Orientation::Horizontal, 8); mss_row.append(&gtk::Label::builder().label("TCP MSS").width_chars(14).halign(gtk::Align::Start).build()); mss_row.append(&mss); iran_card.append(&mss_row); iran_card.append(&dns); iran_card.append(&recover_network);
-    let hotspot_card = gtk::Box::new(Orientation::Vertical, 10); hotspot_card.add_css_class("section-card"); hotspot_card.append(&section_header("Hotspot & devices", "Choose an interface and route devices individually")); hotspot_card.append(&hotspot_iface); hotspot_card.append(&hotspot_vpn); hotspot_card.append(&hotspot_vpn_macs); hotspot_card.append(&hotspot_direct_macs);
-    let settings_page = gtk::Box::new(Orientation::Vertical, 14); settings_page.add_css_class("page"); settings_page.append(&credentials_card); settings_page.append(&routing_card); settings_page.append(&iran_card); settings_page.append(&hotspot_card); settings_page.append(&reset_tuning);
-
-    let text_view = gtk::TextView::builder().editable(false).monospace(true).wrap_mode(gtk::WrapMode::WordChar).top_margin(12).bottom_margin(12).left_margin(12).right_margin(12).css_classes(["diag"]).build();
-    let buffer = text_view.buffer(); buffer.set_text("MilMit Surfshark IKEv2 diagnostics\n");
-    let diag_scroll = gtk::ScrolledWindow::builder().vexpand(true).hexpand(true).child(&text_view).build();
-    let diag_card = gtk::Box::new(Orientation::Vertical, 10); diag_card.add_css_class("section-card"); diag_card.append(&section_header("Advanced diagnostics", "Raw backend output for troubleshooting")); diag_card.append(&diag_scroll);
-    let diag_page = gtk::Box::new(Orientation::Vertical, 14); diag_page.add_css_class("page"); diag_page.append(&diag_card);
-
-    let stack = gtk::Stack::new(); stack.set_transition_type(gtk::StackTransitionType::SlideLeftRight); stack.set_transition_duration(260); stack.set_hexpand(true); stack.set_vexpand(true); stack.add_named(&dashboard, Some("dashboard")); stack.add_named(&settings_page, Some("settings")); stack.add_named(&diag_page, Some("diagnostics")); stack.set_visible_child_name("dashboard");
-
-    let brand = gtk::Box::new(Orientation::Vertical, 0); brand.append(&gtk::Label::builder().label("MILMIT").halign(gtk::Align::Start).css_classes(["brand"]).build()); brand.append(&gtk::Label::builder().label("SECURE ROUTER").halign(gtk::Align::Start).css_classes(["brand-sub"]).build());
-    let nav_dash = gtk::Button::with_label("◉   Dashboard"); let nav_settings = gtk::Button::with_label("⚙   Settings"); let nav_diag = gtk::Button::with_label("⌁   Diagnostics");
-    for b in [&nav_dash, &nav_settings, &nav_diag] { b.add_css_class("nav-button"); b.set_halign(gtk::Align::Fill); }
-    nav_dash.add_css_class("nav-active");
-    let sidebar = gtk::Box::new(Orientation::Vertical, 10); sidebar.add_css_class("sidebar"); sidebar.append(&brand); sidebar.append(&gtk::Separator::new(Orientation::Horizontal)); sidebar.append(&nav_dash); sidebar.append(&nav_settings); sidebar.append(&nav_diag);
-    let spacer = gtk::Box::new(Orientation::Vertical, 0); spacer.set_vexpand(true); sidebar.append(&spacer); sidebar.append(&gtk::Label::builder().label("IKEv2 · strongSwan\nIran-ready routing").halign(gtk::Align::Start).css_classes(["tiny"]).build());
-
-    let shell = gtk::Box::new(Orientation::Horizontal, 0); shell.add_css_class("shell"); shell.append(&sidebar); shell.append(&stack);
-    let root = gtk::Box::new(Orientation::Vertical, 0); root.append(&header); root.append(&shell);
-    let window = adw::ApplicationWindow::builder().application(app).title("MilMit Secure · Surfshark IKEv2").default_width(980).default_height(780).content(&root).build();
-
-    {
-        let stack = stack.clone(); let a=nav_dash.clone(); let b=nav_settings.clone(); let c=nav_diag.clone(); nav_dash.connect_clicked(move |_| { stack.set_visible_child_name("dashboard"); a.add_css_class("nav-active"); b.remove_css_class("nav-active"); c.remove_css_class("nav-active"); });
-    }
-    {
-        let stack = stack.clone(); let a=nav_dash.clone(); let b=nav_settings.clone(); let c=nav_diag.clone(); nav_settings.connect_clicked(move |_| { stack.set_visible_child_name("settings"); a.remove_css_class("nav-active"); b.add_css_class("nav-active"); c.remove_css_class("nav-active"); });
-    }
-    {
-        let stack = stack.clone(); let a=nav_dash.clone(); let b=nav_settings.clone(); let c=nav_diag.clone(); nav_diag.connect_clicked(move |_| { stack.set_visible_child_name("diagnostics"); a.remove_css_class("nav-active"); b.remove_css_class("nav-active"); c.add_css_class("nav-active"); });
-    }
-
-    let (tx, rx) = mpsc::channel::<Event>();
-    let status=Rc::new(status); let status_icon=Rc::new(status_icon); let hero_detail=Rc::new(hero_detail); let spinner=Rc::new(spinner); let progress=Rc::new(progress); let orb=Rc::new(orb);
-    let connect=Rc::new(connect); let disconnect=Rc::new(disconnect); let refresh=Rc::new(refresh); let ping_button=Rc::new(ping_button); let buffer=Rc::new(buffer);
-    let public_value=Rc::new(public_value); let down_value=Rc::new(down_value); let up_value=Rc::new(up_value); let ping_value=Rc::new(ping_value); let watchdog_value=Rc::new(watchdog_value); let route_value=Rc::new(route_value); let hotspot_value=Rc::new(hotspot_value);
-    let pass=Rc::new(pass); let user=Rc::new(user); let location=Rc::new(location); let restricted_mode=Rc::new(restricted_mode); let mss=Rc::new(mss); let dns=Rc::new(dns); let hotspot_vpn=Rc::new(hotspot_vpn); let hotspot_iface=Rc::new(hotspot_iface); let hotspot_vpn_macs=Rc::new(hotspot_vpn_macs); let hotspot_direct_macs=Rc::new(hotspot_direct_macs); let recover_network=Rc::new(recover_network); let kill_switch=Rc::new(kill_switch); let routing_mode=Rc::new(routing_mode);
-
-    {
-        let mss=Rc::clone(&mss); let dns=Rc::clone(&dns); let hotspot_vpn=Rc::clone(&hotspot_vpn); let hotspot_iface=Rc::clone(&hotspot_iface); let hotspot_vpn_macs=Rc::clone(&hotspot_vpn_macs); let hotspot_direct_macs=Rc::clone(&hotspot_direct_macs); let recover_network=Rc::clone(&recover_network); let restricted_mode=Rc::clone(&restricted_mode); let kill_switch=Rc::clone(&kill_switch); let routing_mode=Rc::clone(&routing_mode);
-        reset_tuning.connect_clicked(move |_| { mss.set_value(1200.0); dns.set_text(DEFAULT_DNS); hotspot_vpn.set_active(true); hotspot_iface.set_active_id(Some("auto")); hotspot_vpn_macs.set_text(""); hotspot_direct_macs.set_text(""); recover_network.set_active(true); restricted_mode.set_active(true); kill_switch.set_active(true); routing_mode.set_active_id(Some("vpn_all")); });
-    }
-
-    {
-        let status=Rc::clone(&status); let status_icon=Rc::clone(&status_icon); let hero_detail=Rc::clone(&hero_detail); let spinner=Rc::clone(&spinner); let progress=Rc::clone(&progress); let orb=Rc::clone(&orb); let connect=Rc::clone(&connect); let disconnect=Rc::clone(&disconnect); let refresh=Rc::clone(&refresh); let ping_button=Rc::clone(&ping_button); let buffer=Rc::clone(&buffer); let public_value=Rc::clone(&public_value); let down_value=Rc::clone(&down_value); let up_value=Rc::clone(&up_value); let ping_value=Rc::clone(&ping_value); let watchdog_value=Rc::clone(&watchdog_value); let route_value=Rc::clone(&route_value); let hotspot_value=Rc::clone(&hotspot_value); let pass=Rc::clone(&pass); let location=Rc::clone(&location);
-        glib::timeout_add_local(Duration::from_millis(110), move || {
-            if spinner.is_spinning() { progress.pulse(); }
-            down_value.set_label(&fmt_rate(live_value("RX_BPS"))); up_value.set_label(&fmt_rate(live_value("TX_BPS")));
-            let lat=live_value("LATENCY_MS").unwrap_or_else(|| "—".into());
-            let latency_label = if lat == "0" { "— ms".to_string() } else { format!("{lat} ms") };
-            ping_value.set_label(&latency_label);
-            watchdog_value.set_label(&format!("Watchdog · {}", live_value("HEALTH").unwrap_or_else(|| "waiting".into())));
-            route_value.set_label(&format!("Route · {}", state_value("ROUTING_MODE").unwrap_or_else(|| "—".into())));
-            hotspot_value.set_label(&format!("Hotspot · {}", state_value("HOTSPOT_IFACE").unwrap_or_else(|| "off".into())));
-            while let Ok(event)=rx.try_recv() {
-                match event {
-                    Event::Busy(message)=>{ status.set_label(&message); hero_detail.set_label("Negotiating tunnel and policy route…"); status_icon.set_icon_name(Some("network-transmit-receive-symbolic")); spinner.start(); progress.set_visible(true); orb.remove_css_class("orb-connected"); orb.remove_css_class("orb-error"); orb.add_css_class("orb-busy"); connect.set_sensitive(false); disconnect.set_sensitive(false); refresh.set_sensitive(false); }
-                    Event::Log(title,body)=>append_log(&buffer,&title,&body),
-                    Event::Connected(ip,label,hotspot)=>{ spinner.stop(); progress.set_visible(false); status.set_label("Protected"); hero_detail.set_label(&label); status_icon.set_icon_name(Some("network-vpn-symbolic")); public_value.set_label(&ip); hotspot_value.set_label(&format!("Hotspot · {hotspot}")); orb.remove_css_class("orb-busy"); orb.remove_css_class("orb-error"); orb.add_css_class("orb-connected"); connect.set_visible(false); disconnect.set_visible(true); connect.set_sensitive(true); disconnect.set_sensitive(true); refresh.set_sensitive(true); pass.set_text(""); }
-                    Event::Disconnected=>{ spinner.stop(); progress.set_visible(false); status.set_label("Disconnected"); hero_detail.set_label("Network restored · ready to connect"); status_icon.set_icon_name(Some("network-offline-symbolic")); public_value.set_label("—"); orb.remove_css_class("orb-connected"); orb.remove_css_class("orb-busy"); orb.remove_css_class("orb-error"); connect.set_visible(true); disconnect.set_visible(false); connect.set_sensitive(true); disconnect.set_sensitive(true); refresh.set_sensitive(true); }
-                    Event::Failed(message)=>{ spinner.stop(); progress.set_visible(false); status.set_label("Connection failed"); hero_detail.set_label("Backend recovered the network. Check diagnostics."); status_icon.set_icon_name(Some("dialog-warning-symbolic")); orb.remove_css_class("orb-connected"); orb.remove_css_class("orb-busy"); orb.add_css_class("orb-error"); connect.set_visible(true); disconnect.set_visible(false); connect.set_sensitive(true); disconnect.set_sensitive(true); refresh.set_sensitive(true); append_log(&buffer,"ERROR",&message); }
-                    Event::Refreshed(active,text)=>{ spinner.stop(); progress.set_visible(false); status.set_label(if active{"Protected"}else{"Disconnected"}); status_icon.set_icon_name(Some(if active{"network-vpn-symbolic"}else{"network-offline-symbolic"})); if active { orb.add_css_class("orb-connected"); } else { orb.remove_css_class("orb-connected"); } connect.set_visible(!active); disconnect.set_visible(active); connect.set_sensitive(true); disconnect.set_sensitive(true); refresh.set_sensitive(true); append_log(&buffer,"STATUS",&text); }
-                    Event::PingStarted=>{ ping_button.set_sensitive(false); ping_button.set_label("Scanning…"); }
-                    Event::PingResults(results)=>{ ping_button.set_sensitive(true); ping_button.set_label("Scan latency"); repopulate_locations(&location,&results); append_log(&buffer,"LATENCY SCAN",&format!("{} of {} locations replied.",results.iter().filter(|(_,ms)|ms.is_some()).count(),results.len())); }
-                }
-            }
-            glib::ControlFlow::Continue
-        });
-    }
-
-    {
-        let tx=tx.clone(); let user=Rc::clone(&user); let pass=Rc::clone(&pass); let location=Rc::clone(&location); let restricted_mode=Rc::clone(&restricted_mode); let mss=Rc::clone(&mss); let dns=Rc::clone(&dns); let hotspot_vpn=Rc::clone(&hotspot_vpn); let hotspot_iface=Rc::clone(&hotspot_iface); let hotspot_vpn_macs=Rc::clone(&hotspot_vpn_macs); let hotspot_direct_macs=Rc::clone(&hotspot_direct_macs); let recover_network=Rc::clone(&recover_network); let kill_switch=Rc::clone(&kill_switch); let routing_mode=Rc::clone(&routing_mode);
-        connect.connect_clicked(move |_| {
-            let id=location.active_id().map(|s|s.to_string()).unwrap_or_else(||"ee-tll".to_string()); let Some(selected)=by_id(&id) else{return;};
-            let username=user.text().trim().to_string(); let password=pass.text().to_string(); if username.is_empty(){let _=tx.send(Event::Failed("Surfshark service username is required in Settings.".into()));return;}
-            let current=AppSettings{restricted:restricted_mode.is_active(),mss:mss.value_as_int().clamp(900,1400) as u32,dns:if dns.text().trim().is_empty(){DEFAULT_DNS.to_string()}else{dns.text().trim().to_string()},hotspot_vpn:hotspot_vpn.is_active(),hotspot_iface:hotspot_iface.active_id().map(|s|s.to_string()).unwrap_or_else(||"auto".into()),recover_network:recover_network.is_active(),kill_switch:kill_switch.is_active(),routing_mode:routing_mode.active_id().map(|s|s.to_string()).unwrap_or_else(||"vpn_all".into()),hotspot_vpn_macs:normalize_mac_csv(hotspot_vpn_macs.text().as_str()),hotspot_direct_macs:normalize_mac_csv(hotspot_direct_macs.text().as_str())};
-            save_username(&username); save_settings(&current); let tx=tx.clone();
-            thread::spawn(move || { let _=tx.send(Event::Busy(format!("Connecting to {}…",selected.city))); if current.restricted { if nm_active(){let _=nm(&["--wait","5","connection","down",PROFILE]);} let candidates=restricted_candidates(selected.host); let _=tx.send(Event::Log("RESTRICTED ENDPOINTS".into(),format!("{} candidate(s)\nMSS={}\nDNS={}\nRouting={}\nKill switch={}\nHotspot={}\nVPN MACs={}\nDirect MACs={}",candidates.len(),current.mss,current.dns,current.routing_mode,current.kill_switch,current.hotspot_iface,current.hotspot_vpn_macs,current.hotspot_direct_macs))); if candidates.is_empty(){let _=tx.send(Event::Failed("No restricted endpoint exists for this location yet.".into()));return;} for (i,endpoint) in candidates.iter().enumerate(){let _=tx.send(Event::Busy(format!("{} · secure route {}/{}",selected.city,i+1,candidates.len()))); let (ok,log)=restricted_connect(endpoint,&username,&password,&current); let _=tx.send(Event::Log(format!("RESTRICTED ATTEMPT {}/{}",i+1,candidates.len()),log.clone())); if ok {let ip=parse_helper_value(&log,"Public IPv4").unwrap_or_else(||"connected".into()); let country=parse_helper_value(&log,"Exit country").unwrap_or_default(); let hotspot=parse_helper_value(&log,"Device policy").or_else(||parse_helper_value(&log,"Hotspot VPN")).unwrap_or_else(||"default policy".into()); let mode=parse_helper_value(&log,"Routing mode").unwrap_or_else(||current.routing_mode.clone()); let label=if country.is_empty(){format!("{} · {}",selected.label,mode)}else{format!("{} · {} · {}",selected.label,country,mode)}; let _=tx.send(Event::Connected(ip,label,hotspot));return;}} let _=restricted_disconnect(); let _=tx.send(Event::Failed(format!("All {} restricted endpoints failed.",candidates.len())));} else {if restricted_active(){let _=restricted_disconnect();} let pass_opt=if password.is_empty(){None}else{Some(password.as_str())}; let (ok,log)=standard_connect(selected.host,&username,pass_opt); let _=tx.send(Event::Log("NETWORKMANAGER CONNECT".into(),log)); if ok {let _=tx.send(Event::Connected(public_ip().trim().to_string(),selected.label.to_string(),"normal route".into()));} else {let _=tx.send(Event::Failed("NetworkManager IKEv2 activation failed.".into()));}} });
-        });
-    }
-    {
-        let tx=tx.clone(); disconnect.connect_clicked(move |_| { let tx=tx.clone(); thread::spawn(move || {let _=tx.send(Event::Busy("Restoring network…".into())); let mut log=String::new(); if restricted_active()||fs::metadata(RESTRICTED_STATE).is_ok(){log.push_str(&restricted_disconnect());log.push('\n');} if nm_active(){log.push_str(&nm(&["--wait","5","connection","down",PROFILE]));} let _=tx.send(Event::Log("DISCONNECT".into(),log)); let _=tx.send(if any_vpn_active(){Event::Failed("VPN still appears active after cleanup.".into())}else{Event::Disconnected});});});
-    }
-    {
-        let tx=tx.clone(); refresh.connect_clicked(move |_| { let tx=tx.clone(); thread::spawn(move || {let _=tx.send(Event::Busy("Refreshing…".into())); let active=any_vpn_active(); let text=format!("restricted_active={}\nnetworkmanager_active={}\nvirtual_ip={}\npublic_ip={}\nrouting_mode={}\nkill_switch={}\nwatchdog={}\nrx={}\ntx={}\nlatency={}\nhotspot_iface={}\nvpn_device_count={}\ndirect_device_count={}",restricted_active(),nm_active(),state_value("VIRTUAL_IP").unwrap_or_else(||"—".into()),state_value("PUBLIC_IP").unwrap_or_else(||if active{public_ip()}else{"—".into()}),state_value("ROUTING_MODE").unwrap_or_else(||"—".into()),state_value("KILL_SWITCH").unwrap_or_else(||"—".into()),live_value("HEALTH").unwrap_or_else(||"—".into()),live_value("RX_BPS").unwrap_or_else(||"0".into()),live_value("TX_BPS").unwrap_or_else(||"0".into()),live_value("LATENCY_MS").unwrap_or_else(||"0".into()),state_value("HOTSPOT_IFACE").unwrap_or_else(||"—".into()),state_value("HOTSPOT_VPN_MAC_COUNT").unwrap_or_else(||"0".into()),state_value("HOTSPOT_DIRECT_MAC_COUNT").unwrap_or_else(||"0".into())); let _=tx.send(Event::Refreshed(active,text));});});
-    }
-    {
-        let tx=tx.clone(); ping_button.connect_clicked(move |_| {let tx=tx.clone();thread::spawn(move || {let _=tx.send(Event::PingStarted);let _=tx.send(Event::PingResults(scan_latencies()));});});
-    }
-
+    {let tx=tx.clone();let user=user.clone();let pass=pass.clone();let location=location.clone();let mss=mss.clone();let dns=dns.clone();let hotspot=hotspot.clone();let iface=iface.clone();let vpn_macs=vpn_macs.clone();let direct_macs=direct_macs.clone();let recover=recover.clone();let kill=kill.clone();let routing=routing.clone();connect.connect_clicked(move |_|{let id=location.active_id().map(|s|s.to_string()).unwrap_or_else(||"ee-tll".into());let Some(sel)=by_id(&id)else{return};let username=user.text().trim().to_string();if username.is_empty(){let _=tx.send(Event::Failed("Surfshark service username is required under Routing.".into()));return}let password=pass.text().to_string();let s=AppSettings{mss:mss.value_as_int().clamp(900,1400)as u32,dns:if dns.text().trim().is_empty(){DEFAULT_DNS.into()}else{dns.text().trim().into()},hotspot_vpn:hotspot.is_active(),hotspot_iface:if iface.text().trim().is_empty(){"auto".into()}else{iface.text().trim().into()},recover_network:recover.is_active(),kill_switch:kill.is_active(),routing_mode:routing.active_id().map(|v|v.to_string()).unwrap_or_else(||"vpn_all".into()),hotspot_vpn_macs:normalize_mac_csv(vpn_macs.text().as_str()),hotspot_direct_macs:normalize_mac_csv(direct_macs.text().as_str())};save_username(&username);save_settings(&s);let tx=tx.clone();thread::spawn(move||{let candidates=restricted_candidates(sel.host);let _=tx.send(Event::Busy(format!("Connecting to {}…",sel.city)));for (i,ep) in candidates.iter().enumerate(){let _=tx.send(Event::Busy(format!("{} · route {}/{}",sel.city,i+1,candidates.len())));let(ok,log)=restricted_connect(ep,&username,&password,&s);let _=tx.send(Event::Log(format!("RESTRICTED ATTEMPT {}/{}",i+1,candidates.len()),log.clone()));if ok{let ip=parse_colon(&log,"Public IPv4").unwrap_or_else(||"connected".into());let country=parse_colon(&log,"Exit country").unwrap_or_default();let _=tx.send(Event::Connected(ip,format!("{} · {} · {}",sel.label,country,s.routing_mode)));let _=helper(&["save-lkg"]);return}}let _=disconnect();let _=tx.send(Event::Failed(format!("All {} restricted endpoints failed",candidates.len())));});});}
+    {let tx=tx.clone();disconnect_btn.connect_clicked(move |_|{let tx=tx.clone();thread::spawn(move||{let _=tx.send(Event::Busy("Restoring network…".into()));let log=disconnect();let _=tx.send(Event::Log("DISCONNECT".into(),log));let _=tx.send(Event::Disconnected);});});}
+    {let tx=tx.clone();scan.connect_clicked(move |_|{let tx=tx.clone();thread::spawn(move||{let _=tx.send(Event::PingResults(scan_latencies()));});});}
+    {let tx=tx.clone();health_refresh.connect_clicked(move |_|{let tx=tx.clone();thread::spawn(move||{let o=helper(&["health"]);let _=tx.send(Event::Tool("Protection Health".into(),o));});});}
+    for (button,cmd,label) in [(speed,"speed-test","Speed + TTFB"),(dns_test,"dns-test","DNS Evidence"),(mtu,"mtu-test","MTU/MSS Probe"),(save_lkg,"save-lkg","Last Known Good"),(support,"support-bundle","Support Bundle")]{let tx=tx.clone();button.connect_clicked(move |_|{let tx=tx.clone();thread::spawn(move||{let o=helper(&[cmd]);let _=tx.send(Event::Tool(label.into(),o));});});}
+    {let tx=tx.clone();let route_target=route_target.clone();route_test.connect_clicked(move |_|{let t=route_target.text().trim().to_string();if t.is_empty(){return}let tx=tx.clone();thread::spawn(move||{let o=helper(&["route-test",&t]);let _=tx.send(Event::Tool("Route Tester".into(),o));});});}
+    {let tx=tx.clone();recent.connect_clicked(move |_|{let tx=tx.clone();thread::spawn(move||{let o=helper(&["recent-destinations"]);let _=tx.send(Event::Tool("Recent Destinations".into(),o));});});}
+    manage.connect_clicked(move |_|{let _=Command::new("python3").arg("/usr/lib/milmit-surfshark/hotspot-device-manager.py").spawn();});
+    {let tx=tx.clone();emergency.connect_clicked(move |_|{let tx=tx.clone();thread::spawn(move||{let o=helper(&["emergency-stop"]);let _=tx.send(Event::Tool("EMERGENCY STOP".into(),o));let _=tx.send(Event::Disconnected);});});}
+    {let tx=tx.clone();thread::spawn(move||{thread::sleep(Duration::from_millis(450));let o=helper(&["health"]);let _=tx.send(Event::Tool("Protection Health".into(),o));});}
     window.present();
 }
