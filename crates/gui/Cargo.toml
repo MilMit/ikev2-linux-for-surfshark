@@ -5,5 +5,5 @@ edition = "2021"
 
 [dependencies]
 gtk = { package = "gtk4", version = "0.10" }
-adw = { package = "libadwaita", version = "0.8" }
+adw = { package = "libadwaita", version = "0.8", features = ["v1_3"] }
 glib = "0.21"
