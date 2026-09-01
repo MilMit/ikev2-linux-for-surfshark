@@ -26,6 +26,8 @@ XFRM_IF_ID=42
 ROUTE_TABLE=220
 MARK_VPN=0x112
 MARK_DIRECT=0x113
+RULE_ENDPOINT_PREF=100
+RULE_LOCAL_PREF_BASE=101
 RULE_DIRECT_PREF=109
 RULE_VPN_PREF=110
 CHAIN_HOST=MILMIT_VPN_OUT
@@ -39,12 +41,16 @@ CHAIN_MSS=MILMIT_VPN_MSS
 
 ipt_unhook() { local t="$1" b="$2" c="$3"; while iptables -w -t "$t" -D "$b" -j "$c" 2>/dev/null; do :; done; }
 ipt_reset() { local t="$1" c="$2"; iptables -w -t "$t" -N "$c" 2>/dev/null || true; iptables -w -t "$t" -F "$c"; }
-ipt_hook_front() { local t="$1" b="$2" c="$3"; ipt_unhook "$t" "$b" "$c"; iptables -w -t "$t" -I "$b" 1 -j "$c"; }
+cleanup_rules() {
+  while ip rule del pref "$RULE_ENDPOINT_PREF" >/dev/null 2>&1; do :; done
+  for pref in 101 102 103 104 105 106 107 108; do while ip rule del pref "$pref" >/dev/null 2>&1; do :; done; done
+  while ip rule del pref "$RULE_DIRECT_PREF" >/dev/null 2>&1; do :; done
+  while ip rule del pref "$RULE_VPN_PREF" >/dev/null 2>&1; do :; done
+}
 cleanup_policy() {
   ipt_unhook mangle OUTPUT "$CHAIN_HOST"; ipt_unhook mangle OUTPUT "$CHAIN_MSS"; ipt_unhook mangle FORWARD "$CHAIN_MSS"
   for c in "$CHAIN_HOST" "$CHAIN_MSS"; do iptables -w -t mangle -F "$c" 2>/dev/null || true; iptables -w -t mangle -X "$c" 2>/dev/null || true; done
-  while ip rule del pref "$RULE_DIRECT_PREF" fwmark "$MARK_DIRECT" table main >/dev/null 2>&1; do :; done
-  while ip rule del pref "$RULE_VPN_PREF" fwmark "$MARK_VPN" table "$ROUTE_TABLE" >/dev/null 2>&1; do :; done
+  cleanup_rules
   ip route flush table "$ROUTE_TABLE" >/dev/null 2>&1 || true
 }
 
@@ -121,15 +127,12 @@ secrets {
 EOF
 chmod 0600 "$CONF"
 
-LOAD_CONNS="$(swanctl --load-conns 2>&1)"
-printf '%s\n' "$LOAD_CONNS"
-LOAD_CREDS="$(swanctl --load-creds 2>&1)"
-printf '%s\n' "$LOAD_CREDS"
-CONF_DUMP="$(swanctl --list-conns 2>&1 || true)"
-printf '%s\n' "$CONF_DUMP"
-printf '%s\n' "$CONF_DUMP" | grep -Fq "id: $SERVICE_USER" || { echo "Parsed connection is missing IDi." >&2; exit 66; }
-printf '%s\n' "$CONF_DUMP" | grep -Fq "eap_id: $SERVICE_USER" || { echo "Parsed connection is missing EAP identity." >&2; exit 66; }
+LOAD_CONNS="$(swanctl --load-conns 2>&1)"; printf '%s\n' "$LOAD_CONNS"
+LOAD_CREDS="$(swanctl --load-creds 2>&1)"; printf '%s\n' "$LOAD_CREDS"
+CONF_DUMP="$(swanctl --list-conns 2>&1 || true)"; printf '%s\n' "$CONF_DUMP"
 printf '%s\n' "$LOAD_CREDS" | grep -Fq "eap-milmit-surfshark" || { echo "MilMit EAP secret failed to load." >&2; exit 66; }
+printf '%s\n' "$CONF_DUMP" | grep -Fq "id: $SERVICE_USER" || { echo "Parsed connection is missing service ID." >&2; exit 66; }
+printf '%s\n' "$CONF_DUMP" | grep -Fq "eap_id: $SERVICE_USER" || { echo "Parsed connection is missing EAP ID." >&2; exit 66; }
 
 swanctl --initiate --child "$CHILD_NAME"
 SA_TEXT="$(swanctl --list-sas 2>&1 || true)"; printf '%s\n' "$SA_TEXT"
@@ -139,8 +142,23 @@ VIRTUAL_IP="$(printf '%s\n' "$SA_TEXT" | sed -nE 's/.*local .*\[([0-9]+\.[0-9]+\
 IFACE="$(ip -4 route get "$SERVER_IP" | sed -nE 's/.* dev ([^ ]+).*/\1/p' | head -n1)"
 
 ip route replace default dev "$XFRM_IF" src "$VIRTUAL_IP" table "$ROUTE_TABLE"
+cleanup_rules
+# The IKE peer and local/private networks must never recurse into the tunnel.
+ip rule add pref "$RULE_ENDPOINT_PREF" to "$SERVER_IP/32" table main
+pref="$RULE_LOCAL_PREF_BASE"
+for net in 127.0.0.0/8 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16 224.0.0.0/4 255.255.255.255/32; do
+  ip rule add pref "$pref" to "$net" table main
+  pref=$((pref + 1))
+done
 ip rule add pref "$RULE_DIRECT_PREF" fwmark "$MARK_DIRECT" table main
-ip rule add pref "$RULE_VPN_PREF" fwmark "$MARK_VPN" table "$ROUTE_TABLE"
+# For VPN Everything, select table 220 during the initial route lookup so the
+# socket gets the Surfshark virtual source address before mangle/OUTPUT runs.
+# Mark-only routing happens too late for source-address selection on local traffic.
+if [[ "$ROUTING_MODE" == "vpn_all" ]]; then
+  ip rule add pref "$RULE_VPN_PREF" table "$ROUTE_TABLE"
+else
+  ip rule add pref "$RULE_VPN_PREF" fwmark "$MARK_VPN" table "$ROUTE_TABLE"
+fi
 
 ipt_reset mangle "$CHAIN_HOST"
 iptables -w -t mangle -A "$CHAIN_HOST" -d "$SERVER_IP/32" -j RETURN
@@ -149,12 +167,13 @@ for net in 127.0.0.0/8 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16 22
   iptables -w -t mangle -A "$CHAIN_HOST" -d "$net" -j RETURN
 done
 iptables -w -t mangle -A "$CHAIN_HOST" -j MARK --set-mark "$MARK_VPN"
-ipt_hook_front mangle OUTPUT "$CHAIN_HOST"
 
 ipt_reset mangle "$CHAIN_MSS"
 iptables -w -t mangle -A "$CHAIN_MSS" -m mark --mark "$MARK_VPN" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$MSS"
-ipt_hook_front mangle OUTPUT "$CHAIN_MSS"
-ipt_hook_front mangle FORWARD "$CHAIN_MSS"
+# Install MSS first, then host-marking at rule 1 so packets are marked before MSS is evaluated.
+ipt_unhook mangle OUTPUT "$CHAIN_MSS"; iptables -w -t mangle -I OUTPUT 1 -j "$CHAIN_MSS"
+ipt_unhook mangle OUTPUT "$CHAIN_HOST"; iptables -w -t mangle -I OUTPUT 1 -j "$CHAIN_HOST"
+ipt_unhook mangle FORWARD "$CHAIN_MSS"; iptables -w -t mangle -I FORWARD 1 -j "$CHAIN_MSS"
 
 IFS=',' read -r -a DNS_ARR <<< "$DNS_CSV"
 if command -v resolvectl >/dev/null 2>&1 && [[ -n "$IFACE" ]]; then
@@ -163,13 +182,18 @@ if command -v resolvectl >/dev/null 2>&1 && [[ -n "$IFACE" ]]; then
   resolvectl flush-caches || true
 fi
 
-ROUTE_CHECK="$(ip -4 route get 1.1.1.1 mark "$MARK_VPN" 2>&1 || true)"
-printf 'Marked route : %s\n' "$ROUTE_CHECK"
-printf '%s' "$ROUTE_CHECK" | grep -Fq "dev $XFRM_IF" || { echo "Marked route does not select $XFRM_IF" >&2; cleanup_policy; exit 68; }
-TRACE="$(curl -4 --max-time 12 -ks https://1.1.1.1/cdn-cgi/trace || true)"
+ROUTE_CHECK="$(ip -4 route get 1.1.1.1 2>&1 || true)"
+printf 'System route : %s\n' "$ROUTE_CHECK"
+printf '%s' "$ROUTE_CHECK" | grep -Fq "dev $XFRM_IF" || { echo "System route does not select $XFRM_IF" >&2; cleanup_policy; exit 68; }
+printf '%s' "$ROUTE_CHECK" | grep -Fq "src $VIRTUAL_IP" || { echo "System route did not select Surfshark virtual source." >&2; cleanup_policy; exit 68; }
+
+BEFORE_TX="$(cat /sys/class/net/$XFRM_IF/statistics/tx_packets 2>/dev/null || echo 0)"
+TRACE="$(curl -4 --connect-timeout 6 --max-time 15 -ks https://1.1.1.1/cdn-cgi/trace || true)"
+AFTER_TX="$(cat /sys/class/net/$XFRM_IF/statistics/tx_packets 2>/dev/null || echo 0)"
 PUBLIC_IP="$(printf '%s\n' "$TRACE" | sed -n 's/^ip=//p' | head -n1)"
 EXIT_COUNTRY="$(printf '%s\n' "$TRACE" | sed -n 's/^loc=//p' | head -n1)"
-[[ -n "$PUBLIC_IP" ]] || { echo "System data-path verification failed." >&2; cleanup_policy; exit 68; }
+printf 'XFRM packets  : %s -> %s\n' "$BEFORE_TX" "$AFTER_TX"
+[[ -n "$PUBLIC_IP" && "$AFTER_TX" -gt "$BEFORE_TX" ]] || { echo "System data-path verification failed." >&2; cleanup_policy; exit 68; }
 
 install -d -m 0755 "$STATE_DIR"
 cat >"$STATE_FILE" <<EOF
@@ -193,4 +217,11 @@ HOTSPOT_DIRECT_MACS=$HOTSPOT_DIRECT_MACS
 RECOVER_NETWORK=$RECOVER_NETWORK
 EOF
 chmod 0644 "$STATE_FILE"
-printf '\nRestricted Surfshark IKEv2 is established\nServer ID: %s\nVirtual IPv4: %s\nData-path test: OK\nPublic IPv4: %s\nExit country: %s\n' "$SERVER_IDENTITY" "$VIRTUAL_IP" "$PUBLIC_IP" "${EXIT_COUNTRY:-unknown}"
+
+printf '\nRestricted Surfshark IKEv2 is established\n'
+printf 'Server ID     : %s\n' "$SERVER_IDENTITY"
+printf 'Virtual IPv4  : %s\n' "$VIRTUAL_IP"
+printf 'Routing mode  : %s\n' "$ROUTING_MODE"
+printf 'Data-path test: OK\n'
+printf 'Public IPv4   : %s\n' "$PUBLIC_IP"
+printf 'Exit country  : %s\n' "${EXIT_COUNTRY:-unknown}"
