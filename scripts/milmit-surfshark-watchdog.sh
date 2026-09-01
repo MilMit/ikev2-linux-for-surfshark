@@ -12,6 +12,7 @@ RECOVERING="$STATE_DIR/watchdog-recovering"
 CONNECT=/usr/lib/milmit-surfshark/restricted-ikev2-connect.sh
 DISCONNECT=/usr/lib/milmit-surfshark/restricted-ikev2-disconnect.sh
 ROUTER=/usr/lib/milmit-surfshark/router-features.py
+DESKTOP=/usr/lib/milmit-surfshark/desktop-features.py
 CRED_FILE=/etc/milmit-surfshark/credentials
 XFRM_IF=milmitxfrm0
 MARK_VPN=0x112
@@ -57,6 +58,7 @@ UPDATED=$(date +%s)
 EOF
   chmod 0644 "$tmp"; mv -f "$tmp" "$USAGE_FILE"
 }
+apply_lockdown(){ [[ -x "$DESKTOP" ]] && "$DESKTOP" lockdown-apply >/dev/null 2>&1 || true; }
 quick_reconnect(){
   [[ -x "$CONNECT" && -f "$LAST_FILE" && -f "$CRED_FILE" ]] || return 1
   [[ ! -e "$DISCONNECTING" && ! -e "$RECOVERING" && ! -e "$MANUAL_DISCONNECTED" ]] || return 1
@@ -65,21 +67,20 @@ quick_reconnect(){
   endpoint="$(state_get "$LAST_FILE" SERVER_IP)"; mss="$(state_get "$LAST_FILE" MSS_VALUE)"; mss="${mss:-1200}"; dns="$(state_get "$LAST_FILE" DNS_CSV)"; dns="${dns:-162.252.172.57,149.154.159.92}"
   hotspot="$(state_get "$LAST_FILE" HOTSPOT_VPN)"; hotspot="${hotspot:-1}"; recover="$(state_get "$LAST_FILE" RECOVER_NETWORK)"; recover="${recover:-1}"; hotspot_iface="$(state_get "$LAST_FILE" HOTSPOT_IFACE_REQUEST)"; hotspot_iface="${hotspot_iface:-auto}"
   kill="$(state_get "$LAST_FILE" KILL_SWITCH)"; kill="${kill:-1}"; mode="$(state_get "$LAST_FILE" ROUTING_MODE)"; mode="${mode:-vpn_all}"; vpn_macs="$(state_get "$LAST_FILE" HOTSPOT_VPN_MACS)"; direct_macs="$(state_get "$LAST_FILE" HOTSPOT_DIRECT_MACS)"
-  # shellcheck disable=SC1090
   source "$CRED_FILE"; username="${SERVICE_USER:-}"
   if [[ -z "$endpoint" || -z "$username" ]]; then rm -f "$RECOVERING"; return 1; fi
-  "$DISCONNECT" >/var/log/milmit-surfshark-watchdog.log 2>&1 || true; sleep 2
+  MILMIT_DISCONNECT_REASON=watchdog "$DISCONNECT" >/var/log/milmit-surfshark-watchdog.log 2>&1 || true; sleep 2
   "$CONNECT" "$endpoint" "$username" "$mss" "$dns" "$hotspot" "$recover" "$hotspot_iface" "$kill" "$mode" "$vpn_macs" "$direct_macs" </dev/null >>/var/log/milmit-surfshark-watchdog.log 2>&1
-  rc=$?; rm -f "$RECOVERING"; return "$rc"
+  rc=$?; rm -f "$RECOVERING"; apply_lockdown; return "$rc"
 }
 
 prev_rx=0; prev_tx=0; prev_ts=$(date +%s); failures=0; maintenance_tick=0
 while true; do
   sleep 3; now=$(date +%s); maintenance_tick=$((maintenance_tick+1))
-  if [[ -e "$MANUAL_DISCONNECTED" && ! -f "$STATE_FILE" ]]; then failures=0; prev_rx=0; prev_tx=0; prev_ts=$now; usage_reset_session; write_live DISCONNECTED 0 0 0 0 manual-disconnect; continue; fi
+  if [[ -e "$MANUAL_DISCONNECTED" && ! -f "$STATE_FILE" ]]; then failures=0; prev_rx=0; prev_tx=0; prev_ts=$now; usage_reset_session; apply_lockdown; write_live DISCONNECTED 0 0 0 0 manual-disconnect; continue; fi
   if [[ -e "$MANUAL_DISCONNECTED" && -f "$STATE_FILE" && -e "/sys/class/net/$XFRM_IF" ]]; then rm -f "$MANUAL_DISCONNECTED"; fi
-  if [[ ! -f "$STATE_FILE" ]]; then failures=0; prev_rx=0; prev_tx=0; prev_ts=$now; usage_reset_session; write_live DISCONNECTED 0 0 0 0 idle; continue; fi
-  persist_profile
+  if [[ ! -f "$STATE_FILE" ]]; then failures=0; prev_rx=0; prev_tx=0; prev_ts=$now; usage_reset_session; apply_lockdown; write_live DISCONNECTED 0 0 0 0 idle; continue; fi
+  apply_lockdown; persist_profile
   vip="$(state_get "$STATE_FILE" VIRTUAL_IP)"; mark="$(state_get "$STATE_FILE" MARK_VPN)"; mark="${mark:-$MARK_VPN}"
   rx=$(cat "/sys/class/net/$XFRM_IF/statistics/rx_bytes" 2>/dev/null || echo 0); tx=$(cat "/sys/class/net/$XFRM_IF/statistics/tx_bytes" 2>/dev/null || echo 0); dt=$((now-prev_ts)); ((dt>0)) || dt=1
   if ((prev_rx>0 && rx>=prev_rx)); then rx_bps=$(((rx-prev_rx)/dt)); else rx_bps=0; fi
