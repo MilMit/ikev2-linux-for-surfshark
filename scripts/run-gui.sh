@@ -18,7 +18,7 @@ RUNTIME_SHIM="$RUNTIME_SHIM_DIR/pkexec"
 chmod 0755 "$TRAY" 2>/dev/null || true
 
 needs_install=0
-if [[ ! -x "$HELPER" || ! -f "$INSTALLED_CONNECT" || ! -f "$INSTALLED_CONNECT_V2" || ! -f "$INSTALLED_DISCONNECT" || ! -x "$INSTALLED_DEVICE_POLICY" || ! -x "$INSTALLED_DEVICE_MANAGER" || ! -x "$INSTALLED_WATCHDOG" || ! -f "$WATCHDOG_UNIT" ]]; then
+if [[ ! -x "$HELPER" || ! -f "$INSTALLED_CONNECT" || ! -x "$INSTALLED_CONNECT_V2" || ! -f "$INSTALLED_DISCONNECT" || ! -x "$INSTALLED_DEVICE_POLICY" || ! -x "$INSTALLED_DEVICE_MANAGER" || ! -x "$INSTALLED_WATCHDOG" || ! -f "$WATCHDOG_UNIT" ]]; then
   needs_install=1
 elif [[ ! -f "$EXT_DIR/extension.js" || ! -f "$EXT_DIR/metadata.json" ]]; then
   needs_install=1
@@ -56,7 +56,6 @@ if [[ ! -x "$HELPER" ]] \
   || ! cmp -s "$ROOT/scripts/milmit-surfshark-watchdog.sh" "$INSTALLED_WATCHDOG" \
   || ! cmp -s "$ROOT/scripts/milmit-surfshark-helper" "$HELPER"; then
   echo "ERROR: privileged VPN backend/connectors/watchdog/device manager is stale or installation did not complete." >&2
-  echo "Run this launcher again and approve the one-time Ubuntu authorization." >&2
   exit 78
 fi
 
@@ -72,6 +71,7 @@ cat >"$RUNTIME_SHIM" <<'SHIM'
 set -euo pipefail
 REAL_PKEXEC=/usr/bin/pkexec
 HELPER=/usr/libexec/milmit-surfshark-helper
+CONNECT_V2=/usr/lib/milmit-surfshark/restricted-ikev2-connect-v2.sh
 if [[ "${1:-}" == "bash" && -n "${2:-}" ]]; then
   script="${2}"
   case "$script" in
@@ -87,7 +87,8 @@ if [[ "${1:-}" == "bash" && -n "${2:-}" ]]; then
       routing_mode="${11:-vpn_all}"
       hotspot_vpn_macs="${12:-}"
       hotspot_direct_macs="${13:-}"
-      exec "$REAL_PKEXEC" "$HELPER" connect "$endpoint" "$username" "$mss" "$dns_csv" "$hotspot_vpn" "$recover_network" "$hotspot_iface" "$kill_switch" "$routing_mode" "$hotspot_vpn_macs" "$hotspot_direct_macs"
+      echo "MILMIT_BACKEND=v2-direct" >&2
+      exec "$REAL_PKEXEC" /usr/bin/bash "$CONNECT_V2" "$endpoint" "$username" "$mss" "$dns_csv" "$hotspot_vpn" "$recover_network" "$hotspot_iface" "$kill_switch" "$routing_mode" "$hotspot_vpn_macs" "$hotspot_direct_macs"
       ;;
     */scripts/restricted-ikev2-disconnect.sh)
       exec "$REAL_PKEXEC" "$HELPER" disconnect
