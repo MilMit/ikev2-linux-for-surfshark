@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import html, json, pathlib, subprocess
+import html, ipaddress, json, pathlib, subprocess
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 STATE=pathlib.Path('/run/milmit-surfshark/restricted.state')
@@ -21,6 +21,18 @@ def helper(*args):
         return json.loads(p.stdout or '{}')
     except Exception:return {}
 
+def allowed(addr):
+    try: ip=ipaddress.ip_address(addr)
+    except ValueError:return False
+    if ip.is_loopback:return True
+    st=kv(STATE);subnet=st.get('HOTSPOT_SUBNET','')
+    if subnet:
+        try:return ip in ipaddress.ip_network(subnet,strict=False)
+        except ValueError:pass
+    g=helper('guest-status')
+    # NetworkManager guest hotspot normally uses RFC1918 shared addressing; allow only private source while guest is active.
+    return bool(g.get('active') and ip.is_private)
+
 def page():
     st,lv=kv(STATE),kv(LIVE);r=helper('router-status');g=r.get('guest',{});hs=r.get('hotspot',{})
     ip=html.escape(st.get('PUBLIC_IP','—'));country=html.escape(st.get('EXIT_COUNTRY','—'));health=html.escape(lv.get('HEALTH','UNKNOWN'));lat=html.escape(lv.get('LATENCY_MS','0'))
@@ -30,9 +42,11 @@ def page():
 
 class H(BaseHTTPRequestHandler):
     def do_GET(self):
+        if not allowed(self.client_address[0]):
+            self.send_response(403);self.end_headers();return
         if self.path not in ('/','/status'):
             self.send_response(404);self.end_headers();return
-        b=page().encode();self.send_response(200);self.send_header('Content-Type','text/html; charset=utf-8');self.send_header('Cache-Control','no-store');self.send_header('Content-Length',str(len(b)));self.end_headers();self.wfile.write(b)
+        b=page().encode();self.send_response(200);self.send_header('Content-Type','text/html; charset=utf-8');self.send_header('Cache-Control','no-store');self.send_header('X-Content-Type-Options','nosniff');self.send_header('Content-Security-Policy',"default-src 'none'; style-src 'unsafe-inline'");self.send_header('Content-Length',str(len(b)));self.end_headers();self.wfile.write(b)
     def log_message(self,*a):pass
 
 if __name__=='__main__':ThreadingHTTPServer(('0.0.0.0',8787),H).serve_forever()
