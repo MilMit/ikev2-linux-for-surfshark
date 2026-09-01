@@ -52,7 +52,6 @@ cleanup_rules() {
   for pref in 101 102 103 104 105 106 107 108; do while ip rule del pref "$pref" >/dev/null 2>&1; do :; done; done
   while ip rule del pref "$RULE_DIRECT_PREF" >/dev/null 2>&1; do :; done
   while ip rule del pref "$RULE_VPN_PREF" >/dev/null 2>&1; do :; done
-  # Remove stale v2/v1 leftovers that used the table number as a preference.
   while ip rule del pref 220 >/dev/null 2>&1; do :; done
 }
 cleanup_policy() {
@@ -72,7 +71,7 @@ detect_hotspot_iface() {
     return
   fi
   command -v nmcli >/dev/null 2>&1 || return 0
-  local d conn method
+  local d conn method state
   while IFS=: read -r d state; do
     [[ "$state" == connected && -n "$d" ]] || continue
     conn="$(nmcli -g GENERAL.CONNECTION device show "$d" 2>/dev/null | head -n1)"
@@ -197,12 +196,12 @@ ip rule add pref "$RULE_ENDPOINT_PREF" to "$SERVER_IP/32" table main
 pref="$RULE_LOCAL_PREF_BASE"
 for net in 127.0.0.0/8 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16 224.0.0.0/4 255.255.255.255/32; do ip rule add pref "$pref" to "$net" table main; pref=$((pref+1)); done
 ip rule add pref "$RULE_DIRECT_PREF" fwmark "$MARK_DIRECT" table main
-# table 220 contains the VPN default and, in Iran Direct mode, physical routes for Iran prefixes.
 ip rule add pref "$RULE_VPN_PREF" table "$ROUTE_TABLE"
 
 ipt_reset mangle "$CHAIN_HOST"
-# Respect a higher-priority mark from the advanced policy engine.
-iptables -w -t mangle -A "$CHAIN_HOST" ! -m mark --mark 0 -j RETURN
+# Respect marks set by the higher-priority policy engine. On iptables-nft the
+# negation belongs to the --mark option, not before -m.
+iptables -w -t mangle -A "$CHAIN_HOST" -m mark ! --mark 0 -j RETURN
 iptables -w -t mangle -A "$CHAIN_HOST" -d "$SERVER_IP/32" -j RETURN
 for net in 127.0.0.0/8 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16 224.0.0.0/4 255.255.255.255/32; do
   iptables -w -t mangle -A "$CHAIN_HOST" -d "$net" -j MARK --set-mark "$MARK_DIRECT"; iptables -w -t mangle -A "$CHAIN_HOST" -d "$net" -j RETURN
@@ -229,17 +228,15 @@ PUBLIC_IP="$(sed -n 's/^ip=//p' <<< "$TRACE" | head -n1)"; EXIT_COUNTRY="$(sed -
 printf 'XFRM packets  : %s -> %s\n' "$BEFORE_TX" "$AFTER_TX"
 [[ -n "$PUBLIC_IP" && "$AFTER_TX" -gt "$BEFORE_TX" ]] || { echo "System data-path verification failed." >&2; cleanup_policy; exit 68; }
 
-HOTSPOT_IFACE="$(detect_hotspot_iface || true)"
-HOTSPOT_SUBNET=""; HOTSPOT_DNS="${DNS_ARR[0]:-162.252.172.57}"
-if [[ -n "$HOTSPOT_IFACE" ]]; then HOTSPOT_SUBNET="$(network_of_iface "$HOTSPOT_IFACE" || true)"; fi
-sysctl -q -w net.ipv4.ip_forward=1 || true
+HOTSPOT_IFACE="$(detect_hotspot_iface)"
+HOTSPOT_SUBNET=""
+HOTSPOT_DNS="${DNS_ARR[0]:-162.252.172.57}"
+if [[ -n "$HOTSPOT_IFACE" ]]; then HOTSPOT_SUBNET="$(network_of_iface "$HOTSPOT_IFACE")"; fi
 
 install -d -m 0755 "$STATE_DIR"
 cat >"$STATE_FILE" <<EOF
 VIRTUAL_IP=$VIRTUAL_IP
 IFACE=$IFACE
-PHYS_SRC=$PHYS_SRC
-PHYS_GW=$PHYS_GW
 MSS_VALUE=$MSS
 DNS_CSV=$DNS_CSV
 SERVER_IP=$SERVER_IP
@@ -263,34 +260,18 @@ RECOVER_NETWORK=$RECOVER_NETWORK
 EOF
 chmod 0644 "$STATE_FILE"
 
-# Restore the proven hotspot forwarding/NAT/DNS path after the v2 tunnel exists.
-HOTSPOT_STATUS="off"
 if [[ -n "$HOTSPOT_IFACE" && -n "$HOTSPOT_SUBNET" && -x "$HOTSPOT_POLICY" ]]; then
-  if "$HOTSPOT_POLICY" "$HOTSPOT_VPN" "$HOTSPOT_VPN_MACS" "$HOTSPOT_DIRECT_MACS"; then HOTSPOT_STATUS="$HOTSPOT_IFACE ($HOTSPOT_SUBNET)"; else HOTSPOT_STATUS="detected-but-policy-failed"; fi
-fi
-
-# Actual leak protection. Physical Internet is allowed only for IKE, local/private,
-# explicitly Direct-marked traffic, and Iran prefixes when Iran Direct is enabled.
-ipt_reset filter "$CHAIN_KILL"
-iptables -w -t filter -A "$CHAIN_KILL" -d "$SERVER_IP/32" -j RETURN
-for net in 127.0.0.0/8 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16 224.0.0.0/4; do iptables -w -t filter -A "$CHAIN_KILL" -d "$net" -j RETURN; done
-iptables -w -t filter -A "$CHAIN_KILL" -m mark --mark "$MARK_DIRECT" -j RETURN
-if [[ "$ROUTING_MODE" == iran_direct && "$IRAN_READY" == 1 ]]; then iptables -w -t filter -A "$CHAIN_KILL" -m set --match-set "$IRAN_SET" dst -j RETURN; fi
-iptables -w -t filter -A "$CHAIN_KILL" -o "$XFRM_IF" -j RETURN
-iptables -w -t filter -A "$CHAIN_KILL" -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN
-if [[ "$KILL_SWITCH" == 1 ]]; then
-  iptables -w -t filter -A "$CHAIN_KILL" -j REJECT --reject-with icmp-net-unreachable
-  ipt_unhook filter OUTPUT "$CHAIN_KILL"; iptables -w -t filter -I OUTPUT 1 -j "$CHAIN_KILL"
-  ipt_unhook filter FORWARD "$CHAIN_KILL"; iptables -w -t filter -I FORWARD 1 -j "$CHAIN_KILL"
+  sysctl -qw net.ipv4.ip_forward=1 || true
+  "$HOTSPOT_POLICY" "$HOTSPOT_VPN" "$HOTSPOT_VPN_MACS" "$HOTSPOT_DIRECT_MACS" || {
+    echo "Hotspot policy could not be applied; system VPN remains connected." >&2
+  }
 fi
 
 printf '\nRestricted Surfshark IKEv2 is established\n'
 printf 'Server ID     : %s\n' "$SERVER_IDENTITY"
 printf 'Virtual IPv4  : %s\n' "$VIRTUAL_IP"
 printf 'Routing mode  : %s\n' "$ROUTING_MODE"
-printf 'Iran Direct   : %s\n' "$([[ "$IRAN_READY" == 1 ]] && echo ready || echo inactive)"
-printf 'Hotspot VPN   : %s\n' "$HOTSPOT_STATUS"
-printf 'Kill switch   : %s\n' "$([[ "$KILL_SWITCH" == 1 ]] && echo active || echo off)"
 printf 'Data-path test: OK\n'
 printf 'Public IPv4   : %s\n' "$PUBLIC_IP"
 printf 'Exit country  : %s\n' "${EXIT_COUNTRY:-unknown}"
+if [[ -n "$HOTSPOT_IFACE" ]]; then printf 'Hotspot iface  : %s\n' "$HOTSPOT_IFACE"; fi
