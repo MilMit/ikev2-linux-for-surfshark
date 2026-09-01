@@ -71,16 +71,12 @@ fn ping_once(target: &str) -> Result<Option<u32>, String> {
 }
 
 #[tauri::command]
-fn ping_location(host:String)->Result<Option<u32>,String>{
+async fn ping_location(host:String)->Result<Option<u32>,String>{
     if !valid_host(&host){return Err("invalid location hostname".into())}
-    ping_once(&ping_target(&host))
+    tauri::async_runtime::spawn_blocking(move || ping_once(&ping_target(&host))).await.map_err(|e|e.to_string())?
 }
 
-// A single IPC call handles many location pings, with a small fixed worker
-// width. This avoids launching 100+ concurrent Tauri invokes and keeps the UI
-// responsive while country/header latency is populated in the background.
-#[tauri::command]
-fn ping_locations_batch(items: Vec<PingRequest>) -> Result<Vec<PingResult>, String> {
+fn ping_batch_blocking(items: Vec<PingRequest>) -> Result<Vec<PingResult>, String> {
     if items.len() > 256 { return Err("too many ping targets".into()); }
     if items.iter().any(|x| x.id.len() > 64 || !valid_host(&x.host)) { return Err("invalid ping target".into()); }
     let mut out = Vec::with_capacity(items.len());
@@ -93,14 +89,18 @@ fn ping_locations_batch(items: Vec<PingRequest>) -> Result<Vec<PingResult>, Stri
     Ok(out)
 }
 
+#[tauri::command]
+async fn ping_locations_batch(items: Vec<PingRequest>) -> Result<Vec<PingResult>, String> {
+    tauri::async_runtime::spawn_blocking(move || ping_batch_blocking(items)).await.map_err(|e|e.to_string())?
+}
+
 fn helper_output(action:&str,args:&[&str])->Result<String,String>{
     let output=Command::new("pkexec").arg(HELPER).arg(action).args(args).output().map_err(|e|e.to_string())?;
     let mut text=String::from_utf8_lossy(&output.stdout).to_string(); text.push_str(&String::from_utf8_lossy(&output.stderr));
     if output.status.success(){Ok(text)}else{Err(text)}
 }
 
-#[tauri::command]
-fn connect_location(id:String)->Result<String,String>{
+fn connect_location_blocking(id:String)->Result<String,String>{
     let loc=parse_locations().into_iter().find(|x|x.id==id).ok_or_else(||"unknown location".to_string())?;
     let mut candidates=Vec::<String>::new();
     if loc.host=="ee-tll.prod.surfshark.com"{candidates.push("185.174.159.123".into());}
@@ -110,9 +110,6 @@ fn connect_location(id:String)->Result<String,String>{
     for ip in candidates {
         match helper_output("connect-saved", &[&ip,&loc.host]) {
             Ok(text)=>{
-                // Verify the connector actually committed the requested server identity.
-                // This prevents the UI from claiming Germany/Tallinn/etc. while a stale
-                // quick-connect profile is active underneath.
                 let mut matched = false;
                 for _ in 0..8 {
                     if state_value(STATE,"SERVER_IDENTITY").as_deref() == Some(loc.host.as_str()) { matched = true; break; }
@@ -130,6 +127,11 @@ fn connect_location(id:String)->Result<String,String>{
     Err(format!("All direct-IP candidates failed for {}.{}",loc.city,failures))
 }
 
+#[tauri::command]
+async fn connect_location(id:String)->Result<String,String>{
+    tauri::async_runtime::spawn_blocking(move || connect_location_blocking(id)).await.map_err(|e|e.to_string())?
+}
+
 fn state_value(path:&str,key:&str)->Option<String>{
     fs::read_to_string(path).ok()?.lines().find_map(|l|{let(k,v)=l.split_once('=')?;(k==key).then(||v.trim().to_string())})
 }
@@ -142,13 +144,15 @@ fn connection_state()->ConnectionState{
 }
 
 #[tauri::command]
-fn ping_report(kind:String,host:Option<String>)->Result<String,String>{
-    let target=match kind.as_str(){"internet"=>"1.1.1.1".to_string(),"location"|"vpn"=>{let h=host.ok_or_else(||"location hostname required".to_string())?;ping_target(&h)},_=>return Err("invalid ping report kind".into())};
-    let output=Command::new("ping").args(["-n","-c","8","-W","2",&target]).output().map_err(|e|e.to_string())?;
-    let mut raw=String::from_utf8_lossy(&output.stdout).to_string();raw.push_str(&String::from_utf8_lossy(&output.stderr));
-    let loss=raw.lines().find(|l|l.contains("packet loss")).unwrap_or("Packet loss unavailable");
-    let stats=raw.lines().find(|l|l.contains("min/avg/max")||l.contains("round-trip")).unwrap_or("RTT/jitter unavailable");
-    Ok(format!("Target: {target}\n{loss}\n{stats}\n\n{raw}"))
+async fn ping_report(kind:String,host:Option<String>)->Result<String,String>{
+    tauri::async_runtime::spawn_blocking(move || {
+        let target=match kind.as_str(){"internet"=>"1.1.1.1".to_string(),"location"|"vpn"=>{let h=host.ok_or_else(||"location hostname required".to_string())?;ping_target(&h)},_=>return Err("invalid ping report kind".into())};
+        let output=Command::new("ping").args(["-n","-c","8","-W","2",&target]).output().map_err(|e|e.to_string())?;
+        let mut raw=String::from_utf8_lossy(&output.stdout).to_string();raw.push_str(&String::from_utf8_lossy(&output.stderr));
+        let loss=raw.lines().find(|l|l.contains("packet loss")).unwrap_or("Packet loss unavailable");
+        let stats=raw.lines().find(|l|l.contains("min/avg/max")||l.contains("round-trip")).unwrap_or("RTT/jitter unavailable");
+        Ok(format!("Target: {target}\n{loss}\n{stats}\n\n{raw}"))
+    }).await.map_err(|e|e.to_string())?
 }
 
 #[tauri::command]
