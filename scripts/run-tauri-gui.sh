@@ -22,10 +22,6 @@ missing_modules=(); for module in webkit2gtk-4.1 libsoup-3.0 javascriptcoregtk-4
 if ((${#missing_modules[@]})); then echo "ERROR: pkg-config still cannot find: ${missing_modules[*]}" >&2; echo "PKG_CONFIG_PATH=${PKG_CONFIG_PATH:-<unset>}" >&2; exit 1; fi
 echo "Tauri native dependencies detected:"; pkg-config --modversion webkit2gtk-4.1 libsoup-3.0 javascriptcoregtk-4.1
 
-# Keep the root-owned helper/backend synchronized with the checkout. This is
-# needed when a UI feature introduces a new fixed helper action. Use bash as
-# the pkexec target so the installer does not need its executable bit set in
-# the checkout (which can otherwise surface as a misleading auth failure).
 SOURCE_HELPER="$ROOT/scripts/milmit-surfshark-helper"
 INSTALLED_HELPER="/usr/libexec/milmit-surfshark-helper"
 if [[ ! -f "$INSTALLED_HELPER" ]] || ! cmp -s "$SOURCE_HELPER" "$INSTALLED_HELPER"; then
@@ -33,21 +29,18 @@ if [[ ! -f "$INSTALLED_HELPER" ]] || ! cmp -s "$SOURCE_HELPER" "$INSTALLED_HELPE
   pkexec /bin/bash "$ROOT/scripts/install-privileged-helper.sh"
 fi
 
-ICON="$TAURI_DIR/icons/icon.png"
-if [[ ! -f "$ICON" ]]; then
-  echo "Generating temporary Tauri development icon..."
-  command -v python3 >/dev/null 2>&1 || { sudo apt-get update; sudo apt-get install -y python3; }
-  mkdir -p "$(dirname "$ICON")"
-  ICON_PATH="$ICON" python3 - <<'PY'
-import os, struct, zlib, binascii
-path=os.environ['ICON_PATH'];w=h=32;raw=bytearray()
-for y in range(h):
-    raw.append(0)
-    for x in range(w): raw.extend((46,125,95,255) if 6<=x<26 and 5<=y<27 else (25,46,69,255))
-def chunk(k,d): return struct.pack('>I',len(d))+k+d+struct.pack('>I',binascii.crc32(k+d)&0xffffffff)
-png=b'\x89PNG\r\n\x1a\n'+chunk(b'IHDR',struct.pack('>IIBBBBB',w,h,8,6,0,0,0))+chunk(b'IDAT',zlib.compress(bytes(raw),9))+chunk(b'IEND',b'')
-open(path,'wb').write(png)
-PY
+# Build the branded Tauri icon from the tracked SVG source. The previous tiny
+# generated development tile is replaced automatically when this source is newer.
+ICON_SVG="$TAURI_DIR/icons/icon.svg"
+ICON_PNG="$TAURI_DIR/icons/icon.png"
+if [[ -f "$ICON_SVG" && ( ! -f "$ICON_PNG" || "$ICON_SVG" -nt "$ICON_PNG" ) ]]; then
+  if ! command -v rsvg-convert >/dev/null 2>&1; then
+    echo "Installing SVG icon renderer once..."
+    sudo apt-get update
+    sudo apt-get install -y librsvg2-bin
+  fi
+  echo "Rendering MilMit Secure application icon..."
+  rsvg-convert -w 512 -h 512 "$ICON_SVG" -o "$ICON_PNG"
 fi
 
 [ -d node_modules ] || npm install
