@@ -46,8 +46,10 @@ def setup_direct_ns():
     netns_dir=pathlib.Path('/etc/netns')/NS;netns_dir.mkdir(parents=True,exist_ok=True)
     try:(netns_dir/'resolv.conf').write_text(pathlib.Path('/etc/resolv.conf').read_text())
     except Exception:(netns_dir/'resolv.conf').write_text('nameserver 1.1.1.1\n')
-    run(['iptables','-w','-t','mangle','-C','PREROUTING','-s',NS_ADDR+'/32','-j','MARK','--set-mark','0x113']) or run(['iptables','-w','-t','mangle','-I','PREROUTING','1','-s',NS_ADDR+'/32','-j','MARK','--set-mark','0x113'])
-    run(['iptables','-w','-t','nat','-C','POSTROUTING','-s',SUBNET,'-o',ifc,'-j','MASQUERADE']) or run(['iptables','-w','-t','nat','-A','POSTROUTING','-s',SUBNET,'-o',ifc,'-j','MASQUERADE'])
+    rc,_=run(['iptables','-w','-t','mangle','-C','PREROUTING','-s',NS_ADDR+'/32','-j','MARK','--set-mark','0x113'])
+    if rc:run(['iptables','-w','-t','mangle','-I','PREROUTING','1','-s',NS_ADDR+'/32','-j','MARK','--set-mark','0x113'])
+    rc,_=run(['iptables','-w','-t','nat','-C','POSTROUTING','-s',SUBNET,'-o',ifc,'-j','MASQUERADE'])
+    if rc:run(['iptables','-w','-t','nat','-A','POSTROUTING','-s',SUBNET,'-o',ifc,'-j','MASQUERADE'])
     chain('filter',CHAIN);run(['iptables','-w','-t','filter','-A',CHAIN,'-s',SUBNET,'-j','ACCEPT']);run(['iptables','-w','-t','filter','-A',CHAIN,'-d',SUBNET,'-m','conntrack','--ctstate','ESTABLISHED,RELATED','-j','ACCEPT']);unhook('filter','FORWARD',CHAIN);run(['iptables','-w','-t','filter','-I','FORWARD','1','-j',CHAIN]);return ifc
 def desktop_paths(uid):
     import pwd;home=pathlib.Path(pwd.getpwuid(uid).pw_dir);return [home/'.local/share/applications',pathlib.Path('/usr/local/share/applications'),pathlib.Path('/usr/share/applications')]
@@ -81,11 +83,7 @@ def apply_lockdown(enabled=None):
     enabled=bool(d.get('lockdown'));unhook('filter','OUTPUT',LOCK);run(['iptables','-w','-t','filter','-F',LOCK]);run(['iptables','-w','-t','filter','-X',LOCK])
     if not enabled:return {'ok':True,'lockdown':False}
     if pathlib.Path('/sys/class/net/milmitxfrm0').exists() and STATE.exists():return {'ok':True,'lockdown':True,'active_block':False}
-    chain('filter',LOCK);run(['iptables','-w','-t','filter','-A',LOCK,'-o','lo','-j','RETURN']);run(['iptables','-w','-t','filter','-A',LOCK,'-m','conntrack','--ctstate','ESTABLISHED,RELATED','-j','RETURN'])
-    # During reconnect the VPN policy engine marks protected traffic 0x112 before
-    # this chain. Let that traffic pass so Lockdown never prevents the VPN from
-    # completing its own data-path verification.
-    run(['iptables','-w','-t','filter','-A',LOCK,'-m','mark','--mark','0x112','-j','RETURN'])
+    chain('filter',LOCK);run(['iptables','-w','-t','filter','-A',LOCK,'-o','lo','-j','RETURN']);run(['iptables','-w','-t','filter','-A',LOCK,'-m','conntrack','--ctstate','ESTABLISHED,RELATED','-j','RETURN']);run(['iptables','-w','-t','filter','-A',LOCK,'-m','mark','--mark','0x112','-j','RETURN'])
     for net in ('10.0.0.0/8','172.16.0.0/12','192.168.0.0/16','169.254.0.0/16'):run(['iptables','-w','-t','filter','-A',LOCK,'-d',net,'-j','RETURN'])
     run(['iptables','-w','-t','filter','-A',LOCK,'-p','udp','--sport','68','--dport','67','-j','RETURN']);endpoint=kv(LAST).get('SERVER_IP','')
     if re.fullmatch(r'(?:\d{1,3}\.){3}\d{1,3}',endpoint):
