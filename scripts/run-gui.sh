@@ -22,6 +22,8 @@ EXT_DIR="/usr/share/gnome-shell/extensions/$EXT_UUID"
 TRAY="$ROOT/scripts/tray-indicator.py"
 RUNTIME_SHIM_DIR="${XDG_RUNTIME_DIR:-/tmp}/milmit-surfshark-$UID"
 RUNTIME_SHIM="$RUNTIME_SHIM_DIR/pkexec"
+GUI_SOURCE="$ROOT/crates/gui/src/main.rs"
+GUI_STAMP="$RUNTIME_SHIM_DIR/gui-source.sha256"
 chmod 0755 "$TRAY" 2>/dev/null || true
 
 needs_install=0
@@ -38,7 +40,7 @@ if [[ "$needs_install" == 1 ]]; then
   echo "VPN/full router protection stack update: Ubuntu may ask for your password once."
   /usr/bin/pkexec /usr/bin/bash "$ROOT/scripts/install-privileged-helper.sh"
 fi
-for spec in "$HELPER:$ROOT/scripts/milmit-surfshark-helper" "$INSTALLED_CONNECT_V2:$ROOT/scripts/restricted-ikev2-connect-v2.sh" "$INSTALLED_ROUTER:$ROOT/scripts/router-features.py" "$INSTALLED_ADV:$ROOT/scripts/advanced-router.py" "$INSTALLED_RULES:$ROOT/scripts/rules-update.py" "$INSTALLED_PORTAL:$ROOT/scripts/status-portal.py"; do
+for spec in "$HELPER:$ROOT/scripts/milmit-surfshark-helper" "$INSTALLED_CONNECT_V2:$ROOT/scripts/restricted-ikev2-connect-v2.sh" "$INSTALLED_DISCONNECT:$ROOT/scripts/restricted-ikev2-disconnect.sh" "$INSTALLED_WATCHDOG:$ROOT/scripts/milmit-surfshark-watchdog.sh" "$INSTALLED_ROUTER:$ROOT/scripts/router-features.py" "$INSTALLED_ADV:$ROOT/scripts/advanced-router.py" "$INSTALLED_RULES:$ROOT/scripts/rules-update.py" "$INSTALLED_PORTAL:$ROOT/scripts/status-portal.py"; do
   installed="${spec%%:*}"; source="${spec#*:}"
   if [[ ! -x "$installed" ]] || ! cmp -s "$source" "$installed"; then echo "ERROR: privileged router stack is stale or installation did not complete: $installed" >&2; exit 78; fi
 done
@@ -66,9 +68,28 @@ fi
 exec "$REAL_PKEXEC" "$@"
 SHIM
 chmod 0755 "$RUNTIME_SHIM"
+
 extension_enabled=0
 if command -v gnome-extensions >/dev/null 2>&1; then gnome-extensions enable "$EXT_UUID" >/dev/null 2>&1 || true; if gnome-extensions list --enabled 2>/dev/null | grep -Fxq "$EXT_UUID"; then extension_enabled=1; fi; fi
 if [[ "$extension_enabled" == 0 ]] && command -v python3 >/dev/null 2>&1; then nohup python3 "$TRAY" >/tmp/milmit-surfshark-indicator.log 2>&1 & fi
+
+# GTK applications are single-instance by application ID. Previously an older
+# process could stay alive after git pull, so cargo run merely activated the old
+# window and made new UI work look missing. Always retire our previous dev GUI.
+old_pids="$(pgrep -u "$UID" -f 'target/(debug|release)/surfshark-ikev2-gui' 2>/dev/null || true)"
+if [[ -n "$old_pids" ]]; then
+  echo "Closing previously running MilMit GUI so the current source is shown."
+  while read -r pid; do [[ -n "$pid" && "$pid" != "$$" ]] && kill "$pid" 2>/dev/null || true; done <<< "$old_pids"
+  sleep 0.35
+fi
+
+current_gui_hash="$(sha256sum "$GUI_SOURCE" | awk '{print $1}')"
+previous_gui_hash="$(cat "$GUI_STAMP" 2>/dev/null || true)"
+if [[ "$current_gui_hash" != "$previous_gui_hash" ]]; then
+  echo "GUI source changed: Cargo will rebuild the current UI (no stale window will be reused)."
+  printf '%s\n' "$current_gui_hash" > "$GUI_STAMP"
+fi
+
 export PATH="$RUNTIME_SHIM_DIR:$PATH"
 cd "$ROOT"
 exec cargo run -p surfshark-ikev2-gui
