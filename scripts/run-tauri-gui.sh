@@ -3,6 +3,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 APP="$ROOT/apps/desktop"
+TAURI_DIR="$APP/src-tauri"
 cd "$APP"
 
 if ! command -v npm >/dev/null 2>&1; then
@@ -72,6 +73,45 @@ fi
 
 echo "Tauri native dependencies detected:"
 pkg-config --modversion webkit2gtk-4.1 libsoup-3.0 javascriptcoregtk-4.1
+
+# tauri::generate_context! expects a default application icon at
+# src-tauri/icons/icon.png even when bundling is disabled. Generate a tiny
+# valid RGBA PNG for development if the real branded icon is not present yet.
+ICON="$TAURI_DIR/icons/icon.png"
+if [[ ! -f "$ICON" ]]; then
+  echo "Generating temporary Tauri development icon..."
+  if ! command -v python3 >/dev/null 2>&1; then
+    sudo apt-get update
+    sudo apt-get install -y python3
+  fi
+  mkdir -p "$(dirname "$ICON")"
+  ICON_PATH="$ICON" python3 - <<'PY'
+import os, struct, zlib, binascii
+path = os.environ["ICON_PATH"]
+w = h = 32
+raw = bytearray()
+for y in range(h):
+    raw.append(0)
+    for x in range(w):
+        # simple MilMit development mark: navy background + green center tile
+        if 6 <= x < 26 and 5 <= y < 27:
+            rgba = (46, 125, 95, 255)
+        else:
+            rgba = (25, 46, 69, 255)
+        raw.extend(rgba)
+
+def chunk(kind, data):
+    return (struct.pack(">I", len(data)) + kind + data +
+            struct.pack(">I", binascii.crc32(kind + data) & 0xffffffff))
+
+png = (b"\x89PNG\r\n\x1a\n" +
+       chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 6, 0, 0, 0)) +
+       chunk(b"IDAT", zlib.compress(bytes(raw), 9)) +
+       chunk(b"IEND", b""))
+with open(path, "wb") as f:
+    f.write(png)
+PY
+fi
 
 if [ ! -d node_modules ]; then
   npm install
