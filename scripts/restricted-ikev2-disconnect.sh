@@ -2,7 +2,9 @@
 set -euo pipefail
 
 CONN_NAME=milmit-surfshark-restricted
-STATE_FILE=/run/milmit-surfshark/restricted.state
+STATE_DIR=/run/milmit-surfshark
+STATE_FILE=$STATE_DIR/restricted.state
+DISCONNECTING=$STATE_DIR/disconnecting
 NM_MARKER="Surfshark IKEv2 (Connected)"
 XFRM_IF=milmitxfrm0
 ROUTE_TABLE=220
@@ -19,6 +21,9 @@ CHAIN_MSS=MILMIT_VPN_MSS
 CHAIN_KILL=MILMIT_VPN_KILL
 
 [[ $EUID -eq 0 ]] || { echo "This helper must run as root." >&2; exit 77; }
+mkdir -p "$STATE_DIR"
+touch "$DISCONNECTING"
+trap 'rm -f "$DISCONNECTING"' EXIT
 
 state_get() {
   [[ -f "$STATE_FILE" ]] || return 0
@@ -48,7 +53,6 @@ remove_chains() {
 
 VIRTUAL_IP="$(state_get VIRTUAL_IP)"
 IFACE="$(state_get IFACE)"
-HOTSPOT_IFACE="$(state_get HOTSPOT_IFACE)"
 HOTSPOT_SUBNET="$(state_get HOTSPOT_SUBNET)"
 RECOVER_NETWORK="$(state_get RECOVER_NETWORK)"
 
@@ -93,5 +97,5 @@ if command -v nmcli >/dev/null 2>&1; then
   fi
 fi
 
-rm -f "$STATE_FILE"
-echo "Restricted Surfshark IKEv2 disconnected. Per-device hotspot policy, fwmark/IPSet rules, kill switch, XFRM interface, NAT/DNS and physical-link state were restored."
+rm -f "$STATE_FILE" "$STATE_DIR/live.state"
+echo "Restricted Surfshark IKEv2 disconnected. Watchdog paused, per-device hotspot policy, fwmark/IPSet rules, kill switch, XFRM interface, NAT/DNS and physical-link state were restored."
