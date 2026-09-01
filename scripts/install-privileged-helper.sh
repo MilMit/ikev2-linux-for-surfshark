@@ -11,32 +11,40 @@ if command -v apt-get >/dev/null 2>&1; then
   command -v ipset >/dev/null 2>&1 || missing+=(ipset)
   command -v tc >/dev/null 2>&1 || missing+=(iproute2)
   command -v conntrack >/dev/null 2>&1 || missing+=(conntrack)
+  command -v qrencode >/dev/null 2>&1 || missing+=(qrencode)
   if ((${#missing[@]})); then DEBIAN_FRONTEND=noninteractive apt-get install -y "${missing[@]}" >/dev/null 2>&1 || true; fi
 fi
 
-install -d -m 0755 /usr/lib/milmit-surfshark /usr/libexec /usr/share/polkit-1/actions "$EXT_DIR" /var/lib/milmit-surfshark
-install -o root -g root -m 0755 "$ROOT/scripts/restricted-ikev2-connect.sh" /usr/lib/milmit-surfshark/restricted-ikev2-connect.sh
-install -o root -g root -m 0755 "$ROOT/scripts/restricted-ikev2-connect-v2.sh" /usr/lib/milmit-surfshark/restricted-ikev2-connect-v2.sh
-install -o root -g root -m 0755 "$ROOT/scripts/restricted-ikev2-disconnect.sh" /usr/lib/milmit-surfshark/restricted-ikev2-disconnect.sh
-install -o root -g root -m 0755 "$ROOT/scripts/hotspot-device-policy.sh" /usr/lib/milmit-surfshark/hotspot-device-policy.sh
+install -d -m 0755 /usr/lib/milmit-surfshark /usr/libexec /usr/share/polkit-1/actions "$EXT_DIR" /var/lib/milmit-surfshark /var/lib/milmit-surfshark/rules
+for f in restricted-ikev2-connect.sh restricted-ikev2-connect-v2.sh restricted-ikev2-disconnect.sh hotspot-device-policy.sh milmit-surfshark-watchdog.sh control-center.py router-features.py advanced-router.py rules-update.py status-portal.py; do
+  install -o root -g root -m 0755 "$ROOT/scripts/$f" "/usr/lib/milmit-surfshark/$f"
+done
 install -o root -g root -m 0755 "$ROOT/scripts/hotspot-device-manager.py" /usr/lib/milmit-surfshark/hotspot-device-manager.py
-install -o root -g root -m 0755 "$ROOT/scripts/milmit-surfshark-watchdog.sh" /usr/lib/milmit-surfshark/milmit-surfshark-watchdog.sh
-install -o root -g root -m 0755 "$ROOT/scripts/control-center.py" /usr/lib/milmit-surfshark/control-center.py
-install -o root -g root -m 0755 "$ROOT/scripts/router-features.py" /usr/lib/milmit-surfshark/router-features.py
 install -o root -g root -m 0755 "$ROOT/scripts/milmit-surfshark-helper" /usr/libexec/milmit-surfshark-helper
 install -o root -g root -m 0644 "$ROOT/packaging/net.milmit.surfshark-ikev2.policy" /usr/share/polkit-1/actions/net.milmit.surfshark-ikev2.policy
 install -o root -g root -m 0644 "$ROOT/packaging/gnome-shell-extension/metadata.json" "$EXT_DIR/metadata.json"
 install -o root -g root -m 0644 "$ROOT/packaging/gnome-shell-extension/extension.js" "$EXT_DIR/extension.js"
-install -o root -g root -m 0644 "$ROOT/packaging/milmit-surfshark-watchdog.service" /etc/systemd/system/milmit-surfshark-watchdog.service
+for unit in milmit-surfshark-watchdog.service milmit-surfshark-rules-update.service milmit-surfshark-rules-update.timer milmit-surfshark-portal.service milmit-surfshark-keepawake.service; do
+  install -o root -g root -m 0644 "$ROOT/packaging/$unit" "/etc/systemd/system/$unit"
+done
 
 systemctl daemon-reload >/dev/null 2>&1 || true
 systemctl enable --now milmit-surfshark-watchdog.service >/dev/null 2>&1 || true
+systemctl enable --now milmit-surfshark-rules-update.timer >/dev/null 2>&1 || true
+systemctl enable --now milmit-surfshark-portal.service >/dev/null 2>&1 || true
+# Keep-awake is opt-in at runtime; do not enable it globally on install.
+systemctl disable --now milmit-surfshark-keepawake.service >/dev/null 2>&1 || true
 systemctl try-reload-or-restart polkit.service >/dev/null 2>&1 || true
 
-echo "MilMit Surfshark privileged helper, advanced router engine, control center, auth-fixed connector, watchdog, hotspot manager and GNOME indicator installed."
+# Bootstrap local rules only when no valid snapshot exists. Failure is intentionally non-fatal.
+if [[ ! -s /var/lib/milmit-surfshark/rules/ircidr.txt ]]; then /usr/lib/milmit-surfshark/rules-update.py update >/var/log/milmit-surfshark-rules-update.log 2>&1 || true; fi
+
+echo "MilMit Surfshark privileged helper and full native router protection stack installed."
 command -v ipset >/dev/null 2>&1 && echo "Iran Direct: ipset ready." || echo "Iran Direct: ipset missing."
-command -v tc >/dev/null 2>&1 && echo "Per-device speed limits: tc ready." || echo "Per-device speed limits: tc unavailable."
-command -v conntrack >/dev/null 2>&1 && echo "Hotspot connection reset/repair: conntrack ready." || true
-if systemctl is-active --quiet milmit-surfshark-watchdog.service 2>/dev/null; then echo "Watchdog: active · recovery + telemetry + quota enforcement enabled."; fi
-echo "Advanced features: Hotspot VPN repair, per-device VPN/Direct/Block/Pause, quota/throttle, speed limits, Guest Hotspot, Force DNS, QUIC block, client isolation, IPv6 policy, manual domain/IP policies, Iran Direct, route tester, health, LKG and Emergency Stop."
+command -v tc >/dev/null 2>&1 && echo "Per-device shaping: tc ready." || echo "Per-device shaping: tc unavailable."
+command -v conntrack >/dev/null 2>&1 && echo "Candidate feed / connection repair: conntrack ready." || true
+command -v qrencode >/dev/null 2>&1 && echo "Guest QR support: qrencode ready." || true
+systemctl is-active --quiet milmit-surfshark-watchdog.service 2>/dev/null && echo "Watchdog: active · recovery + telemetry + quota enforcement."
+systemctl is-active --quiet milmit-surfshark-portal.service 2>/dev/null && echo "Local status portal: active on TCP 8787 (loopback/hotspot clients only)."
+echo "Feature stack: transactional Apply Safely + live verification, LKG, Iran local snapshot + weekly validated refresh, policy priority, VPN/Direct/Block rules, device controls, quota/throttle, shaping, Guest Hotspot, Force DNS, QUIC/IPv6 protection, isolation, candidates, route explain/test, watchdog, diagnostics, support bundle, status portal, low-power controls and Emergency Stop."
 echo "Future privileged operations from an active local session should not ask for the Ubuntu password again."
