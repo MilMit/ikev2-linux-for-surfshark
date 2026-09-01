@@ -12,7 +12,7 @@ NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
-ReadWritePaths=/run/milmit-surfshark /var/lib/milmit-surfshark /var/log /etc/milmit-surfshark
+ReadWritePaths=/run/milmit-surfshark /var/lib/milmit-surfshark /var/log /etc/milmit-surfshark /etc/swanctl
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_DAC_READ_SEARCH
 AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_DAC_READ_SEARCH
 
