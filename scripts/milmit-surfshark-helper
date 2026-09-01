@@ -3,6 +3,7 @@ set -euo pipefail
 
 CONNECT=/usr/lib/milmit-surfshark/restricted-ikev2-connect.sh
 DISCONNECT=/usr/lib/milmit-surfshark/restricted-ikev2-disconnect.sh
+DEVICE_POLICY=/usr/lib/milmit-surfshark/hotspot-device-policy.sh
 
 if [[ $EUID -ne 0 ]]; then
   echo "helper must run as root" >&2
@@ -39,6 +40,16 @@ case "$cmd" in
 
     exec "$CONNECT" "$endpoint" "$username" "$mss" "$dns_csv" "$hotspot_vpn" "$recover_network" "$hotspot_iface" "$kill_switch" "$routing_mode" "$hotspot_vpn_macs" "$hotspot_direct_macs"
     ;;
+  device-policy)
+    default_vpn="${2:-1}"
+    vpn_macs="${3:-}"
+    direct_macs="${4:-}"
+    [[ "$default_vpn" == 0 || "$default_vpn" == 1 ]] || { echo "invalid default hotspot policy" >&2; exit 64; }
+    [[ ${#vpn_macs} -le 2048 && ${#direct_macs} -le 2048 ]] || { echo "hotspot MAC policy list too long" >&2; exit 64; }
+    [[ -z "$vpn_macs" || "$vpn_macs" =~ ^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}(,([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2})*$ ]] || { echo "invalid hotspot VPN MAC list" >&2; exit 64; }
+    [[ -z "$direct_macs" || "$direct_macs" =~ ^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}(,([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2})*$ ]] || { echo "invalid hotspot Direct MAC list" >&2; exit 64; }
+    exec "$DEVICE_POLICY" "$default_vpn" "$vpn_macs" "$direct_macs"
+    ;;
   disconnect)
     exec "$DISCONNECT"
     ;;
@@ -46,7 +57,7 @@ case "$cmd" in
     exec /usr/sbin/swanctl --list-sas
     ;;
   *)
-    echo "usage: $0 {connect <ipv4> <service-user> [mss] [dns-csv] [hotspot-vpn 0|1] [recover 0|1] [hotspot-iface|auto] [kill-switch 0|1] [vpn_all|iran_direct] [vpn-macs] [direct-macs]|disconnect|status}" >&2
+    echo "usage: $0 {connect ...|device-policy <default-vpn 0|1> [vpn-macs] [direct-macs]|disconnect|status}" >&2
     exit 64
     ;;
 esac
