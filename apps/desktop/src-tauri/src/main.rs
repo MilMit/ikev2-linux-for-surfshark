@@ -15,7 +15,7 @@ const LOCATION_SOURCE:&str=include_str!("../../../../crates/gui/src/locations.rs
 const STATE:&str="/run/milmit-surfshark/restricted.state";
 const LIVE:&str="/run/milmit-surfshark/live.state";
 const USAGE:&str="/var/lib/milmit-surfshark/traffic-usage.state";
-const ALLOWED:&[&str]=&["status","connect","quick-connect","connect-saved","disconnect","watchdog-status","router-status","hotspot-status","hotspot-repair","rules-status","rules-update","health","apply-safe","full-live-test","speed-test","dns-test","mtu-test","save-lkg","support-bundle","emergency-stop","candidates","route-explain","route-test","policy-add","policy-remove","router-options","device-set","guest-start","guest-stop","guest-status","credentials-status","credentials-save","desktop-status","auto-connect","lockdown","lockdown-apply","app-direct-launch"];
+const ALLOWED:&[&str]=&["status","connect","quick-connect","connect-saved","disconnect","watchdog-status","router-status","hotspot-status","hotspot-repair","hotspot-doctor","rules-status","rules-update","health","apply-safe","full-live-test","speed-test","dns-test","mtu-test","save-lkg","support-bundle","emergency-stop","candidates","route-explain","route-test","policy-add","policy-remove","router-options","device-set","guest-start","guest-stop","guest-status","credentials-status","credentials-save","desktop-status","auto-connect","lockdown","lockdown-apply","app-direct-launch"];
 
 #[derive(Clone,Serialize)]struct UiLocation{id:String,country:String,city:String,host:String}
 #[derive(Clone,Serialize)]struct ConnectionState{connected:bool,state:String,public_ip:Option<String>,exit_country:Option<String>,latency_ms:Option<u32>}
