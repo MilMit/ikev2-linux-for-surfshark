@@ -1,0 +1,18 @@
+[Unit]
+Description=MilMit Surfshark local status portal
+After=network.target milmit-surfshark-watchdog.service
+
+[Service]
+Type=simple
+ExecStart=/usr/lib/milmit-surfshark/status-portal.py
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadOnlyPaths=/run/milmit-surfshark /var/lib/milmit-surfshark
+RestrictAddressFamilies=AF_INET AF_UNIX
+
+[Install]
+WantedBy=multi-user.target
