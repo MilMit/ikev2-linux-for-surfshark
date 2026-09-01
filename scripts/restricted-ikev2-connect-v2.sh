@@ -51,7 +51,16 @@ cleanup_policy() {
 SERVICE_PASS=""
 if [[ ! -t 0 ]]; then IFS= read -r SERVICE_PASS || true; fi
 install -d -m 0700 "$CRED_DIR"
-if [[ -n "$SERVICE_PASS" ]]; then umask 077; printf 'SERVICE_USER=%q\nSERVICE_PASS=%q\n' "$SERVICE_USER" "$SERVICE_PASS" > "$CRED_FILE"; elif [[ -f "$CRED_FILE" ]]; then source "$CRED_FILE"; else echo "Surfshark service password is required." >&2; exit 66; fi
+if [[ -n "$SERVICE_PASS" ]]; then
+  umask 077
+  printf 'SERVICE_USER=%q\nSERVICE_PASS=%q\n' "$SERVICE_USER" "$SERVICE_PASS" > "$CRED_FILE"
+elif [[ -f "$CRED_FILE" ]]; then
+  # shellcheck disable=SC1090
+  source "$CRED_FILE"
+else
+  echo "Surfshark service password is required." >&2
+  exit 66
+fi
 [[ -n "${SERVICE_PASS:-}" ]] || { echo "Surfshark service password is empty." >&2; exit 66; }
 
 cleanup_policy
@@ -61,7 +70,8 @@ rm -f "$STATE_FILE"
 ip link add "$XFRM_IF" type xfrm if_id "$XFRM_IF_ID"
 ip link set "$XFRM_IF" mtu 1280 up
 
-ESC_PASS="${SERVICE_PASS//\\/\\\\}"; ESC_PASS="${ESC_PASS//\"/\\\"}"
+ESC_PASS="${SERVICE_PASS//\\/\\\\}"
+ESC_PASS="${ESC_PASS//\"/\\\"}"
 install -d -m 0755 /etc/swanctl/conf.d
 cat >"$CONF" <<EOF
 connections {
@@ -73,8 +83,18 @@ connections {
     fragmentation = yes
     mobike = yes
     send_certreq = yes
-    local { auth = eap-mschapv2; id = $SERVICE_USER; eap_id = $SERVICE_USER }
-    remote { auth = pubkey; id = $SERVER_IDENTITY }
+
+    local {
+      auth = eap-mschapv2
+      id = $SERVICE_USER
+      eap_id = $SERVICE_USER
+    }
+
+    remote {
+      auth = pubkey
+      id = $SERVER_IDENTITY
+    }
+
     children {
       $CHILD_NAME {
         local_ts = 0.0.0.0/0
@@ -86,16 +106,31 @@ connections {
         if_id_out = $XFRM_IF_ID
       }
     }
+
     vips = 0.0.0.0
     dpd_delay = 30s
   }
 }
-secrets { eap-milmit-surfshark { id = $SERVICE_USER; secret = "$ESC_PASS" } }
+
+secrets {
+  eap-milmit-surfshark {
+    id = $SERVICE_USER
+    secret = "$ESC_PASS"
+  }
+}
 EOF
 chmod 0600 "$CONF"
 
-swanctl --load-conns
-swanctl --load-creds
+LOAD_CONNS="$(swanctl --load-conns 2>&1)"
+printf '%s\n' "$LOAD_CONNS"
+LOAD_CREDS="$(swanctl --load-creds 2>&1)"
+printf '%s\n' "$LOAD_CREDS"
+CONF_DUMP="$(swanctl --list-conns 2>&1 || true)"
+printf '%s\n' "$CONF_DUMP"
+printf '%s\n' "$CONF_DUMP" | grep -Fq "id: $SERVICE_USER" || { echo "Parsed connection is missing IDi." >&2; exit 66; }
+printf '%s\n' "$CONF_DUMP" | grep -Fq "eap_id: $SERVICE_USER" || { echo "Parsed connection is missing EAP identity." >&2; exit 66; }
+printf '%s\n' "$LOAD_CREDS" | grep -Fq "eap-milmit-surfshark" || { echo "MilMit EAP secret failed to load." >&2; exit 66; }
+
 swanctl --initiate --child "$CHILD_NAME"
 SA_TEXT="$(swanctl --list-sas 2>&1 || true)"; printf '%s\n' "$SA_TEXT"
 printf '%s\n' "$SA_TEXT" | grep -Fq "$CONN_NAME" || { echo "IKE SA was not established." >&2; exit 67; }
@@ -109,7 +144,10 @@ ip rule add pref "$RULE_VPN_PREF" fwmark "$MARK_VPN" table "$ROUTE_TABLE"
 
 ipt_reset mangle "$CHAIN_HOST"
 iptables -w -t mangle -A "$CHAIN_HOST" -d "$SERVER_IP/32" -j RETURN
-for net in 127.0.0.0/8 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16 224.0.0.0/4 255.255.255.255/32; do iptables -w -t mangle -A "$CHAIN_HOST" -d "$net" -j MARK --set-mark "$MARK_DIRECT"; iptables -w -t mangle -A "$CHAIN_HOST" -d "$net" -j RETURN; done
+for net in 127.0.0.0/8 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16 224.0.0.0/4 255.255.255.255/32; do
+  iptables -w -t mangle -A "$CHAIN_HOST" -d "$net" -j MARK --set-mark "$MARK_DIRECT"
+  iptables -w -t mangle -A "$CHAIN_HOST" -d "$net" -j RETURN
+done
 iptables -w -t mangle -A "$CHAIN_HOST" -j MARK --set-mark "$MARK_VPN"
 ipt_hook_front mangle OUTPUT "$CHAIN_HOST"
 
@@ -119,12 +157,18 @@ ipt_hook_front mangle OUTPUT "$CHAIN_MSS"
 ipt_hook_front mangle FORWARD "$CHAIN_MSS"
 
 IFS=',' read -r -a DNS_ARR <<< "$DNS_CSV"
-if command -v resolvectl >/dev/null 2>&1 && [[ -n "$IFACE" ]]; then resolvectl dns "$IFACE" "${DNS_ARR[@]}" || true; resolvectl domain "$IFACE" '~.' || true; resolvectl flush-caches || true; fi
+if command -v resolvectl >/dev/null 2>&1 && [[ -n "$IFACE" ]]; then
+  resolvectl dns "$IFACE" "${DNS_ARR[@]}" || true
+  resolvectl domain "$IFACE" '~.' || true
+  resolvectl flush-caches || true
+fi
 
-ROUTE_CHECK="$(ip -4 route get 1.1.1.1 mark "$MARK_VPN" 2>&1 || true)"; printf 'Marked route : %s\n' "$ROUTE_CHECK"
+ROUTE_CHECK="$(ip -4 route get 1.1.1.1 mark "$MARK_VPN" 2>&1 || true)"
+printf 'Marked route : %s\n' "$ROUTE_CHECK"
 printf '%s' "$ROUTE_CHECK" | grep -Fq "dev $XFRM_IF" || { echo "Marked route does not select $XFRM_IF" >&2; cleanup_policy; exit 68; }
 TRACE="$(curl -4 --max-time 12 -ks https://1.1.1.1/cdn-cgi/trace || true)"
-PUBLIC_IP="$(printf '%s\n' "$TRACE" | sed -n 's/^ip=//p' | head -n1)"; EXIT_COUNTRY="$(printf '%s\n' "$TRACE" | sed -n 's/^loc=//p' | head -n1)"
+PUBLIC_IP="$(printf '%s\n' "$TRACE" | sed -n 's/^ip=//p' | head -n1)"
+EXIT_COUNTRY="$(printf '%s\n' "$TRACE" | sed -n 's/^loc=//p' | head -n1)"
 [[ -n "$PUBLIC_IP" ]] || { echo "System data-path verification failed." >&2; cleanup_policy; exit 68; }
 
 install -d -m 0755 "$STATE_DIR"
