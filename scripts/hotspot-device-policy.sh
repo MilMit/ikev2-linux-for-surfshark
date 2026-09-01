@@ -27,9 +27,8 @@ count_csv(){ local v="$1"; [[ -z "$v" ]] && { echo 0; return; }; echo $(( $(tr -
 VPN_MACS="$(normalize_csv "$VPN_MACS")"; DIRECT_MACS="$(normalize_csv "$DIRECT_MACS")"
 if [[ -n "$VPN_MACS" && -n "$DIRECT_MACS" ]]; then IFS=',' read -r -a check <<< "$VPN_MACS"; for mac in "${check[@]}"; do [[ ",$DIRECT_MACS," != *",$mac,"* ]] || { echo "MAC $mac cannot be both VPN and Direct." >&2; exit 64; }; done; fi
 
-HOTSPOT_IFACE="$(state_get HOTSPOT_IFACE)"; HOTSPOT_SUBNET="$(state_get HOTSPOT_SUBNET)"; HOTSPOT_DNS="$(state_get HOTSPOT_DNS)"; VIRTUAL_IP="$(state_get VIRTUAL_IP)"; ROUTING_MODE="$(state_get ROUTING_MODE)"; IRAN_READY="$(state_get IRAN_SET_READY)"; PHYS_IFACE="$(state_get IFACE)"; MSS="$(state_get MSS_VALUE)"; MSS="${MSS:-1200}"
+HOTSPOT_IFACE="$(state_get HOTSPOT_IFACE)"; HOTSPOT_SUBNET="$(state_get HOTSPOT_SUBNET)"; HOTSPOT_DNS="1.1.1.1"; VIRTUAL_IP="$(state_get VIRTUAL_IP)"; ROUTING_MODE="$(state_get ROUTING_MODE)"; IRAN_READY="$(state_get IRAN_SET_READY)"; PHYS_IFACE="$(state_get IFACE)"; MSS="$(state_get MSS_VALUE)"; MSS="${MSS:-1200}"
 [[ -n "$HOTSPOT_IFACE" && -n "$HOTSPOT_SUBNET" ]] || { echo "No active hotspot was detected in current VPN state." >&2; exit 4; }
-[[ -n "$HOTSPOT_DNS" ]] || HOTSPOT_DNS=162.252.172.57
 sysctl -q -w net.ipv4.ip_forward=1 || true
 sysctl -q -w net.ipv4.conf.all.rp_filter=2 || true
 sysctl -q -w "net.ipv4.conf.$HOTSPOT_IFACE.rp_filter=0" || true
@@ -71,6 +70,11 @@ if [[ -n "$PHYS_IFACE" ]]; then
 fi
 
 iptables -w -t filter -N "$CHAIN_HOT_FWD" 2>/dev/null || true; iptables -w -t filter -F "$CHAIN_HOT_FWD"
+# Hotspot clients are much more sensitive to path-MTU problems with HTTP/3/QUIC.
+# Reject VPN-bound UDP/443 only on forwarded hotspot traffic so browsers/apps
+# immediately fall back to TCP/TLS, where MSS=1200 is already enforced. The host
+# itself keeps QUIC enabled.
+iptables -w -t filter -A "$CHAIN_HOT_FWD" -i "$HOTSPOT_IFACE" -s "$HOTSPOT_SUBNET" -m mark --mark "$MARK_VPN" -p udp --dport 443 -j REJECT --reject-with icmp-port-unreachable
 iptables -w -t filter -A "$CHAIN_HOT_FWD" -i "$HOTSPOT_IFACE" -s "$HOTSPOT_SUBNET" -o "$XFRM_IF" -j ACCEPT
 iptables -w -t filter -A "$CHAIN_HOT_FWD" -i "$XFRM_IF" -o "$HOTSPOT_IFACE" -d "$HOTSPOT_SUBNET" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
 if [[ -n "$PHYS_IFACE" ]]; then
@@ -85,19 +89,21 @@ iptables -w -t filter -I FORWARD 1 -j "$CHAIN_HOT_FWD"
 iptables -w -t mangle -C PREROUTING -i "$HOTSPOT_IFACE" -s "$HOTSPOT_SUBNET" -j "$CHAIN_HOT"
 iptables -w -t mangle -C FORWARD -j "$CHAIN_HOT_MSS"
 iptables -w -t filter -C FORWARD -j "$CHAIN_HOT_FWD"
+iptables -w -t filter -C "$CHAIN_HOT_FWD" -i "$HOTSPOT_IFACE" -s "$HOTSPOT_SUBNET" -m mark --mark "$MARK_VPN" -p udp --dport 443 -j REJECT --reject-with icmp-port-unreachable
 if [[ "$DEFAULT_VPN" == 1 || -n "$VPN_MACS" ]]; then iptables -w -t nat -C POSTROUTING -s "$HOTSPOT_SUBNET" -o "$XFRM_IF" -j SNAT --to-source "$VIRTUAL_IP"; fi
 if [[ -n "$PHYS_IFACE" ]]; then iptables -w -t nat -C POSTROUTING -s "$HOTSPOT_SUBNET" -o "$PHYS_IFACE" -m mark --mark "$MARK_DIRECT" -j MASQUERADE; fi
 
 VPN_COUNT="$(count_csv "$VPN_MACS")"; DIRECT_COUNT="$(count_csv "$DIRECT_MACS")"
-tmp="$(mktemp)"; awk -F= '!($1=="HOTSPOT_VPN" || $1=="HOTSPOT_VPN_MACS" || $1=="HOTSPOT_DIRECT_MACS" || $1=="HOTSPOT_VPN_MAC_COUNT" || $1=="HOTSPOT_DIRECT_MAC_COUNT") {print}' "$STATE_FILE" > "$tmp"
+tmp="$(mktemp)"; awk -F= '!($1=="HOTSPOT_VPN" || $1=="HOTSPOT_VPN_MACS" || $1=="HOTSPOT_DIRECT_MACS" || $1=="HOTSPOT_VPN_MAC_COUNT" || $1=="HOTSPOT_DIRECT_MAC_COUNT" || $1=="HOTSPOT_DNS") {print}' "$STATE_FILE" > "$tmp"
 cat >> "$tmp" <<EOF
 HOTSPOT_VPN=$DEFAULT_VPN
 HOTSPOT_VPN_MACS=$VPN_MACS
 HOTSPOT_DIRECT_MACS=$DIRECT_MACS
 HOTSPOT_VPN_MAC_COUNT=$VPN_COUNT
 HOTSPOT_DIRECT_MAC_COUNT=$DIRECT_COUNT
+HOTSPOT_DNS=$HOTSPOT_DNS
 EOF
 install -m 0644 "$tmp" "$STATE_FILE"; rm -f "$tmp"
 command -v conntrack >/dev/null 2>&1 && { conntrack -D -s "$HOTSPOT_SUBNET" >/dev/null 2>&1 || true; conntrack -D -d "$HOTSPOT_SUBNET" >/dev/null 2>&1 || true; }
 ip route flush cache >/dev/null 2>&1 || true
-printf 'Hotspot device policy applied live: iface=%s subnet=%s default=%s VPN=%s Direct=%s DNS=%s MSS=%s direct-nat=ready forward=ready\n' "$HOTSPOT_IFACE" "$HOTSPOT_SUBNET" "$([[ "$DEFAULT_VPN" == 1 ]] && echo VPN || echo Direct)" "$VPN_COUNT" "$DIRECT_COUNT" "$HOTSPOT_DNS" "$MSS"
+printf 'Hotspot device policy applied live: iface=%s subnet=%s default=%s VPN=%s Direct=%s DNS=%s MSS=%s quic-fallback=on direct-nat=ready forward=ready\n' "$HOTSPOT_IFACE" "$HOTSPOT_SUBNET" "$([[ "$DEFAULT_VPN" == 1 ]] && echo VPN || echo Direct)" "$VPN_COUNT" "$DIRECT_COUNT" "$HOTSPOT_DNS" "$MSS"
