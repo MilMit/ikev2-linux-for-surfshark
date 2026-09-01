@@ -1,0 +1,15 @@
+[Unit]
+Description=MilMit Surfshark automatic VPN connection
+Wants=network-online.target
+After=network-online.target
+ConditionPathExists=/etc/milmit-surfshark/credentials
+ConditionPathExists=/var/lib/milmit-surfshark/last-profile.state
+
+[Service]
+Type=oneshot
+ExecStart=/usr/libexec/milmit-surfshark-helper quick-connect
+RemainAfterExit=no
+TimeoutStartSec=90
+
+[Install]
+WantedBy=multi-user.target
