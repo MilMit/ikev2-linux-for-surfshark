@@ -1,0 +1,15 @@
+[Unit]
+Description=MilMit Surfshark hotspot keep-awake inhibitor
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/systemd-inhibit --what=sleep --who=MilMit-Surfshark --why=Keep VPN hotspot routing alive --mode=block /usr/bin/sleep infinity
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target
