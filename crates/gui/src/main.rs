@@ -432,7 +432,9 @@ fn build_ui(app: &adw::Application) {
         glib::timeout_add_local(Duration::from_millis(110), move || {
             if spinner.is_spinning() { progress.pulse(); }
             down_value.set_label(&fmt_rate(live_value("RX_BPS"))); up_value.set_label(&fmt_rate(live_value("TX_BPS")));
-            let lat=live_value("LATENCY_MS").unwrap_or_else(|| "—".into()); ping_value.set_label(if lat=="0" { "— ms" } else { &format!("{lat} ms") });
+            let lat=live_value("LATENCY_MS").unwrap_or_else(|| "—".into());
+            let latency_label = if lat == "0" { "— ms".to_string() } else { format!("{lat} ms") };
+            ping_value.set_label(&latency_label);
             watchdog_value.set_label(&format!("Watchdog · {}", live_value("HEALTH").unwrap_or_else(|| "waiting".into())));
             route_value.set_label(&format!("Route · {}", state_value("ROUTING_MODE").unwrap_or_else(|| "—".into())));
             hotspot_value.set_label(&format!("Hotspot · {}", state_value("HOTSPOT_IFACE").unwrap_or_else(|| "off".into())));
