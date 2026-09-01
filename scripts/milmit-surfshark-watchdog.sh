@@ -50,9 +50,8 @@ quick_reconnect() {
   [[ -x "$CONNECT" && -f "$LAST_FILE" && -f "$CRED_FILE" ]] || return 1
   [[ ! -e "$DISCONNECTING" && ! -e "$RECOVERING" ]] || return 1
   touch "$RECOVERING"
-  trap 'rm -f "$RECOVERING"' RETURN
 
-  local endpoint username mss dns hotspot recover hotspot_iface kill mode vpn_macs direct_macs
+  local endpoint username mss dns hotspot recover hotspot_iface kill mode vpn_macs direct_macs rc
   endpoint="$(state_get "$LAST_FILE" SERVER_IP)"
   mss="$(state_get "$LAST_FILE" MSS_VALUE)"; mss="${mss:-1200}"
   dns="$(state_get "$LAST_FILE" DNS_CSV)"; dns="${dns:-162.252.172.57,149.154.159.92}"
@@ -63,15 +62,21 @@ quick_reconnect() {
   mode="$(state_get "$LAST_FILE" ROUTING_MODE)"; mode="${mode:-vpn_all}"
   vpn_macs="$(state_get "$LAST_FILE" HOTSPOT_VPN_MACS)"
   direct_macs="$(state_get "$LAST_FILE" HOTSPOT_DIRECT_MACS)"
-  # credentials is root-owned and written with shell-safe %q values.
+  # root-only file written with printf %q by the connect helper.
   # shellcheck disable=SC1090
   source "$CRED_FILE"
   username="${SERVICE_USER:-}"
-  [[ -n "$endpoint" && -n "$username" ]] || return 1
+  if [[ -z "$endpoint" || -z "$username" ]]; then
+    rm -f "$RECOVERING"
+    return 1
+  fi
 
   "$DISCONNECT" >/var/log/milmit-surfshark-watchdog.log 2>&1 || true
   sleep 2
   "$CONNECT" "$endpoint" "$username" "$mss" "$dns" "$hotspot" "$recover" "$hotspot_iface" "$kill" "$mode" "$vpn_macs" "$direct_macs" </dev/null >>/var/log/milmit-surfshark-watchdog.log 2>&1
+  rc=$?
+  rm -f "$RECOVERING"
+  return "$rc"
 }
 
 prev_rx=0
@@ -91,7 +96,6 @@ while true; do
 
   persist_profile
   vip="$(state_get "$STATE_FILE" VIRTUAL_IP)"
-  endpoint="$(state_get "$STATE_FILE" SERVER_IP)"
   mark="$(state_get "$STATE_FILE" MARK_VPN)"; mark="${mark:-$MARK_VPN}"
 
   rx=$(cat "/sys/class/net/$XFRM_IF/statistics/rx_bytes" 2>/dev/null || echo 0)
