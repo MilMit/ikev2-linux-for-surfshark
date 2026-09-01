@@ -49,7 +49,7 @@ def main():
         elif level=='WARN': warns+=1
         rows.append((level,name,detail))
 
-    iface=st.get('HOTSPOT_IFACE',''); subnet=st.get('HOTSPOT_SUBNET',''); dns=st.get('HOTSPOT_DNS') or '162.252.172.57'; phys=st.get('IFACE',''); vip=st.get('VIRTUAL_IP',''); mode=st.get('ROUTING_MODE','unknown'); mss=st.get('MSS_VALUE','1200')
+    iface=st.get('HOTSPOT_IFACE',''); subnet=st.get('HOTSPOT_SUBNET',''); dns=st.get('HOTSPOT_DNS') or '1.1.1.1'; phys=st.get('IFACE',''); vip=st.get('VIRTUAL_IP',''); mode=st.get('ROUTING_MODE','unknown'); mss=st.get('MSS_VALUE','1200')
     if not STATE.exists():
         add('FAIL','VPN state','VPN runtime state is missing. Connect VPN before diagnosing the hotspot.')
     else:add('PASS','VPN state',f'connected state present · routing={mode}')
@@ -70,11 +70,13 @@ def main():
         rc,_=ipt('mangle','-C','PREROUTING','-i',iface,'-s',subnet,'-j','MILMIT_HOTSPOT_MARK')
         add('PASS' if rc==0 else 'FAIL','Hotspot route hook','MILMIT_HOTSPOT_MARK is attached to PREROUTING' if rc==0 else 'PREROUTING mark hook is missing')
         rc,_=ipt('nat','-C','PREROUTING','-i',iface,'-s',subnet,'-j','MILMIT_HOTSPOT_DNS')
-        add('PASS' if rc==0 else 'FAIL','DNS interception','DNS DNAT hook is installed' if rc==0 else 'DNS DNAT hook is missing')
+        add('PASS' if rc==0 else 'FAIL','DNS interception',f'DNS DNAT hook is installed · compatibility resolver {dns}' if rc==0 else 'DNS DNAT hook is missing')
         rc,_=ipt('mangle','-C','FORWARD','-j','MILMIT_HOTSPOT_MSS')
         add('PASS' if rc==0 else 'FAIL','MSS protection',f'Forwarded VPN TCP uses MSS {mss}' if rc==0 else 'MILMIT_HOTSPOT_MSS is missing; some HTTPS/CDN traffic may hang')
         rc,_=ipt('filter','-C','FORWARD','-j','MILMIT_HOTSPOT_FWD')
         add('PASS' if rc==0 else 'FAIL','Forwarding','MilMit hotspot forwarding chain is active' if rc==0 else 'Hotspot forwarding chain is missing')
+        rc,_=ipt('filter','-C','MILMIT_HOTSPOT_FWD','-i',iface,'-s',subnet,'-m','mark','--mark',MARK_VPN,'-p','udp','--dport','443','-j','REJECT','--reject-with','icmp-port-unreachable')
+        add('PASS' if rc==0 else 'WARN','Hotspot QUIC fallback','VPN-bound hotspot UDP/443 is rejected so HTTP/3 falls back to MSS-protected TCP' if rc==0 else 'Hotspot-only QUIC fallback rule is missing; QUIC-heavy apps/sites may stall on this MTU path')
         if vip:
             rc,_=ipt('nat','-C','POSTROUTING','-s',subnet,'-o',XFRM,'-j','SNAT','--to-source',vip)
             add('PASS' if rc==0 else 'FAIL','VPN NAT','VPN client traffic is SNATed to the assigned virtual IP' if rc==0 else 'VPN SNAT rule is missing')
@@ -83,15 +85,13 @@ def main():
             add('PASS' if rc==0 else 'FAIL','Direct NAT','Iran/Direct traffic has explicit MASQUERADE' if rc==0 else 'Direct MASQUERADE is missing; bypass sites can fail after firewall/NM refresh')
 
     rc,_=run(['ping','-n','-c','1','-W','2',dns],4)
-    add('PASS' if rc==0 else 'WARN','VPN DNS reachability',f'{dns} responds' if rc==0 else f'{dns} did not answer ICMP; DNS may still work, but verify resolver reachability')
+    add('PASS' if rc==0 else 'WARN','Hotspot DNS reachability',f'{dns} responds through the protected path' if rc==0 else f'{dns} did not answer ICMP; DNS may still work, but verify resolver reachability')
     rc,resolved=run(['getent','ahostsv4','example.com'],5)
     add('PASS' if rc==0 and resolved else 'FAIL','DNS resolution','System resolver can resolve IPv4 names' if rc==0 and resolved else 'IPv4 DNS lookup failed on the host')
 
     block_quic=bool(c.get('block_quic'))
-    if block_quic:
-        rc,_=ipt('filter','-C','MILMIT_ADV_BLOCK','-p','udp','--dport','443','-j','REJECT','--reject-with','icmp-port-unreachable')
-        add('PASS' if rc==0 else 'WARN','QUIC policy','UDP/443 is blocked so apps fall back to TCP' if rc==0 else 'Block QUIC is enabled in config but rule was not found')
-    else:add('INFO','QUIC policy','UDP/443 is allowed. If Instagram/HTTPS stalls, temporarily enable Block QUIC to test TCP fallback.')
+    if block_quic:add('INFO','Global QUIC policy','Advanced router also blocks UDP/443 globally; hotspot compatibility does not require this because forwarded clients have their own fallback rule.')
+    else:add('INFO','Global QUIC policy','Host QUIC remains allowed; only VPN-bound hotspot clients are forced to TCP fallback.')
 
     if iface:
         add('PASS' if sysctl(f'net.ipv4.conf.{iface}.rp_filter')=='0' else 'WARN','Hotspot rp_filter',f'{iface}={sysctl(f"net.ipv4.conf.{iface}.rp_filter")} · expected 0 for asymmetric policy routing')
@@ -111,14 +111,14 @@ def main():
     add('PASS' if rc==0 and 'ip=' in trace else 'WARN','Host HTTPS data path','VPN host path can complete HTTPS' if rc==0 and 'ip=' in trace else 'Host HTTPS probe failed; hotspot failures may be upstream of Wi-Fi sharing')
 
     print('MilMit Hotspot Doctor')
-    print(f'Interface: {iface or "not detected"} · Subnet: {subnet or "unknown"} · Mode: {mode} · MSS: {mss}')
+    print(f'Interface: {iface or "not detected"} · Subnet: {subnet or "unknown"} · Mode: {mode} · MSS: {mss} · DNS: {dns}')
     print('')
     for level,name,detail in rows: print(f'[{level}] {name}: {detail}')
     print('')
     overall='HEALTHY' if fails==0 and warns==0 else 'CHECK' if fails==0 else 'DEGRADED'
     print(f'Overall: {overall} · failures={fails} · warnings={warns}')
     if fails or warns:
-        print('Suggested next step: run “Repair hotspot routing”, then Hotspot Doctor again. If only QUIC warns and apps still stall, enable Block QUIC and retest.')
+        print('Suggested next step: run “Repair hotspot routing”, reconnect the client Wi-Fi, then Hotspot Doctor again.')
     return 0
 
 
