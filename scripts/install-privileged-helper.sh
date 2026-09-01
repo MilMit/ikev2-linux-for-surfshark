@@ -18,7 +18,7 @@ if command -v apt-get >/dev/null 2>&1; then
 fi
 
 install -d -m 0755 /usr/lib/milmit-surfshark /usr/libexec /usr/share/polkit-1/actions "$RULES_DIR" "$EXT_DIR" /var/lib/milmit-surfshark /var/lib/milmit-surfshark/rules
-for f in restricted-ikev2-connect.sh restricted-ikev2-connect-v2.sh restricted-ikev2-disconnect.sh hotspot-device-policy.sh milmit-surfshark-watchdog.sh control-center.py router-features.py advanced-router.py rules-update.py status-portal.py desktop-features.py; do
+for f in restricted-ikev2-connect.sh restricted-ikev2-connect-v2.sh restricted-ikev2-disconnect.sh hotspot-device-policy.sh milmit-surfshark-watchdog.sh control-center.py router-features.py advanced-router.py rules-update.py status-portal.py desktop-features.py hotspot-doctor.py; do
   install -o root -g root -m 0755 "$ROOT/scripts/$f" "/usr/lib/milmit-surfshark/$f"
 done
 install -o root -g root -m 0755 "$ROOT/scripts/install-privileged-helper.sh" /usr/lib/milmit-surfshark/install-privileged-helper.sh
