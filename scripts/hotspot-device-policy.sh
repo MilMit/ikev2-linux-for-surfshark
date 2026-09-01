@@ -31,18 +31,12 @@ HOTSPOT_IFACE="$(state_get HOTSPOT_IFACE)"; HOTSPOT_SUBNET="$(state_get HOTSPOT_
 [[ -n "$HOTSPOT_IFACE" && -n "$HOTSPOT_SUBNET" ]] || { echo "No active hotspot was detected in current VPN state." >&2; exit 4; }
 [[ -n "$HOTSPOT_DNS" ]] || HOTSPOT_DNS=162.252.172.57
 sysctl -q -w net.ipv4.ip_forward=1 || true
-# Policy-routed hotspot traffic is intentionally asymmetric from the kernel's
-# point of view. Strict reverse-path filtering can intermittently discard valid
-# replies after route/conntrack changes, so use loose/off validation on the
-# interfaces participating in this router path.
 sysctl -q -w net.ipv4.conf.all.rp_filter=2 || true
 sysctl -q -w "net.ipv4.conf.$HOTSPOT_IFACE.rp_filter=0" || true
 sysctl -q -w "net.ipv4.conf.$XFRM_IF.rp_filter=0" || true
 [[ -n "$PHYS_IFACE" ]] && sysctl -q -w "net.ipv4.conf.$PHYS_IFACE.rp_filter=2" || true
 
 iptables -w -t mangle -N "$CHAIN_HOT" 2>/dev/null || true; iptables -w -t mangle -F "$CHAIN_HOT"
-# Preserve marks set by the higher-priority policy engine. iptables-nft requires
-# negation on --mark itself ("-m mark ! --mark 0"), not before -m.
 iptables -w -t mangle -A "$CHAIN_HOT" -m mark ! --mark 0 -j RETURN
 for net in "$HOTSPOT_SUBNET" 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16; do iptables -w -t mangle -A "$CHAIN_HOT" -d "$net" -j MARK --set-mark "$MARK_DIRECT"; iptables -w -t mangle -A "$CHAIN_HOT" -d "$net" -j RETURN; done
 if [[ -n "$DIRECT_MACS" ]]; then IFS=',' read -r -a arr <<< "$DIRECT_MACS"; for mac in "${arr[@]}"; do iptables -w -t mangle -A "$CHAIN_HOT" -m mac --mac-source "$mac" -j MARK --set-mark "$MARK_DIRECT"; iptables -w -t mangle -A "$CHAIN_HOT" -m mac --mac-source "$mac" -j RETURN; done; fi
@@ -54,9 +48,6 @@ else iptables -w -t mangle -A "$CHAIN_HOT" -j MARK --set-mark "$MARK_DIRECT"; fi
 while iptables -w -t mangle -D PREROUTING -i "$HOTSPOT_IFACE" -s "$HOTSPOT_SUBNET" -j "$CHAIN_HOT" 2>/dev/null; do :; done
 iptables -w -t mangle -I PREROUTING 1 -i "$HOTSPOT_IFACE" -s "$HOTSPOT_SUBNET" -j "$CHAIN_HOT"
 
-# Forwarded clients need their own MSS policy. TCP MSS on host OUTPUT alone does
-# not cover every hotspot flow, while VPN MTU/fragmentation failures often show
-# up as "Telegram works but some HTTPS/Instagram sites hang".
 iptables -w -t mangle -N "$CHAIN_HOT_MSS" 2>/dev/null || true; iptables -w -t mangle -F "$CHAIN_HOT_MSS"
 iptables -w -t mangle -A "$CHAIN_HOT_MSS" -s "$HOTSPOT_SUBNET" -m mark --mark "$MARK_VPN" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$MSS"
 if [[ -n "$PHYS_IFACE" ]]; then iptables -w -t mangle -A "$CHAIN_HOT_MSS" -s "$HOTSPOT_SUBNET" -o "$PHYS_IFACE" -m mark --mark "$MARK_DIRECT" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu; fi
@@ -74,16 +65,11 @@ if [[ -n "$VIRTUAL_IP" ]]; then
   while iptables -w -t nat -D POSTROUTING -s "$HOTSPOT_SUBNET" -o "$XFRM_IF" -j SNAT --to-source "$VIRTUAL_IP" 2>/dev/null; do :; done
   if [[ "$DEFAULT_VPN" == 1 || -n "$VPN_MACS" ]]; then iptables -w -t nat -I POSTROUTING 1 -s "$HOTSPOT_SUBNET" -o "$XFRM_IF" -j SNAT --to-source "$VIRTUAL_IP"; fi
 fi
-# Do not depend on NetworkManager's shared-zone masquerade for Iran/direct
-# traffic. Explicit marked MASQUERADE prevents a 10.42.x client source from
-# leaking onto the physical uplink after NM/firewall refreshes its rules.
 if [[ -n "$PHYS_IFACE" ]]; then
   while iptables -w -t nat -D POSTROUTING -s "$HOTSPOT_SUBNET" -o "$PHYS_IFACE" -m mark --mark "$MARK_DIRECT" -j MASQUERADE 2>/dev/null; do :; done
   iptables -w -t nat -I POSTROUTING 1 -s "$HOTSPOT_SUBNET" -o "$PHYS_IFACE" -m mark --mark "$MARK_DIRECT" -j MASQUERADE
 fi
 
-# Explicit forwarding is required on hosts where Docker/libvirt/UFW leaves the
-# base FORWARD policy at DROP. Keep every MilMit rule in our own auditable chain.
 iptables -w -t filter -N "$CHAIN_HOT_FWD" 2>/dev/null || true; iptables -w -t filter -F "$CHAIN_HOT_FWD"
 iptables -w -t filter -A "$CHAIN_HOT_FWD" -i "$HOTSPOT_IFACE" -s "$HOTSPOT_SUBNET" -o "$XFRM_IF" -j ACCEPT
 iptables -w -t filter -A "$CHAIN_HOT_FWD" -i "$XFRM_IF" -o "$HOTSPOT_IFACE" -d "$HOTSPOT_SUBNET" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
@@ -96,7 +82,6 @@ fi
 while iptables -w -t filter -D FORWARD -j "$CHAIN_HOT_FWD" 2>/dev/null; do :; done
 iptables -w -t filter -I FORWARD 1 -j "$CHAIN_HOT_FWD"
 
-# Fail closed during setup if the critical hotspot datapath hooks did not land.
 iptables -w -t mangle -C PREROUTING -i "$HOTSPOT_IFACE" -s "$HOTSPOT_SUBNET" -j "$CHAIN_HOT"
 iptables -w -t mangle -C FORWARD -j "$CHAIN_HOT_MSS"
 iptables -w -t filter -C FORWARD -j "$CHAIN_HOT_FWD"
