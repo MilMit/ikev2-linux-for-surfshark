@@ -1,6 +1,8 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::process::Command;
+use std::thread;
+use std::time::Duration;
 
 #[path = "../../../../crates/gui/src/bundled_endpoints.rs"]
 mod bundled_endpoints;
@@ -29,6 +31,12 @@ struct ConnectionState {
     latency_ms: Option<u32>,
 }
 
+#[derive(Clone, Deserialize)]
+struct PingRequest { id: String, host: String }
+
+#[derive(Clone, Serialize)]
+struct PingResult { id: String, ping: Option<u32> }
+
 fn quoted_field(line: &str, field: &str) -> Option<String> {
     let marker = format!("{field}: \"");
     let start = line.find(&marker)? + marker.len();
@@ -46,6 +54,10 @@ fn parse_locations() -> Vec<UiLocation> {
 #[tauri::command]
 fn list_locations() -> Vec<UiLocation> { parse_locations() }
 
+fn valid_host(host: &str) -> bool {
+    host.len() <= 255 && host.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-'))
+}
+
 fn ping_target(host: &str) -> String {
     if host == "ee-tll.prod.surfshark.com" { return "185.174.159.123".into(); }
     bundled_endpoints::for_host(host).first().copied().unwrap_or(host).to_string()
@@ -60,8 +72,25 @@ fn ping_once(target: &str) -> Result<Option<u32>, String> {
 
 #[tauri::command]
 fn ping_location(host:String)->Result<Option<u32>,String>{
-    if host.len()>255 || !host.chars().all(|c|c.is_ascii_alphanumeric()||matches!(c,'.'|'-')){return Err("invalid location hostname".into())}
+    if !valid_host(&host){return Err("invalid location hostname".into())}
     ping_once(&ping_target(&host))
+}
+
+// A single IPC call handles many location pings, with a small fixed worker
+// width. This avoids launching 100+ concurrent Tauri invokes and keeps the UI
+// responsive while country/header latency is populated in the background.
+#[tauri::command]
+fn ping_locations_batch(items: Vec<PingRequest>) -> Result<Vec<PingResult>, String> {
+    if items.len() > 256 { return Err("too many ping targets".into()); }
+    if items.iter().any(|x| x.id.len() > 64 || !valid_host(&x.host)) { return Err("invalid ping target".into()); }
+    let mut out = Vec::with_capacity(items.len());
+    for chunk in items.chunks(6) {
+        let handles = chunk.iter().cloned().map(|item| {
+            thread::spawn(move || PingResult { id: item.id, ping: ping_once(&ping_target(&item.host)).ok().flatten() })
+        }).collect::<Vec<_>>();
+        for h in handles { if let Ok(v) = h.join() { out.push(v); } }
+    }
+    Ok(out)
 }
 
 fn helper_output(action:&str,args:&[&str])->Result<String,String>{
@@ -80,7 +109,21 @@ fn connect_location(id:String)->Result<String,String>{
     let mut failures=String::new();
     for ip in candidates {
         match helper_output("connect-saved", &[&ip,&loc.host]) {
-            Ok(text)=>return Ok(format!("LOCATION={}\nCITY={}\nENDPOINT={}\n{}",loc.id,loc.city,ip,text)),
+            Ok(text)=>{
+                // Verify the connector actually committed the requested server identity.
+                // This prevents the UI from claiming Germany/Tallinn/etc. while a stale
+                // quick-connect profile is active underneath.
+                let mut matched = false;
+                for _ in 0..8 {
+                    if state_value(STATE,"SERVER_IDENTITY").as_deref() == Some(loc.host.as_str()) { matched = true; break; }
+                    thread::sleep(Duration::from_millis(150));
+                }
+                if !matched {
+                    let actual = state_value(STATE,"SERVER_IDENTITY").unwrap_or_else(||"unknown".into());
+                    return Err(format!("Tunnel came up but selected-location verification failed. Requested {}, active identity {}.", loc.host, actual));
+                }
+                return Ok(format!("LOCATION={}\nCITY={}\nIDENTITY={}\nENDPOINT={}\n{}",loc.id,loc.city,loc.host,ip,text));
+            },
             Err(e)=>{failures.push_str(&format!("\n[{ip}] {e}\n"));}
         }
     }
@@ -115,5 +158,5 @@ fn helper_action(action:String,args:Vec<String>)->Result<String,String>{
 }
 
 fn main(){
-    tauri::Builder::default().invoke_handler(tauri::generate_handler![helper_action,list_locations,ping_location,connect_location,connection_state,ping_report]).run(tauri::generate_context!()).expect("error while running MilMit Secure");
+    tauri::Builder::default().invoke_handler(tauri::generate_handler![helper_action,list_locations,ping_location,ping_locations_batch,connect_location,connection_state,ping_report]).run(tauri::generate_context!()).expect("error while running MilMit Secure");
 }
