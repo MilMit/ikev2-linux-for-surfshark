@@ -4,6 +4,7 @@ set -euo pipefail
 CONNECT=/usr/lib/milmit-surfshark/restricted-ikev2-connect-v2.sh
 DISCONNECT=/usr/lib/milmit-surfshark/restricted-ikev2-disconnect.sh
 DEVICE_POLICY=/usr/lib/milmit-surfshark/hotspot-device-policy.sh
+CONTROL=/usr/lib/milmit-surfshark/control-center.py
 LAST_PROFILE=/var/lib/milmit-surfshark/last-profile.state
 CRED_FILE=/etc/milmit-surfshark/credentials
 LIVE_STATE=/run/milmit-surfshark/live.state
@@ -40,6 +41,11 @@ quick_connect() {
   exec "$CONNECT" "$endpoint" "$SERVICE_USER" "$mss" "$dns" "$hotspot" "$recover" "$hotspot_iface" "$kill" "$mode" "$vpn_macs" "$direct_macs" "$identity" </dev/null
 }
 
+control() {
+  [[ -x "$CONTROL" ]] || { echo "control center is not installed" >&2; exit 69; }
+  exec "$CONTROL" "$@"
+}
+
 cmd="${1:-}"
 case "$cmd" in
   connect)
@@ -70,26 +76,23 @@ case "$cmd" in
 
     exec "$CONNECT" "$endpoint" "$username" "$mss" "$dns_csv" "$hotspot_vpn" "$recover_network" "$hotspot_iface" "$kill_switch" "$routing_mode" "$hotspot_vpn_macs" "$hotspot_direct_macs" "$server_identity"
     ;;
-  quick-connect)
-    quick_connect
-    ;;
+  quick-connect) quick_connect ;;
   device-policy)
-    default_vpn="${2:-1}"
-    vpn_macs="${3:-}"
-    direct_macs="${4:-}"
-    exec "$DEVICE_POLICY" "$default_vpn" "$vpn_macs" "$direct_macs"
+    exec "$DEVICE_POLICY" "${2:-1}" "${3:-}" "${4:-}"
     ;;
-  disconnect)
-    exec "$DISCONNECT"
+  disconnect) exec "$DISCONNECT" ;;
+  status) exec /usr/sbin/swanctl --list-sas ;;
+  watchdog-status) [[ -f "$LIVE_STATE" ]] && cat "$LIVE_STATE" || echo "HEALTH=UNKNOWN" ;;
+  health|speed-test|dns-test|mtu-test|save-lkg|lkg-status|emergency-stop|recent-destinations|support-bundle|history)
+    control "$cmd"
     ;;
-  status)
-    exec /usr/sbin/swanctl --list-sas
-    ;;
-  watchdog-status)
-    [[ -f "$LIVE_STATE" ]] && cat "$LIVE_STATE" || echo "HEALTH=UNKNOWN"
+  route-test)
+    target="${2:-1.1.1.1}"
+    [[ ${#target} -le 255 && "$target" != *$'\n'* ]] || { echo "invalid route-test target" >&2; exit 64; }
+    control route-test "$target"
     ;;
   *)
-    echo "usage: $0 {connect ...|quick-connect|device-policy ...|disconnect|status|watchdog-status}" >&2
+    echo "usage: $0 {connect|quick-connect|device-policy|disconnect|status|watchdog-status|health|speed-test|dns-test|mtu-test|route-test TARGET|save-lkg|lkg-status|emergency-stop|recent-destinations|support-bundle|history}" >&2
     exit 64
     ;;
 esac
