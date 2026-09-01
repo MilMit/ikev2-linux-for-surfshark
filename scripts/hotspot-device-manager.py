@@ -1,238 +1,58 @@
 #!/usr/bin/env python3
-import os
-import re
-import subprocess
+import json, os, re, subprocess
 from pathlib import Path
-
 try:
-    import gi
-    gi.require_version("Gtk", "3.0")
-    from gi.repository import Gtk, GLib
-except Exception as exc:
-    raise SystemExit(f"GTK3 is required: {exc}")
-
-STATE_FILE = Path("/run/milmit-surfshark/restricted.state")
-CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config"))) / "milmit-surfshark"
-SETTINGS_FILE = CONFIG_DIR / "settings.conf"
-HELPER = "/usr/libexec/milmit-surfshark-helper"
-MAC_RE = re.compile(r"^(?:[0-9A-F]{2}:){5}[0-9A-F]{2}$")
-
-
-def read_kv(path):
-    data = {}
-    try:
-        for raw in Path(path).read_text(encoding="utf-8").splitlines():
-            if "=" in raw:
-                k, v = raw.split("=", 1)
-                data[k] = v
-    except OSError:
-        pass
-    return data
-
-
-def write_settings(values):
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    current = read_kv(SETTINGS_FILE)
-    current.update(values)
-    order = [
-        "restricted", "mss", "dns", "hotspot_vpn", "hotspot_iface",
-        "recover_network", "kill_switch", "routing_mode",
-        "hotspot_vpn_macs", "hotspot_direct_macs",
-    ]
-    keys = order + [k for k in current if k not in order]
-    SETTINGS_FILE.write_text("".join(f"{k}={current[k]}\n" for k in keys if k in current), encoding="utf-8")
-
-
-def run(args, timeout=3):
-    try:
-        return subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                              text=True, timeout=timeout, check=False).stdout.strip()
-    except Exception:
-        return ""
-
-
-def selected_iface(settings, state):
-    if state.get("HOTSPOT_IFACE"):
-        return state["HOTSPOT_IFACE"]
-    requested = settings.get("hotspot_iface", "auto")
-    if requested != "auto":
-        return requested
-    text = run(["nmcli", "-t", "-f", "NAME,DEVICE", "connection", "show", "--active"])
-    for line in text.splitlines():
-        if ":" not in line:
-            continue
-        name, dev = line.rsplit(":", 1)
-        method = run(["nmcli", "-g", "ipv4.method", "connection", "show", name], timeout=1)
-        if method.strip() == "shared":
-            return dev
-    return ""
-
-
-def reverse_name(ip):
-    out = run(["getent", "hosts", ip], timeout=0.6)
-    if not out:
-        return ""
-    parts = out.split()
-    return parts[1] if len(parts) > 1 else ""
-
-
-def neighbors(iface):
-    if not iface:
-        return []
-    text = run(["ip", "neigh", "show", "dev", iface])
-    rows = []
-    seen = set()
-    for line in text.splitlines():
-        parts = line.split()
-        if not parts or "lladdr" not in parts:
-            continue
-        try:
-            ip = parts[0]
-            mac = parts[parts.index("lladdr") + 1].upper()
-        except Exception:
-            continue
-        if not MAC_RE.match(mac) or mac in seen:
-            continue
-        state = parts[-1] if parts else ""
-        if state in {"FAILED", "INCOMPLETE"}:
-            continue
-        seen.add(mac)
-        rows.append((reverse_name(ip), ip, mac, state))
-    return rows
-
-
+ import gi; gi.require_version('Gtk','3.0'); from gi.repository import Gtk, GLib
+except Exception as exc: raise SystemExit(f'GTK3 is required: {exc}')
+HELPER='/usr/libexec/milmit-surfshark-helper'; STATE=Path('/run/milmit-surfshark/restricted.state')
+def run(args,timeout=30):
+ try:
+  p=subprocess.run(args,text=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,timeout=timeout,check=False); return p.returncode,p.stdout.strip()
+ except Exception as e:return 124,str(e)
+def helper(*a): return run(['pkexec',HELPER,*a])
+def jhelper(*a):
+ rc,t=helper(*a)
+ try:return rc,json.loads(t)
+ except Exception:return rc,{'ok':False,'error':t}
+class DeviceRow(Gtk.ListBoxRow):
+ def __init__(self,d,s):
+  super().__init__(); self.mac=d['mac']; box=Gtk.Box(orientation=Gtk.Orientation.VERTICAL,spacing=8); box.set_border_width(12); self.add(box)
+  top=Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL,spacing=8); txt=Gtk.Label(label=f"{d.get('ip','')}  ·  {self.mac}  ·  {d.get('state','')}"); txt.set_xalign(0); top.pack_start(txt,True,True,0)
+  self.policy=Gtk.ComboBoxText(); [(self.policy.append(k,l)) for k,l in [('default','Default'),('vpn','Force VPN'),('direct','Direct'),('block','Block')]]; self.policy.set_active_id(s.get('policy','default')); top.pack_end(self.policy,False,False,0); box.pack_start(top,False,False,0)
+  grid=Gtk.Grid(column_spacing=10,row_spacing=4); self.speed=Gtk.SpinButton.new_with_range(0,1000000,128); self.speed.set_value(int(s.get('speed_kbit',0) or 0)); self.quota=Gtk.SpinButton.new_with_range(0,100000,100); self.quota.set_value(int(s.get('quota_mb',0) or 0)); self.action=Gtk.ComboBoxText(); [(self.action.append(k,l)) for k,l in [('notify','Notify'),('throttle','Throttle'),('block','Block')]]; self.action.set_active_id(s.get('quota_action','notify')); self.pause=Gtk.Switch(); self.pause.set_active(bool(s.get('paused',False)))
+  for i,(lab,w) in enumerate([('Speed kbit/s',self.speed),('Daily quota MB',self.quota),('Quota action',self.action),('Pause',self.pause)]):
+   v=Gtk.Box(orientation=Gtk.Orientation.VERTICAL,spacing=2); x=Gtk.Label(label=lab); x.set_xalign(0); v.pack_start(x,False,False,0); v.pack_start(w,False,False,0); grid.attach(v,i,0,1,1)
+  box.pack_start(grid,False,False,0)
+ def values(self): return [self.mac,self.policy.get_active_id() or 'default',str(self.speed.get_value_as_int()),str(self.quota.get_value_as_int()),self.action.get_active_id() or 'notify','1' if self.pause.get_active() else '0']
 class Manager(Gtk.Window):
-    def __init__(self):
-        super().__init__(title="Hotspot Device Routing · MilMit")
-        self.set_default_size(720, 520)
-        self.set_border_width(18)
-        self.settings = read_kv(SETTINGS_FILE)
-        self.state = read_kv(STATE_FILE)
-        self.rows = {}
-
-        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
-        self.add(root)
-
-        title = Gtk.Label()
-        title.set_markup("<span size='x-large' weight='bold'>Hotspot devices</span>")
-        title.set_xalign(0)
-        root.pack_start(title, False, False, 0)
-
-        self.subtitle = Gtk.Label(label="Detecting devices…")
-        self.subtitle.set_xalign(0)
-        root.pack_start(self.subtitle, False, False, 0)
-
-        toolbar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        self.refresh_btn = Gtk.Button(label="Refresh devices")
-        self.default_combo = Gtk.ComboBoxText()
-        self.default_combo.append("vpn", "Unlisted → VPN")
-        self.default_combo.append("direct", "Unlisted → Direct")
-        self.default_combo.set_active_id("vpn" if self.settings.get("hotspot_vpn", "1") == "1" else "direct")
-        toolbar.pack_start(self.refresh_btn, False, False, 0)
-        toolbar.pack_end(self.default_combo, False, False, 0)
-        root.pack_start(toolbar, False, False, 0)
-
-        self.listbox = Gtk.ListBox()
-        self.listbox.set_selection_mode(Gtk.SelectionMode.NONE)
-        scroll = Gtk.ScrolledWindow()
-        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-        scroll.add(self.listbox)
-        root.pack_start(scroll, True, True, 0)
-
-        self.info = Gtk.Label(label="Default keeps the device on the global hotspot policy. VPN forces Surfshark. Direct bypasses Surfshark.")
-        self.info.set_line_wrap(True)
-        self.info.set_xalign(0)
-        root.pack_start(self.info, False, False, 0)
-
-        actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        self.apply_btn = Gtk.Button(label="Save & Apply now")
-        self.apply_btn.get_style_context().add_class("suggested-action")
-        close_btn = Gtk.Button(label="Close")
-        actions.pack_end(self.apply_btn, False, False, 0)
-        actions.pack_end(close_btn, False, False, 0)
-        root.pack_start(actions, False, False, 0)
-
-        self.refresh_btn.connect("clicked", lambda *_: self.refresh())
-        self.apply_btn.connect("clicked", lambda *_: self.apply())
-        close_btn.connect("clicked", lambda *_: self.destroy())
-        self.refresh()
-
-    def policy_for(self, mac):
-        vpn = {m for m in self.settings.get("hotspot_vpn_macs", "").upper().split(",") if m}
-        direct = {m for m in self.settings.get("hotspot_direct_macs", "").upper().split(",") if m}
-        if mac in vpn:
-            return "vpn"
-        if mac in direct:
-            return "direct"
-        return "default"
-
-    def refresh(self):
-        for child in self.listbox.get_children():
-            self.listbox.remove(child)
-        self.rows.clear()
-        self.settings = read_kv(SETTINGS_FILE)
-        self.state = read_kv(STATE_FILE)
-        iface = selected_iface(self.settings, self.state)
-        devices = neighbors(iface)
-        self.subtitle.set_text(f"Interface: {iface or 'not detected'} · {len(devices)} device(s) discovered")
-        if not devices:
-            row = Gtk.ListBoxRow()
-            label = Gtk.Label(label="No neighbors found. Connect devices to the Ubuntu hotspot, then press Refresh devices.")
-            label.set_margin_top(18); label.set_margin_bottom(18)
-            row.add(label); self.listbox.add(row)
-        for name, ip, mac, nstate in devices:
-            row = Gtk.ListBoxRow()
-            box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
-            box.set_border_width(10)
-            icon = Gtk.Image.new_from_icon_name("computer-symbolic", Gtk.IconSize.DIALOG)
-            box.pack_start(icon, False, False, 0)
-            text = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
-            primary = Gtk.Label(label=name or "Connected device"); primary.set_xalign(0)
-            primary.get_style_context().add_class("heading")
-            secondary = Gtk.Label(label=f"{ip}  ·  {mac}  ·  {nstate}"); secondary.set_xalign(0)
-            text.pack_start(primary, False, False, 0); text.pack_start(secondary, False, False, 0)
-            box.pack_start(text, True, True, 0)
-            combo = Gtk.ComboBoxText()
-            combo.append("default", "Default")
-            combo.append("vpn", "VPN")
-            combo.append("direct", "Direct")
-            combo.set_active_id(self.policy_for(mac))
-            box.pack_end(combo, False, False, 0)
-            row.add(box); self.listbox.add(row)
-            self.rows[mac] = combo
-        self.listbox.show_all()
-
-    def apply(self):
-        vpn, direct = [], []
-        for mac, combo in self.rows.items():
-            policy = combo.get_active_id() or "default"
-            if policy == "vpn":
-                vpn.append(mac)
-            elif policy == "direct":
-                direct.append(mac)
-        default_vpn = "1" if self.default_combo.get_active_id() == "vpn" else "0"
-        vpn_csv = ",".join(vpn)
-        direct_csv = ",".join(direct)
-        write_settings({
-            "hotspot_vpn": default_vpn,
-            "hotspot_vpn_macs": vpn_csv,
-            "hotspot_direct_macs": direct_csv,
-        })
-        if STATE_FILE.exists() and os.path.exists(HELPER):
-            proc = subprocess.run(["pkexec", HELPER, "device-policy", default_vpn, vpn_csv, direct_csv],
-                                  stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, check=False)
-            msg = proc.stdout.strip() or ("Policy applied." if proc.returncode == 0 else "Policy saved; live apply failed.")
-        else:
-            msg = "Policy saved. It will be used on the next VPN connection."
-        dialog = Gtk.MessageDialog(transient_for=self, flags=0, message_type=Gtk.MessageType.INFO,
-                                   buttons=Gtk.ButtonsType.OK, text="Hotspot device policy")
-        dialog.format_secondary_text(msg)
-        dialog.run(); dialog.destroy()
-        self.settings = read_kv(SETTINGS_FILE)
-
-
-if __name__ == "__main__":
-    win = Manager()
-    win.connect("destroy", Gtk.main_quit)
-    win.show_all()
-    Gtk.main()
+ def __init__(self):
+  super().__init__(title='MilMit Secure · Hotspot Control Center'); self.set_default_size(940,700); self.set_border_width(18); self.rows=[]
+  root=Gtk.Box(orientation=Gtk.Orientation.VERTICAL,spacing=12); self.add(root); title=Gtk.Label(); title.set_markup("<span size='xx-large' weight='bold'>Hotspot Control Center</span>"); title.set_xalign(0); root.pack_start(title,False,False,0)
+  self.note=Gtk.Label(label='Per-device VPN/Direct/Block, quota, speed limits, Guest Hotspot, DNS/QUIC/IPv6 protection'); self.note.set_xalign(0); root.pack_start(self.note,False,False,0)
+  nb=Gtk.Notebook(); root.pack_start(nb,True,True,0)
+  dev=Gtk.Box(orientation=Gtk.Orientation.VERTICAL,spacing=8); self.listbox=Gtk.ListBox(); self.listbox.set_selection_mode(Gtk.SelectionMode.NONE); sc=Gtk.ScrolledWindow(); sc.add(self.listbox); dev.pack_start(sc,True,True,0); bar=Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL,spacing=8); refresh=Gtk.Button(label='Refresh'); repair=Gtk.Button(label='Repair hotspot'); apply=Gtk.Button(label='Apply device policies'); apply.get_style_context().add_class('suggested-action'); bar.pack_start(refresh,False,False,0); bar.pack_start(repair,False,False,0); bar.pack_end(apply,False,False,0); dev.pack_start(bar,False,False,0); nb.append_page(dev,Gtk.Label(label='Devices'))
+  sec=Gtk.Box(orientation=Gtk.Orientation.VERTICAL,spacing=12); sec.set_border_width(16); self.force_dns=Gtk.CheckButton(label='Force protected DNS for hotspot'); self.quic=Gtk.CheckButton(label='Block QUIC (UDP/443)'); self.isolation=Gtk.CheckButton(label='Client isolation'); self.ipv6=Gtk.ComboBoxText(); self.ipv6.append('block','Block IPv6'); self.ipv6.append('allow','Allow IPv6'); self.ipv6.set_active_id('block'); sec.pack_start(self.force_dns,False,False,0); sec.pack_start(self.quic,False,False,0); sec.pack_start(self.isolation,False,False,0); sec.pack_start(self.ipv6,False,False,0); sec_apply=Gtk.Button(label='Apply protection'); sec_apply.get_style_context().add_class('suggested-action'); sec.pack_start(sec_apply,False,False,0); nb.append_page(sec,Gtk.Label(label='Protection'))
+  guest=Gtk.Box(orientation=Gtk.Orientation.VERTICAL,spacing=8); guest.set_border_width(16); self.ssid=Gtk.Entry(); self.ssid.set_text('MilMit Guest'); self.minutes=Gtk.SpinButton.new_with_range(5,1440,5); self.minutes.set_value(60); guest.pack_start(Gtk.Label(label='Guest SSID'),False,False,0); guest.pack_start(self.ssid,False,False,0); guest.pack_start(Gtk.Label(label='Duration (minutes)'),False,False,0); guest.pack_start(self.minutes,False,False,0); gb=Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL,spacing=8); gs=Gtk.Button(label='Start Guest'); gs.get_style_context().add_class('suggested-action'); ge=Gtk.Button(label='Stop Guest'); gb.pack_start(gs,False,False,0); gb.pack_start(ge,False,False,0); guest.pack_start(gb,False,False,0); nb.append_page(guest,Gtk.Label(label='Guest Hotspot'))
+  pol=Gtk.Box(orientation=Gtk.Orientation.VERTICAL,spacing=8); pol.set_border_width(16); self.target=Gtk.Entry(); self.target.set_placeholder_text('domain / IPv4 / CIDR'); self.rule=Gtk.ComboBoxText(); [(self.rule.append(k,l)) for k,l in [('vpn','Force VPN'),('direct','Direct'),('block','Block')]]; self.rule.set_active_id('vpn'); self.scope=Gtk.ComboBoxText(); [(self.scope.append(k,l)) for k,l in [('both','Ubuntu + Hotspot'),('ubuntu','Ubuntu only'),('hotspot','Hotspot only')]]; self.scope.set_active_id('both'); pb=Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL,spacing=8); pb.pack_start(self.target,True,True,0); pb.pack_start(self.rule,False,False,0); pb.pack_start(self.scope,False,False,0); pa=Gtk.Button(label='Add / Update'); pb.pack_start(pa,False,False,0); pol.pack_start(pb,False,False,0); self.policy_text=Gtk.TextView(); self.policy_text.set_editable(False); self.policy_text.set_monospace(True); ps=Gtk.ScrolledWindow(); ps.add(self.policy_text); pol.pack_start(ps,True,True,0); nb.append_page(pol,Gtk.Label(label='Domain/IP Rules'))
+  self.status=Gtk.Label(label='Loading…'); self.status.set_xalign(0); root.pack_start(self.status,False,False,0)
+  refresh.connect('clicked',lambda *_:self.reload()); repair.connect('clicked',lambda *_:self.action('hotspot-repair')); apply.connect('clicked',lambda *_:self.apply_devices()); sec_apply.connect('clicked',lambda *_:self.apply_options()); gs.connect('clicked',lambda *_:self.start_guest()); ge.connect('clicked',lambda *_:self.action('guest-stop')); pa.connect('clicked',lambda *_:self.add_policy()); self.reload(); GLib.timeout_add_seconds(5,self.tick)
+ def tick(self): self.reload(True); return True
+ def reload(self,quiet=False):
+  rc,d=jhelper('router-status'); h=d.get('hotspot',{}); c=d.get('config',{}); stored=c.get('devices',{}); [self.listbox.remove(x) for x in self.listbox.get_children()]; self.rows=[]
+  for x in h.get('clients',[]): r=DeviceRow(x,stored.get(x.get('mac',''),{})); self.rows.append(r); self.listbox.add(r)
+  if not self.rows:
+   r=Gtk.ListBoxRow(); l=Gtk.Label(label='No hotspot clients detected. Connect the phone and press Refresh.'); l.set_margin_top(24); l.set_margin_bottom(24); r.add(l); self.listbox.add(r)
+  self.listbox.show_all(); self.force_dns.set_active(bool(c.get('force_dns',True))); self.quic.set_active(bool(c.get('block_quic',False))); self.isolation.set_active(bool(c.get('client_isolation',False))); self.ipv6.set_active_id(c.get('ipv6_policy','block')); self.policy_text.get_buffer().set_text(json.dumps(c.get('policies',[]),ensure_ascii=False,indent=2)); self.status.set_text(f"Hotspot: {h.get('iface') or 'not detected'} · {h.get('subnet') or '—'} · {h.get('client_count',0)} client(s)")
+ def dialog(self,t,m): d=Gtk.MessageDialog(transient_for=self,flags=0,message_type=Gtk.MessageType.INFO,buttons=Gtk.ButtonsType.OK,text=t); d.format_secondary_text((m or '')[:5000]); d.run(); d.destroy()
+ def action(self,*a): rc,t=helper(*a); self.dialog('Operation result',t or ('OK' if rc==0 else 'Failed')); self.reload()
+ def apply_devices(self):
+  out=[]
+  for r in self.rows: out.append(helper('device-set',*r.values())[1])
+  self.dialog('Device policies','\n'.join(out) or 'No devices'); self.reload()
+ def apply_options(self): self.action('router-options','1' if self.force_dns.get_active() else '0','1' if self.quic.get_active() else '0','1' if self.isolation.get_active() else '0',self.ipv6.get_active_id() or 'block')
+ def start_guest(self):
+  rc,d=jhelper('guest-start',str(self.minutes.get_value_as_int()),self.ssid.get_text().strip() or 'MilMit Guest'); self.dialog('Guest Hotspot',f"SSID: {d.get('ssid','')}\nPassword: {d.get('password','')}\n{d.get('wifi_uri','')}" if d.get('ok') else d.get('error','Failed'))
+ def add_policy(self):
+  t=self.target.get_text().strip()
+  if t:self.action('policy-add',t,self.rule.get_active_id() or 'vpn',self.scope.get_active_id() or 'both')
+if __name__=='__main__': w=Manager(); w.connect('destroy',Gtk.main_quit); w.show_all(); Gtk.main()
