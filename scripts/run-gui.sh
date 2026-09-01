@@ -10,7 +10,12 @@ INSTALLED_DEVICE_MANAGER=/usr/lib/milmit-surfshark/hotspot-device-manager.py
 INSTALLED_WATCHDOG=/usr/lib/milmit-surfshark/milmit-surfshark-watchdog.sh
 INSTALLED_CONTROL=/usr/lib/milmit-surfshark/control-center.py
 INSTALLED_ROUTER=/usr/lib/milmit-surfshark/router-features.py
+INSTALLED_ADV=/usr/lib/milmit-surfshark/advanced-router.py
+INSTALLED_RULES=/usr/lib/milmit-surfshark/rules-update.py
+INSTALLED_PORTAL=/usr/lib/milmit-surfshark/status-portal.py
 WATCHDOG_UNIT=/etc/systemd/system/milmit-surfshark-watchdog.service
+RULES_TIMER=/etc/systemd/system/milmit-surfshark-rules-update.timer
+PORTAL_UNIT=/etc/systemd/system/milmit-surfshark-portal.service
 EXT_UUID=surfshark-ikev2@milmit.net
 EXT_DIR="/usr/share/gnome-shell/extensions/$EXT_UUID"
 TRAY="$ROOT/scripts/tray-indicator.py"
@@ -19,24 +24,26 @@ RUNTIME_SHIM="$RUNTIME_SHIM_DIR/pkexec"
 chmod 0755 "$TRAY" 2>/dev/null || true
 
 needs_install=0
-if [[ ! -x "$HELPER" || ! -f "$INSTALLED_CONNECT" || ! -x "$INSTALLED_CONNECT_V2" || ! -f "$INSTALLED_DISCONNECT" || ! -x "$INSTALLED_DEVICE_POLICY" || ! -x "$INSTALLED_DEVICE_MANAGER" || ! -x "$INSTALLED_WATCHDOG" || ! -x "$INSTALLED_CONTROL" || ! -x "$INSTALLED_ROUTER" || ! -f "$WATCHDOG_UNIT" ]]; then needs_install=1
-elif [[ ! -f "$EXT_DIR/extension.js" || ! -f "$EXT_DIR/metadata.json" ]]; then needs_install=1
-elif ! cmp -s "$ROOT/scripts/restricted-ikev2-connect.sh" "$INSTALLED_CONNECT"; then needs_install=1
-elif ! cmp -s "$ROOT/scripts/restricted-ikev2-connect-v2.sh" "$INSTALLED_CONNECT_V2"; then needs_install=1
-elif ! cmp -s "$ROOT/scripts/restricted-ikev2-disconnect.sh" "$INSTALLED_DISCONNECT"; then needs_install=1
-elif ! cmp -s "$ROOT/scripts/hotspot-device-policy.sh" "$INSTALLED_DEVICE_POLICY"; then needs_install=1
-elif ! cmp -s "$ROOT/scripts/hotspot-device-manager.py" "$INSTALLED_DEVICE_MANAGER"; then needs_install=1
-elif ! cmp -s "$ROOT/scripts/milmit-surfshark-watchdog.sh" "$INSTALLED_WATCHDOG"; then needs_install=1
-elif ! cmp -s "$ROOT/scripts/control-center.py" "$INSTALLED_CONTROL"; then needs_install=1
-elif ! cmp -s "$ROOT/scripts/router-features.py" "$INSTALLED_ROUTER"; then needs_install=1
-elif ! cmp -s "$ROOT/scripts/milmit-surfshark-helper" "$HELPER"; then needs_install=1
-elif ! cmp -s "$ROOT/packaging/gnome-shell-extension/extension.js" "$EXT_DIR/extension.js"; then needs_install=1
-elif ! cmp -s "$ROOT/packaging/milmit-surfshark-watchdog.service" "$WATCHDOG_UNIT"; then needs_install=1
+for spec in "$HELPER:$ROOT/scripts/milmit-surfshark-helper" "$INSTALLED_CONNECT:$ROOT/scripts/restricted-ikev2-connect.sh" "$INSTALLED_CONNECT_V2:$ROOT/scripts/restricted-ikev2-connect-v2.sh" "$INSTALLED_DISCONNECT:$ROOT/scripts/restricted-ikev2-disconnect.sh" "$INSTALLED_DEVICE_POLICY:$ROOT/scripts/hotspot-device-policy.sh" "$INSTALLED_DEVICE_MANAGER:$ROOT/scripts/hotspot-device-manager.py" "$INSTALLED_WATCHDOG:$ROOT/scripts/milmit-surfshark-watchdog.sh" "$INSTALLED_CONTROL:$ROOT/scripts/control-center.py" "$INSTALLED_ROUTER:$ROOT/scripts/router-features.py" "$INSTALLED_ADV:$ROOT/scripts/advanced-router.py" "$INSTALLED_RULES:$ROOT/scripts/rules-update.py" "$INSTALLED_PORTAL:$ROOT/scripts/status-portal.py"; do
+  installed="${spec%%:*}"; source="${spec#*:}"
+  if [[ ! -x "$installed" ]] || ! cmp -s "$source" "$installed"; then needs_install=1; break; fi
+done
+if [[ "$needs_install" == 0 ]]; then
+  [[ -f "$WATCHDOG_UNIT" && -f "$RULES_TIMER" && -f "$PORTAL_UNIT" ]] || needs_install=1
+  [[ -f "$EXT_DIR/extension.js" && -f "$EXT_DIR/metadata.json" ]] || needs_install=1
 fi
-if [[ "$needs_install" == 1 ]]; then echo "VPN/router engine/control center/watchdog update: Ubuntu may ask for your password once."; /usr/bin/pkexec /usr/bin/bash "$ROOT/scripts/install-privileged-helper.sh"; fi
-if [[ ! -x "$HELPER" ]] || ! cmp -s "$ROOT/scripts/restricted-ikev2-connect-v2.sh" "$INSTALLED_CONNECT_V2" || ! cmp -s "$ROOT/scripts/restricted-ikev2-disconnect.sh" "$INSTALLED_DISCONNECT" || ! cmp -s "$ROOT/scripts/hotspot-device-policy.sh" "$INSTALLED_DEVICE_POLICY" || ! cmp -s "$ROOT/scripts/milmit-surfshark-watchdog.sh" "$INSTALLED_WATCHDOG" || ! cmp -s "$ROOT/scripts/control-center.py" "$INSTALLED_CONTROL" || ! cmp -s "$ROOT/scripts/router-features.py" "$INSTALLED_ROUTER" || ! cmp -s "$ROOT/scripts/milmit-surfshark-helper" "$HELPER"; then echo "ERROR: privileged VPN/router backend is stale or installation did not complete." >&2; exit 78; fi
-if ! systemctl is-active --quiet milmit-surfshark-watchdog.service 2>/dev/null; then /usr/bin/pkexec /usr/bin/systemctl start milmit-surfshark-watchdog.service >/dev/null 2>&1 || true; fi
-echo "MilMit VPN backend, advanced router engine, protection control center, watchdog and hotspot manager: verified and current."
+if [[ "$needs_install" == 0 ]] && ! cmp -s "$ROOT/packaging/gnome-shell-extension/extension.js" "$EXT_DIR/extension.js"; then needs_install=1; fi
+if [[ "$needs_install" == 1 ]]; then
+  echo "VPN/full router protection stack update: Ubuntu may ask for your password once."
+  /usr/bin/pkexec /usr/bin/bash "$ROOT/scripts/install-privileged-helper.sh"
+fi
+for spec in "$HELPER:$ROOT/scripts/milmit-surfshark-helper" "$INSTALLED_CONNECT_V2:$ROOT/scripts/restricted-ikev2-connect-v2.sh" "$INSTALLED_ROUTER:$ROOT/scripts/router-features.py" "$INSTALLED_ADV:$ROOT/scripts/advanced-router.py" "$INSTALLED_RULES:$ROOT/scripts/rules-update.py" "$INSTALLED_PORTAL:$ROOT/scripts/status-portal.py"; do
+  installed="${spec%%:*}"; source="${spec#*:}"
+  if [[ ! -x "$installed" ]] || ! cmp -s "$source" "$installed"; then echo "ERROR: privileged router stack is stale or installation did not complete: $installed" >&2; exit 78; fi
+done
+systemctl is-active --quiet milmit-surfshark-watchdog.service 2>/dev/null || /usr/bin/pkexec /usr/bin/systemctl start milmit-surfshark-watchdog.service >/dev/null 2>&1 || true
+systemctl is-active --quiet milmit-surfshark-portal.service 2>/dev/null || /usr/bin/pkexec /usr/bin/systemctl start milmit-surfshark-portal.service >/dev/null 2>&1 || true
+echo "MilMit VPN + native router protection stack: verified and current."
 
 install -d -m 0700 "$RUNTIME_SHIM_DIR"
 cat >"$RUNTIME_SHIM" <<'SHIM'
