@@ -100,7 +100,10 @@ fn location_row(
     let host_s = host.to_string(); let id_ctx = id.to_string(); let country_s = country.to_string(); let city_s = city.to_string();
     let ping_ctx = ping.clone(); let favs_ctx = favorites.clone(); let ll_ctx = home_label.clone(); let st_ctx = stack.clone(); let sel_ctx = selected.clone(); let star_ctx = star.clone();
     gesture.connect_pressed(move |g,_,x,y| {
-        let pop = gtk::Popover::new(); pop.set_parent(&g.widget()); pop.set_pointing_to(Some(&gtk::gdk::Rectangle::new(x as i32,y as i32,1,1)));
+        let pop = gtk::Popover::new();
+        let Some(widget) = g.widget() else { return; };
+        pop.set_parent(&widget);
+        pop.set_pointing_to(Some(&gtk::gdk::Rectangle::new(x as i32,y as i32,1,1)));
         let menu = gtk::Box::new(Orientation::Vertical,4); menu.set_margin_top(6); menu.set_margin_bottom(6); menu.set_margin_start(6); menu.set_margin_end(6);
         let select_b = gtk::Button::with_label("Select location");
         let ping_b = gtk::Button::with_label("Ping now");
