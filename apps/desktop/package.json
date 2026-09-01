@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "bundle:linux": "bash ../../scripts/build-linux-release.sh"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.0.0",
