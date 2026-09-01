@@ -5,63 +5,34 @@ CONNECT=/usr/lib/milmit-surfshark/restricted-ikev2-connect-v2.sh
 DISCONNECT=/usr/lib/milmit-surfshark/restricted-ikev2-disconnect.sh
 DEVICE_POLICY=/usr/lib/milmit-surfshark/hotspot-device-policy.sh
 CONTROL=/usr/lib/milmit-surfshark/control-center.py
+ROUTER=/usr/lib/milmit-surfshark/router-features.py
 LAST_PROFILE=/var/lib/milmit-surfshark/last-profile.state
 CRED_FILE=/etc/milmit-surfshark/credentials
 LIVE_STATE=/run/milmit-surfshark/live.state
 
-if [[ $EUID -ne 0 ]]; then
-  echo "helper must run as root" >&2
-  exit 77
-fi
-
-state_get() {
-  local file="$1" key="$2"
-  [[ -f "$file" ]] || return 0
-  awk -F= -v k="$key" '$1==k {sub(/^[^=]*=/, ""); print; exit}' "$file" 2>/dev/null || true
-}
-
-quick_connect() {
+[[ $EUID -eq 0 ]] || { echo "helper must run as root" >&2; exit 77; }
+state_get(){ local file="$1" key="$2"; [[ -f "$file" ]] || return 0; awk -F= -v k="$key" '$1==k {sub(/^[^=]*=/, ""); print; exit}' "$file" 2>/dev/null || true; }
+quick_connect(){
   [[ -f "$LAST_PROFILE" ]] || { echo "No previous successful VPN profile is available yet." >&2; exit 69; }
   [[ -f "$CRED_FILE" ]] || { echo "Saved Surfshark credentials are unavailable." >&2; exit 66; }
   # shellcheck disable=SC1090
   source "$CRED_FILE"
   local endpoint identity mss dns hotspot recover hotspot_iface kill mode vpn_macs direct_macs
-  endpoint="$(state_get "$LAST_PROFILE" SERVER_IP)"
-  identity="$(state_get "$LAST_PROFILE" SERVER_IDENTITY)"; identity="${identity:-ee-tll.prod.surfshark.com}"
-  mss="$(state_get "$LAST_PROFILE" MSS_VALUE)"; mss="${mss:-1200}"
-  dns="$(state_get "$LAST_PROFILE" DNS_CSV)"; dns="${dns:-162.252.172.57,149.154.159.92}"
-  hotspot="$(state_get "$LAST_PROFILE" HOTSPOT_VPN)"; hotspot="${hotspot:-1}"
-  recover="$(state_get "$LAST_PROFILE" RECOVER_NETWORK)"; recover="${recover:-1}"
-  hotspot_iface="$(state_get "$LAST_PROFILE" HOTSPOT_IFACE_REQUEST)"; hotspot_iface="${hotspot_iface:-auto}"
-  kill="$(state_get "$LAST_PROFILE" KILL_SWITCH)"; kill="${kill:-1}"
-  mode="$(state_get "$LAST_PROFILE" ROUTING_MODE)"; mode="${mode:-vpn_all}"
-  vpn_macs="$(state_get "$LAST_PROFILE" HOTSPOT_VPN_MACS)"
-  direct_macs="$(state_get "$LAST_PROFILE" HOTSPOT_DIRECT_MACS)"
+  endpoint="$(state_get "$LAST_PROFILE" SERVER_IP)"; identity="$(state_get "$LAST_PROFILE" SERVER_IDENTITY)"; identity="${identity:-ee-tll.prod.surfshark.com}"
+  mss="$(state_get "$LAST_PROFILE" MSS_VALUE)"; mss="${mss:-1200}"; dns="$(state_get "$LAST_PROFILE" DNS_CSV)"; dns="${dns:-162.252.172.57,149.154.159.92}"
+  hotspot="$(state_get "$LAST_PROFILE" HOTSPOT_VPN)"; hotspot="${hotspot:-1}"; recover="$(state_get "$LAST_PROFILE" RECOVER_NETWORK)"; recover="${recover:-1}"
+  hotspot_iface="$(state_get "$LAST_PROFILE" HOTSPOT_IFACE_REQUEST)"; hotspot_iface="${hotspot_iface:-auto}"; kill="$(state_get "$LAST_PROFILE" KILL_SWITCH)"; kill="${kill:-1}"
+  mode="$(state_get "$LAST_PROFILE" ROUTING_MODE)"; mode="${mode:-vpn_all}"; vpn_macs="$(state_get "$LAST_PROFILE" HOTSPOT_VPN_MACS)"; direct_macs="$(state_get "$LAST_PROFILE" HOTSPOT_DIRECT_MACS)"
   [[ -n "$endpoint" && -n "${SERVICE_USER:-}" ]] || { echo "Saved quick-connect profile is incomplete." >&2; exit 69; }
   exec "$CONNECT" "$endpoint" "$SERVICE_USER" "$mss" "$dns" "$hotspot" "$recover" "$hotspot_iface" "$kill" "$mode" "$vpn_macs" "$direct_macs" "$identity" </dev/null
 }
-
-control() {
-  [[ -x "$CONTROL" ]] || { echo "control center is not installed" >&2; exit 69; }
-  exec "$CONTROL" "$@"
-}
+control(){ [[ -x "$CONTROL" ]] || { echo "control center is not installed" >&2; exit 69; }; exec "$CONTROL" "$@"; }
+router(){ [[ -x "$ROUTER" ]] || { echo "router feature engine is not installed" >&2; exit 69; }; exec "$ROUTER" "$@"; }
 
 cmd="${1:-}"
 case "$cmd" in
   connect)
-    endpoint="${2:-}"
-    username="${3:-}"
-    mss="${4:-1200}"
-    dns_csv="${5:-162.252.172.57,149.154.159.92}"
-    hotspot_vpn="${6:-1}"
-    recover_network="${7:-1}"
-    hotspot_iface="${8:-auto}"
-    kill_switch="${9:-0}"
-    routing_mode="${10:-vpn_all}"
-    hotspot_vpn_macs="${11:-}"
-    hotspot_direct_macs="${12:-}"
-    server_identity="${13:-ee-tll.prod.surfshark.com}"
-
+    endpoint="${2:-}"; username="${3:-}"; mss="${4:-1200}"; dns_csv="${5:-162.252.172.57,149.154.159.92}"; hotspot_vpn="${6:-1}"; recover_network="${7:-1}"; hotspot_iface="${8:-auto}"; kill_switch="${9:-0}"; routing_mode="${10:-vpn_all}"; hotspot_vpn_macs="${11:-}"; hotspot_direct_macs="${12:-}"; server_identity="${13:-ee-tll.prod.surfshark.com}"
     [[ "$endpoint" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || { echo "invalid IPv4 endpoint" >&2; exit 64; }
     [[ -n "$username" && ${#username} -le 128 && "$username" != *$'\n'* ]] || { echo "invalid service username" >&2; exit 64; }
     [[ "$mss" =~ ^[0-9]+$ && "$mss" -ge 900 && "$mss" -le 1400 ]] || { echo "invalid MSS (900-1400)" >&2; exit 64; }
@@ -72,27 +43,27 @@ case "$cmd" in
     [[ "$routing_mode" == vpn_all || "$routing_mode" == iran_direct ]] || { echo "invalid routing mode" >&2; exit 64; }
     [[ "$hotspot_iface" == auto || "$hotspot_iface" =~ ^[a-zA-Z0-9_.:-]{1,32}$ ]] || { echo "invalid hotspot interface" >&2; exit 64; }
     [[ "$server_identity" =~ ^[A-Za-z0-9.-]+$ ]] || { echo "invalid server identity" >&2; exit 64; }
-    [[ ${#hotspot_vpn_macs} -le 2048 && ${#hotspot_direct_macs} -le 2048 ]] || { echo "hotspot MAC policy list too long" >&2; exit 64; }
-
     exec "$CONNECT" "$endpoint" "$username" "$mss" "$dns_csv" "$hotspot_vpn" "$recover_network" "$hotspot_iface" "$kill_switch" "$routing_mode" "$hotspot_vpn_macs" "$hotspot_direct_macs" "$server_identity"
     ;;
   quick-connect) quick_connect ;;
-  device-policy)
-    exec "$DEVICE_POLICY" "${2:-1}" "${3:-}" "${4:-}"
-    ;;
+  device-policy) exec "$DEVICE_POLICY" "${2:-1}" "${3:-}" "${4:-}" ;;
   disconnect) exec "$DISCONNECT" ;;
   status) exec /usr/sbin/swanctl --list-sas ;;
   watchdog-status) [[ -f "$LIVE_STATE" ]] && cat "$LIVE_STATE" || echo "HEALTH=UNKNOWN" ;;
-  health|speed-test|dns-test|mtu-test|save-lkg|lkg-status|emergency-stop|recent-destinations|support-bundle|history)
-    control "$cmd"
-    ;;
-  route-test)
-    target="${2:-1.1.1.1}"
-    [[ ${#target} -le 255 && "$target" != *$'\n'* ]] || { echo "invalid route-test target" >&2; exit 64; }
-    control route-test "$target"
-    ;;
+  health|speed-test|dns-test|mtu-test|save-lkg|lkg-status|emergency-stop|recent-destinations|support-bundle|history) control "$cmd" ;;
+  route-test) target="${2:-1.1.1.1}"; [[ ${#target} -le 255 && "$target" != *$'\n'* ]] || { echo "invalid target" >&2; exit 64; }; control route-test "$target" ;;
+  router-status|hotspot-status) router status ;;
+  router-apply|hotspot-repair) router apply ;;
+  quota-enforce) router quota-enforce ;;
+  policy-add) router policy-add "${2:?target required}" "${3:?policy required}" "${4:-both}" ;;
+  policy-remove) router policy-remove "${2:?target required}" "${3:-both}" ;;
+  device-set) router device-set "${2:?MAC required}" "${3:-default}" "${4:-0}" "${5:-0}" "${6:-notify}" "${7:-0}" ;;
+  router-options) router options "${2:-1}" "${3:-0}" "${4:-0}" "${5:-block}" ;;
+  guest-start) router guest-start "${2:-60}" "${3:-MilMit Guest}" ;;
+  guest-stop) router guest-stop ;;
+  guest-status) router guest-status ;;
   *)
-    echo "usage: $0 {connect|quick-connect|device-policy|disconnect|status|watchdog-status|health|speed-test|dns-test|mtu-test|route-test TARGET|save-lkg|lkg-status|emergency-stop|recent-destinations|support-bundle|history}" >&2
+    echo "usage: $0 {connect|quick-connect|disconnect|health|route-test|router-status|router-apply|hotspot-repair|policy-add TARGET direct|vpn|block [scope]|policy-remove TARGET [scope]|device-set MAC default|vpn|direct|block [speed_kbit] [quota_mb] [notify|throttle|block] [paused0/1]|router-options force_dns quic_block isolation ipv6_policy|guest-start [minutes] [ssid]|guest-stop|guest-status|emergency-stop}" >&2
     exit 64
     ;;
 esac
