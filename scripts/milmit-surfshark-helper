@@ -6,11 +6,13 @@ DISCONNECT=/usr/lib/milmit-surfshark/restricted-ikev2-disconnect.sh
 DEVICE_POLICY=/usr/lib/milmit-surfshark/hotspot-device-policy.sh
 CONTROL=/usr/lib/milmit-surfshark/control-center.py
 ROUTER=/usr/lib/milmit-surfshark/router-features.py
+ADV=/usr/lib/milmit-surfshark/advanced-router.py
+RULES=/usr/lib/milmit-surfshark/rules-update.py
 LAST_PROFILE=/var/lib/milmit-surfshark/last-profile.state
 CRED_FILE=/etc/milmit-surfshark/credentials
 LIVE_STATE=/run/milmit-surfshark/live.state
 
-[[ $EUID -eq 0 ]] || { echo "helper must run as root" >&2; exit 77; }
+[[ $EUID -ne 0 ]] && { echo "helper must run as root" >&2; exit 77; }
 state_get(){ local file="$1" key="$2"; [[ -f "$file" ]] || return 0; awk -F= -v k="$key" '$1==k {sub(/^[^=]*=/, ""); print; exit}' "$file" 2>/dev/null || true; }
 quick_connect(){
   [[ -f "$LAST_PROFILE" ]] || { echo "No previous successful VPN profile is available yet." >&2; exit 69; }
@@ -28,6 +30,8 @@ quick_connect(){
 }
 control(){ [[ -x "$CONTROL" ]] || { echo "control center is not installed" >&2; exit 69; }; exec "$CONTROL" "$@"; }
 router(){ [[ -x "$ROUTER" ]] || { echo "router feature engine is not installed" >&2; exit 69; }; exec "$ROUTER" "$@"; }
+adv(){ [[ -x "$ADV" ]] || { echo "advanced router is not installed" >&2; exit 69; }; exec "$ADV" "$@"; }
+rules(){ [[ -x "$RULES" ]] || { echo "rules updater is not installed" >&2; exit 69; }; exec "$RULES" "$@"; }
 
 cmd="${1:-}"
 case "$cmd" in
@@ -62,8 +66,16 @@ case "$cmd" in
   guest-start) router guest-start "${2:-60}" "${3:-MilMit Guest}" ;;
   guest-stop) router guest-stop ;;
   guest-status) router guest-status ;;
+  apply-safe) adv apply-safe ;;
+  full-live-test|verify-live) adv verify ;;
+  candidates) adv candidates ;;
+  candidate-action) adv candidate-action "${2:?address required}" "${3:?action required}" ;;
+  route-explain) adv route-explain "${2:?target required}" ;;
+  low-power) adv low-power "${2:?lock|screen-off|keep-awake required}" ;;
+  rules-update) rules update-force ;;
+  rules-status) rules status ;;
   *)
-    echo "usage: $0 {connect|quick-connect|disconnect|health|route-test|router-status|router-apply|hotspot-repair|policy-add TARGET direct|vpn|block [scope]|policy-remove TARGET [scope]|device-set MAC default|vpn|direct|block [speed_kbit] [quota_mb] [notify|throttle|block] [paused0/1]|router-options force_dns quic_block isolation ipv6_policy|guest-start [minutes] [ssid]|guest-stop|guest-status|emergency-stop}" >&2
+    echo "usage: $0 {connect|quick-connect|disconnect|health|route-test|router-status|router-apply|apply-safe|full-live-test|hotspot-repair|policy-add TARGET direct|vpn|block [scope]|policy-remove TARGET [scope]|device-set MAC default|vpn|direct|block [speed_kbit] [quota_mb] [notify|throttle|block] [paused0/1]|router-options force_dns quic_block isolation ipv6_policy|guest-start [minutes] [ssid]|guest-stop|guest-status|candidates|candidate-action ADDRESS direct|vpn|block|dismiss|route-explain TARGET|rules-update|rules-status|low-power MODE|emergency-stop}" >&2
     exit 64
     ;;
 esac
