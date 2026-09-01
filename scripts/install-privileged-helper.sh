@@ -41,7 +41,10 @@ for unit in milmit-surfshark-watchdog.service milmit-surfshark-rules-update.serv
 done
 
 systemctl daemon-reload >/dev/null 2>&1 || true
-systemctl enable --now milmit-surfshark-watchdog.service >/dev/null 2>&1 || true
+systemctl enable milmit-surfshark-watchdog.service >/dev/null 2>&1 || true
+# Backend/watchdog files are replaced during an upgrade. Restart even when the
+# service is already active so the installed code is the code actually running.
+systemctl restart milmit-surfshark-watchdog.service >/dev/null 2>&1 || true
 systemctl enable --now milmit-surfshark-rules-update.timer >/dev/null 2>&1 || true
 systemctl enable --now milmit-surfshark-portal.service >/dev/null 2>&1 || true
 systemctl disable --now milmit-surfshark-keepawake.service >/dev/null 2>&1 || true
