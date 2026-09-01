@@ -8,6 +8,7 @@ CONTROL=/usr/lib/milmit-surfshark/control-center.py
 ROUTER=/usr/lib/milmit-surfshark/router-features.py
 ADV=/usr/lib/milmit-surfshark/advanced-router.py
 RULES=/usr/lib/milmit-surfshark/rules-update.py
+DESKTOP=/usr/lib/milmit-surfshark/desktop-features.py
 LAST_PROFILE=/var/lib/milmit-surfshark/last-profile.state
 CRED_DIR=/etc/milmit-surfshark
 CRED_FILE=$CRED_DIR/credentials
@@ -33,7 +34,6 @@ connect_saved(){
   [[ "$endpoint" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || { echo "invalid IPv4 endpoint" >&2; exit 64; }
   [[ -n "$identity" && "$identity" =~ ^[A-Za-z0-9.-]+$ ]] || { echo "invalid server identity" >&2; exit 64; }
   [[ -s "$CRED_FILE" ]] || { echo "Saved Surfshark credentials are unavailable. Save service credentials first." >&2; exit 66; }
-  # shellcheck disable=SC1090
   source "$CRED_FILE"
   [[ -n "${SERVICE_USER:-}" ]] || { echo "Saved Surfshark service username is unavailable." >&2; exit 66; }
   local mss dns hotspot recover hotspot_iface kill mode vpn_macs direct_macs
@@ -53,6 +53,7 @@ control(){ [[ -x "$CONTROL" ]] || { echo "control center is not installed" >&2; 
 router(){ [[ -x "$ROUTER" ]] || { echo "router feature engine is not installed" >&2; exit 69; }; exec "$ROUTER" "$@"; }
 adv(){ [[ -x "$ADV" ]] || { echo "advanced router is not installed" >&2; exit 69; }; exec "$ADV" "$@"; }
 rules(){ [[ -x "$RULES" ]] || { echo "rules updater is not installed" >&2; exit 69; }; exec "$RULES" "$@"; }
+desktop(){ [[ -x "$DESKTOP" ]] || { echo "desktop feature engine is not installed" >&2; exit 69; }; exec "$DESKTOP" "$@"; }
 
 cmd="${1:-}"
 case "$cmd" in
@@ -71,8 +72,7 @@ case "$cmd" in
     [[ "$routing_mode" == vpn_all || "$routing_mode" == iran_direct ]] || { echo "invalid routing mode" >&2; exit 64; }
     [[ "$hotspot_iface" == auto || "$hotspot_iface" =~ ^[a-zA-Z0-9_.:-]{1,32}$ ]] || { echo "invalid hotspot interface" >&2; exit 64; }
     [[ "$server_identity" =~ ^[A-Za-z0-9.-]+$ ]] || { echo "invalid server identity" >&2; exit 64; }
-    exec "$CONNECT" "$endpoint" "$username" "$mss" "$dns_csv" "$hotspot_vpn" "$recover_network" "$hotspot_iface" "$kill_switch" "$routing_mode" "$hotspot_vpn_macs" "$hotspot_direct_macs" "$server_identity"
-    ;;
+    exec "$CONNECT" "$endpoint" "$username" "$mss" "$dns_csv" "$hotspot_vpn" "$recover_network" "$hotspot_iface" "$kill_switch" "$routing_mode" "$hotspot_vpn_macs" "$hotspot_direct_macs" "$server_identity" ;;
   quick-connect) quick_connect ;;
   device-policy) exec "$DEVICE_POLICY" "${2:-1}" "${3:-}" "${4:-}" ;;
   disconnect) exec "$DISCONNECT" ;;
@@ -100,8 +100,10 @@ case "$cmd" in
   low-power) adv low-power "${2:?lock|screen-off|keep-awake required}" ;;
   rules-update) rules update-force ;;
   rules-status) rules status ;;
-  *)
-    echo "usage: $0 {credentials-save USER|credentials-status|connect-saved ENDPOINT IDENTITY|connect|quick-connect|disconnect|health|route-test|router-status|router-apply|apply-safe|full-live-test|hotspot-repair|policy-add TARGET direct|vpn|block [scope]|policy-remove TARGET [scope]|device-set MAC default|vpn|direct|block [speed_kbit] [quota_mb] [notify|throttle|block] [paused0/1]|router-options force_dns quic_block isolation ipv6_policy|guest-start [minutes] [ssid]|guest-stop|guest-status|candidates|candidate-action ADDRESS direct|vpn|block|dismiss|route-explain TARGET|rules-update|rules-status|low-power MODE|emergency-stop}" >&2
-    exit 64
-    ;;
+  desktop-status) desktop status ;;
+  auto-connect) [[ "${2:-}" == 0 || "${2:-}" == 1 ]] || { echo "auto-connect requires 0 or 1" >&2; exit 64; }; desktop auto-connect "$2" ;;
+  lockdown) [[ "${2:-}" == 0 || "${2:-}" == 1 ]] || { echo "lockdown requires 0 or 1" >&2; exit 64; }; desktop lockdown "$2" ;;
+  lockdown-apply) desktop lockdown-apply ;;
+  app-direct-launch) [[ "${2:-}" =~ ^[A-Za-z0-9_.+-]+\.desktop$ ]] || { echo "invalid desktop app id" >&2; exit 64; }; desktop app-direct-launch "$2" ;;
+  *) echo "unsupported helper action: $cmd" >&2; exit 64 ;;
 esac
