@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashSet;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 use std::thread;
 use std::time::Duration;
@@ -23,7 +23,6 @@ const ALLOWED:&[&str]=&["status","connect","quick-connect","connect-saved","disc
 #[derive(Clone,Serialize)]struct PingResult{id:String,ping:Option<u32>}
 #[derive(Clone,Serialize)]struct TrafficSnapshot{connected:bool,rx_bytes:u64,tx_bytes:u64,rx_bps:u64,tx_bps:u64,all_rx_bytes:u64,all_tx_bytes:u64,day_rx_bytes:u64,day_tx_bytes:u64,month_rx_bytes:u64,month_tx_bytes:u64}
 #[derive(Clone,Serialize)]struct DesktopApp{id:String,name:String,icon:String,exec:String}
-
 fn quoted_field(line:&str,field:&str)->Option<String>{let marker=format!("{field}: \"");let start=line.find(&marker)?+marker.len();let rest=&line[start..];let end=rest.find('"')?;Some(rest[..end].to_string())}
 fn parse_locations()->Vec<UiLocation>{LOCATION_SOURCE.lines().filter(|line|line.trim_start().starts_with("Location {")).filter_map(|line|Some(UiLocation{id:quoted_field(line,"id")?,country:quoted_field(line,"country")?,city:quoted_field(line,"city")?,host:quoted_field(line,"host")?})).collect()}
 #[tauri::command]fn list_locations()->Vec<UiLocation>{parse_locations()}
@@ -46,7 +45,6 @@ fn read_u64(path:&str)->u64{fs::read_to_string(path).ok().and_then(|v|v.trim().p
 #[tauri::command]fn helper_action(action:String,args:Vec<String>)->Result<String,String>{if !ALLOWED.contains(&action.as_str()){return Err(format!("unsupported helper action: {action}"))}let refs=args.iter().map(String::as_str).collect::<Vec<_>>();helper_output(&action,&refs)}
 #[tauri::command]async fn router_state()->Result<Value,String>{tauri::async_runtime::spawn_blocking(||helper_json("router-status",&[])).await.map_err(|e|e.to_string())?}
 #[tauri::command]async fn desktop_feature_state()->Result<Value,String>{tauri::async_runtime::spawn_blocking(||helper_json("desktop-status",&[])).await.map_err(|e|e.to_string())?}
-
 fn desktop_dirs()->Vec<PathBuf>{let mut v=Vec::new();if let Ok(home)=std::env::var("HOME"){v.push(PathBuf::from(home).join(".local/share/applications"))}v.push(PathBuf::from("/usr/local/share/applications"));v.push(PathBuf::from("/usr/share/applications"));v}
 fn desktop_value(text:&str,key:&str)->Option<String>{text.lines().find_map(|l|l.strip_prefix(&(key.to_string()+"=")).map(|v|v.trim().to_string()))}
 #[tauri::command]fn list_desktop_apps()->Vec<DesktopApp>{let mut out=Vec::new();let mut seen=HashSet::new();for dir in desktop_dirs(){let Ok(rd)=fs::read_dir(dir)else{continue};for ent in rd.flatten(){let path=ent.path();if path.extension().and_then(|x|x.to_str())!=Some("desktop"){continue}let id=path.file_name().and_then(|x|x.to_str()).unwrap_or("").to_string();if id.is_empty()||seen.contains(&id){continue}let Ok(text)=fs::read_to_string(&path)else{continue};if desktop_value(&text,"NoDisplay").as_deref()==Some("true")||desktop_value(&text,"Hidden").as_deref()==Some("true"){continue}let Some(name)=desktop_value(&text,"Name")else{continue};let Some(exec)=desktop_value(&text,"Exec")else{continue};let icon=desktop_value(&text,"Icon").unwrap_or_default();seen.insert(id.clone());out.push(DesktopApp{id,name,icon,exec})}}out.sort_by(|a,b|a.name.to_lowercase().cmp(&b.name.to_lowercase()));out}
@@ -56,6 +54,5 @@ fn lists_path()->PathBuf{user_config_dir().join("location-lists.json")}
 #[tauri::command]fn save_location_lists(lists:Value)->Result<(),String>{if !lists.is_array(){return Err("location lists must be an array".into())}let raw=serde_json::to_string_pretty(&lists).map_err(|e|e.to_string())?;if raw.len()>131072{return Err("location lists are too large".into())}let dir=user_config_dir();fs::create_dir_all(&dir).map_err(|e|e.to_string())?;fs::write(lists_path(),raw).map_err(|e|e.to_string())}
 fn autostart_path()->PathBuf{PathBuf::from(std::env::var("HOME").unwrap_or_else(|_|".".into())).join(".config/autostart/milmit-secure.desktop")}
 #[tauri::command]fn launch_at_startup_enabled()->bool{autostart_path().exists()}
-#[tauri::command]fn set_launch_at_startup(enabled:bool)->Result<(),String>{let path=autostart_path();if !enabled{if path.exists(){fs::remove_file(path).map_err(|e|e.to_string())?}return Ok(())}let exe=std::env::current_exe().map_err(|e|e.to_string())?;if let Some(parent)=path.parent(){fs::create_dir_all(parent).map_err(|e|e.to_string())?}let content=format!("[Desktop Entry]\nType=Application\nName=MilMit Secure\nExec={}\nX-GNOME-Autostart-enabled=true\nNoDisplay=true\n",exe.display());fs::write(path,content).map_err(|e|e.to_string())}
-
+#[tauri::command]fn set_launch_at_startup(enabled:bool)->Result<(),String>{let path=autostart_path();if !enabled{if path.exists(){fs::remove_file(path).map_err(|e|e.to_string())?}return Ok(())}let exe=std::env::current_exe().map_err(|e|e.to_string())?;if let Some(parent)=path.parent(){fs::create_dir_all(parent).map_err(|e|e.to_string())?}let repo_root=exe.parent().and_then(|p|p.parent()).and_then(|p|p.parent()).map(PathBuf::from);let dev_launcher=repo_root.as_ref().map(|r|r.join("scripts/run-tauri-gui.sh"));let exec_line=if let Some(script)=dev_launcher.filter(|p|p.exists()){format!("/bin/bash \"{}\"",script.display())}else{format!("\"{}\"",exe.display())};let content=format!("[Desktop Entry]\nType=Application\nName=MilMit Secure\nExec={exec_line}\nX-GNOME-Autostart-enabled=true\nNoDisplay=true\n");fs::write(path,content).map_err(|e|e.to_string())}
 fn main(){tauri::Builder::default().invoke_handler(tauri::generate_handler![helper_action,list_locations,ping_location,ping_locations_batch,connect_location,connection_state,traffic_snapshot,ping_report,router_state,desktop_feature_state,list_desktop_apps,get_location_lists,save_location_lists,launch_at_startup_enabled,set_launch_at_startup]).run(tauri::generate_context!()).expect("error while running MilMit Secure")}
