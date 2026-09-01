@@ -22,25 +22,26 @@ missing_modules=(); for module in webkit2gtk-4.1 libsoup-3.0 javascriptcoregtk-4
 if ((${#missing_modules[@]})); then echo "ERROR: pkg-config still cannot find: ${missing_modules[*]}" >&2; echo "PKG_CONFIG_PATH=${PKG_CONFIG_PATH:-<unset>}" >&2; exit 1; fi
 echo "Tauri native dependencies detected:"; pkg-config --modversion webkit2gtk-4.1 libsoup-3.0 javascriptcoregtk-4.1
 
-SOURCE_HELPER="$ROOT/scripts/milmit-surfshark-helper"
-INSTALLED_HELPER="/usr/libexec/milmit-surfshark-helper"
-if [[ ! -f "$INSTALLED_HELPER" ]] || ! cmp -s "$SOURCE_HELPER" "$INSTALLED_HELPER"; then
-  echo "Backend helper changed; installing the current protected backend once..."
+# Compare the complete privileged stack, not only the helper entrypoint. This
+# prevents a changed watchdog/router/desktop-feature script from silently using
+# an older installed copy.
+backend_changed=0
+backend_files=(restricted-ikev2-connect.sh restricted-ikev2-connect-v2.sh restricted-ikev2-disconnect.sh hotspot-device-policy.sh milmit-surfshark-watchdog.sh control-center.py router-features.py advanced-router.py rules-update.py status-portal.py desktop-features.py)
+for f in "${backend_files[@]}"; do
+  [[ -f "/usr/lib/milmit-surfshark/$f" ]] && cmp -s "$ROOT/scripts/$f" "/usr/lib/milmit-surfshark/$f" || backend_changed=1
+done
+[[ -f /usr/libexec/milmit-surfshark-helper ]] && cmp -s "$ROOT/scripts/milmit-surfshark-helper" /usr/libexec/milmit-surfshark-helper || backend_changed=1
+[[ -f /etc/systemd/system/milmit-surfshark-autoconnect.service ]] && cmp -s "$ROOT/packaging/milmit-surfshark-autoconnect.service" /etc/systemd/system/milmit-surfshark-autoconnect.service || backend_changed=1
+if ((backend_changed)); then
+  echo "Protected backend changed; installing the current backend once..."
   pkexec /bin/bash "$ROOT/scripts/install-privileged-helper.sh"
 fi
 
-# Build the branded Tauri icon from the tracked SVG source. The previous tiny
-# generated development tile is replaced automatically when this source is newer.
 ICON_SVG="$TAURI_DIR/icons/icon.svg"
 ICON_PNG="$TAURI_DIR/icons/icon.png"
 if [[ -f "$ICON_SVG" && ( ! -f "$ICON_PNG" || "$ICON_SVG" -nt "$ICON_PNG" ) ]]; then
-  if ! command -v rsvg-convert >/dev/null 2>&1; then
-    echo "Installing SVG icon renderer once..."
-    sudo apt-get update
-    sudo apt-get install -y librsvg2-bin
-  fi
-  echo "Rendering MilMit Secure application icon..."
-  rsvg-convert -w 512 -h 512 "$ICON_SVG" -o "$ICON_PNG"
+  if ! command -v rsvg-convert >/dev/null 2>&1; then echo "Installing SVG icon renderer once..."; sudo apt-get update; sudo apt-get install -y librsvg2-bin; fi
+  echo "Rendering MilMit Secure application icon..."; rsvg-convert -w 512 -h 512 "$ICON_SVG" -o "$ICON_PNG"
 fi
 
 [ -d node_modules ] || npm install
