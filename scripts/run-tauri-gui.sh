@@ -23,14 +23,14 @@ if ((${#missing_modules[@]})); then echo "ERROR: pkg-config still cannot find: $
 echo "Tauri native dependencies detected:"; pkg-config --modversion webkit2gtk-4.1 libsoup-3.0 javascriptcoregtk-4.1
 
 # Keep the root-owned helper/backend synchronized with the checkout. This is
-# needed when a UI feature introduces a new fixed helper action (for example
-# connecting the location selected in the UI). Upgrade authorization may ask
-# once; normal runtime actions remain passwordless through the installed rule.
+# needed when a UI feature introduces a new fixed helper action. Use bash as
+# the pkexec target so the installer does not need its executable bit set in
+# the checkout (which can otherwise surface as a misleading auth failure).
 SOURCE_HELPER="$ROOT/scripts/milmit-surfshark-helper"
 INSTALLED_HELPER="/usr/libexec/milmit-surfshark-helper"
 if [[ ! -f "$INSTALLED_HELPER" ]] || ! cmp -s "$SOURCE_HELPER" "$INSTALLED_HELPER"; then
   echo "Backend helper changed; installing the current protected backend once..."
-  pkexec "$ROOT/scripts/install-privileged-helper.sh"
+  pkexec /bin/bash "$ROOT/scripts/install-privileged-helper.sh"
 fi
 
 ICON="$TAURI_DIR/icons/icon.png"
