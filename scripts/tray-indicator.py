@@ -21,6 +21,7 @@ except Exception as exc:
 
 STATE_FILE = "/run/milmit-surfshark/restricted.state"
 HELPER = "/usr/libexec/milmit-surfshark-helper"
+DEVICE_MANAGER = "/usr/lib/milmit-surfshark/hotspot-device-manager.py"
 LOCK_FILE = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "milmit-surfshark-indicator.lock")
 
 lock = open(LOCK_FILE, "w")
@@ -47,6 +48,9 @@ ip_item.set_sensitive(False)
 menu.append(ip_item)
 
 menu.append(Gtk.SeparatorMenuItem())
+
+devices_item = Gtk.MenuItem(label="Hotspot devices…")
+menu.append(devices_item)
 
 disconnect_item = Gtk.MenuItem(label="Disconnect VPN")
 menu.append(disconnect_item)
@@ -104,7 +108,13 @@ def refresh():
         status_item.set_label("Surfshark IKEv2 · Disconnected")
         ip_item.set_label("Public IP: —")
         disconnect_item.set_sensitive(False)
+    devices_item.set_sensitive(os.path.exists(DEVICE_MANAGER))
     return True
+
+
+def open_devices(_item):
+    if os.path.exists(DEVICE_MANAGER):
+        subprocess.Popen(["python3", DEVICE_MANAGER], start_new_session=True)
 
 
 def disconnect(_item):
@@ -117,6 +127,7 @@ def quit_indicator(_item):
     Gtk.main_quit()
 
 
+devices_item.connect("activate", open_devices)
 disconnect_item.connect("activate", disconnect)
 quit_item.connect("activate", quit_indicator)
 
