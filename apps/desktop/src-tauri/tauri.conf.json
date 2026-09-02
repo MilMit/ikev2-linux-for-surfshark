@@ -26,8 +26,8 @@
     "active": true,
     "targets": ["deb", "appimage"],
     "category": "Utility",
-    "shortDescription": "Native Linux IKEv2 VPN and protected hotspot client",
-    "longDescription": "MilMit Secure is a native Linux IKEv2 VPN client with direct-IP Surfshark connectivity, protected hotspot routing, Iran bypass policies, diagnostics, split routing and persistent traffic accounting.",
+    "shortDescription": "Native Linux VPN and protected hotspot client",
+    "longDescription": "MilMit Secure is a native Linux VPN client with a stateful connection engine, direct-IP Surfshark IKEv2, protected hotspot routing, Iran bypass policies, diagnostics, split routing, persistent traffic accounting and optional WireGuard/OpenVPN fallback profiles.",
     "license": "MIT",
     "licenseFile": "../../../LICENSE",
     "icon": [
@@ -51,7 +51,9 @@
           "polkitd",
           "procps",
           "iputils-ping",
-          "qrencode"
+          "qrencode",
+          "openvpn",
+          "wireguard-tools"
         ],
         "postInstallScript": "deb/postinstall.sh",
         "preRemoveScript": "deb/preremove.sh",
@@ -60,6 +62,7 @@
           "/usr/lib/milmit-surfshark/restricted-ikev2-connect.sh": "../../../scripts/restricted-ikev2-connect.sh",
           "/usr/lib/milmit-surfshark/restricted-ikev2-connect-v2.sh": "../../../scripts/restricted-ikev2-connect-v2.sh",
           "/usr/lib/milmit-surfshark/restricted-ikev2-disconnect.sh": "../../../scripts/restricted-ikev2-disconnect.sh",
+          "/usr/lib/milmit-surfshark/connection-engine-v3.py": "../../../scripts/connection-engine-v3.py",
           "/usr/lib/milmit-surfshark/hotspot-device-policy.sh": "../../../scripts/hotspot-device-policy.sh",
           "/usr/lib/milmit-surfshark/milmit-surfshark-watchdog.sh": "../../../scripts/milmit-surfshark-watchdog.sh",
           "/usr/lib/milmit-surfshark/control-center.py": "../../../scripts/control-center.py",
