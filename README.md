@@ -2,6 +2,8 @@
 
 An **unofficial** Linux IKEv2 client focused on simple Surfshark manual connections.
 
+Created by [Milad Dadgar](https://github.com/miladdadgar) and published under [MilMit](https://github.com/MilMit).
+
 > This project is not affiliated with, endorsed by, or sponsored by Surfshark.
 > Surfshark is a trademark of its respective owner. This project does not ship Surfshark account credentials.
 
