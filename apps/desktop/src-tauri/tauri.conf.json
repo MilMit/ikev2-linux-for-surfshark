@@ -51,6 +51,7 @@
           "polkitd",
           "procps",
           "iputils-ping",
+          "ike-scan",
           "qrencode",
           "openvpn",
           "wireguard-tools"
