@@ -6,7 +6,6 @@ type Verified={fingerprint:string;verifiedAt:number;latency:number|null};
 
 const KEY='milmit-real-connect-latency-v1';
 const SCAN_FLAG='milmit-real-scan-running';
-const TTL=10*60*1000;
 let locations:Location[]=[];
 let currentFingerprint='';
 let pendingFingerprint='';
@@ -63,11 +62,13 @@ function maskLatencies(){
     const records=load();
     document.querySelectorAll<HTMLElement>('.location-row').forEach(row=>{
       const loc=findLocationForRow(row);const badge=row.querySelector<HTMLElement>('.latency');if(!loc||!badge)return;
-      const r=records[loc.id];const ok=!!r&&!!currentFingerprint&&r.fingerprint===currentFingerprint&&Date.now()-r.verifiedAt<TTL;
+      // A verified result is durable for this physical network. Real Scan's shorter cache TTL
+      // decides when to retest; it must not make an already saved result disappear from the UI.
+      const r=records[loc.id];const ok=!!r&&!!currentFingerprint&&r.fingerprint===currentFingerprint;
       if(ok&&typeof r.latency==='number'){
         setText(badge,`${r.latency} ms`);
         if(badge.dataset.realVerified!=='1')badge.dataset.realVerified='1';
-        if(badge.title!=='Verified by a successful VPN tunnel and data-path test on this network')badge.title='Verified by a successful VPN tunnel and data-path test on this network';
+        const title=`Verified by a successful VPN tunnel and data-path test on this network · ${new Date(r.verifiedAt).toLocaleString()}`;if(badge.title!==title)badge.title=title;
       }else{
         setText(badge,'—');
         if(badge.dataset.realVerified)delete badge.dataset.realVerified;
