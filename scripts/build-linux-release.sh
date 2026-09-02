@@ -20,7 +20,7 @@ install_deps(){
 }
 
 install_deps
-"$ROOT/scripts/prepare-tauri-icons.sh"
+/bin/bash "$ROOT/scripts/prepare-tauri-icons.sh"
 cd "$APP"
 
 if [[ -f package-lock.json ]]; then npm ci; else npm install; fi
