@@ -23,6 +23,12 @@ CHAIN_DEVICE_BLOCK=MILMIT_DEVICE_BLOCK
 DESKTOP=/usr/lib/milmit-surfshark/desktop-features.py
 
 [[ $EUID -eq 0 ]] || { echo "This helper must run as root." >&2; exit 77; }
+# A user can cancel while an endpoint attempt is still inside the connector.
+# Stop only MilMit connector processes; this makes Disconnect/Cancel return
+# promptly and prevents the old attempt from continuing with another endpoint.
+pkill -TERM -f '/usr/lib/milmit-surfshark/restricted-ikev2-connect-v2.sh' >/dev/null 2>&1 || true
+pkill -TERM -f '/usr/lib/milmit-surfshark/restricted-ikev2-connect.sh' >/dev/null 2>&1 || true
+sleep 0.12
 mkdir -p "$STATE_DIR"
 # User/API disconnects are authoritative. Internal watchdog recovery sets
 # MILMIT_DISCONNECT_REASON=watchdog so it does not accidentally create a
