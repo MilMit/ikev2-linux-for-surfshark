@@ -26,10 +26,12 @@ backend_files=(restricted-ikev2-connect.sh restricted-ikev2-connect-v2.sh restri
 for f in "${backend_files[@]}"; do
   [[ -f "/usr/lib/milmit-surfshark/$f" ]] && cmp -s "$ROOT/scripts/$f" "/usr/lib/milmit-surfshark/$f" || backend_changed=1
 done
+[[ -f /usr/lib/milmit-surfshark/install-privileged-helper.sh ]] && cmp -s "$ROOT/scripts/install-privileged-helper.sh" /usr/lib/milmit-surfshark/install-privileged-helper.sh || backend_changed=1
 [[ -f /usr/libexec/milmit-surfshark-helper ]] && cmp -s "$ROOT/scripts/milmit-surfshark-helper" /usr/libexec/milmit-surfshark-helper || backend_changed=1
 [[ -f /etc/systemd/system/milmit-surfshark-autoconnect.service ]] && cmp -s "$ROOT/packaging/milmit-surfshark-autoconnect.service" /etc/systemd/system/milmit-surfshark-autoconnect.service || backend_changed=1
+command -v ike-scan >/dev/null 2>&1 || backend_changed=1
 if ((backend_changed)); then
-  echo "Protected backend changed; installing the current backend once..."
+  echo "Protected backend changed; installing the current backend and IKE readiness probe once..."
   pkexec /bin/bash "$ROOT/scripts/install-privileged-helper.sh"
 fi
 

@@ -16,6 +16,7 @@ if command -v apt-get >/dev/null 2>&1; then
   command -v qrencode >/dev/null 2>&1 || missing+=(qrencode)
   command -v openvpn >/dev/null 2>&1 || missing+=(openvpn)
   command -v wg-quick >/dev/null 2>&1 || missing+=(wireguard-tools)
+  command -v ike-scan >/dev/null 2>&1 || missing+=(ike-scan)
   if ((${#missing[@]})); then DEBIAN_FRONTEND=noninteractive apt-get install -y "${missing[@]}" >/dev/null 2>&1 || true; fi
 fi
 
@@ -55,6 +56,7 @@ if [[ ! -s /var/lib/milmit-surfshark/rules/ircidr.txt ]]; then /usr/lib/milmit-s
 /usr/lib/milmit-surfshark/desktop-features.py lockdown-apply >/dev/null 2>&1 || true
 
 echo "MilMit Surfshark privileged helper and Connection Engine v3 installed."
+echo "Location latency now probes the actual IKEv2 service instead of trusting ICMP ping alone."
 echo "Fallback transports: WireGuard/OpenVPN engines are available when matching manual profiles are present under /etc/milmit-surfshark/."
 echo "Suspend/resume recovery hook installed; screen lock leaves the tunnel running and sleep recovery is automatic."
 echo "Authorization model: install/update may ask once; connect/disconnect/tools are passwordless for the active local sudo user."
