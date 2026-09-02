@@ -182,11 +182,6 @@ if [[ "$ROUTING_MODE" == iran_direct && -s "$IRAN_FILE" && -n "$IFACE" && -n "$P
   while IFS= read -r net; do
     [[ -n "$net" && "$net" != \#* ]] || continue
     ipset add "$IRAN_SET" "$net" -exist >/dev/null 2>&1 || continue
-    if [[ -n "$PHYS_GW" ]]; then
-      ip route replace "$net" via "$PHYS_GW" dev "$IFACE" src "$PHYS_SRC" table "$ROUTE_TABLE" 2>/dev/null || true
-    else
-      ip route replace "$net" dev "$IFACE" src "$PHYS_SRC" table "$ROUTE_TABLE" 2>/dev/null || true
-    fi
   done < "$IRAN_FILE"
   IRAN_READY=1
 fi
@@ -206,6 +201,10 @@ iptables -w -t mangle -A "$CHAIN_HOST" -d "$SERVER_IP/32" -j RETURN
 for net in 127.0.0.0/8 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16 224.0.0.0/4 255.255.255.255/32; do
   iptables -w -t mangle -A "$CHAIN_HOST" -d "$net" -j MARK --set-mark "$MARK_DIRECT"; iptables -w -t mangle -A "$CHAIN_HOST" -d "$net" -j RETURN
 done
+if [[ "$IRAN_READY" == 1 ]]; then
+  iptables -w -t mangle -A "$CHAIN_HOST" -m set --match-set "$IRAN_SET" dst -j MARK --set-mark "$MARK_DIRECT"
+  iptables -w -t mangle -A "$CHAIN_HOST" -m set --match-set "$IRAN_SET" dst -j RETURN
+fi
 iptables -w -t mangle -A "$CHAIN_HOST" -j MARK --set-mark "$MARK_VPN"
 
 ipt_reset mangle "$CHAIN_MSS"
