@@ -47,14 +47,33 @@ fn attempt_clear() {
     if let Ok(mut log) = ATTEMPT_LOG.lock() { log.clear(); }
 }
 fn sanitize_backend(text: &str) -> String {
-    text.lines()
-        .filter(|line| {
-            let l = line.to_ascii_lowercase();
-            !(l.contains("service_pass") || l.contains("service_user") || l.contains("password") || l.contains("secret") || l.contains("eap identity") || l.contains("authentication of '") )
-        })
-        .take(120)
-        .collect::<Vec<_>>()
-        .join("\n")
+    let mut out = Vec::<String>::new();
+    let mut local_auth = false;
+    for line in text.lines() {
+        let l = line.to_ascii_lowercase();
+        if l.contains("local eap_mschapv2 authentication") {
+            local_auth = true;
+            out.push(line.to_string());
+            continue;
+        }
+        if l.contains("remote public key authentication") { local_auth = false; }
+        if local_auth && (line.trim_start().starts_with("id:") || line.trim_start().starts_with("eap_id:")) {
+            out.push(format!("{}[redacted]", &line[..line.len() - line.trim_start().len()]));
+            continue;
+        }
+        if l.contains("service_pass") || l.contains("service_user") || l.contains("password") || l.contains("secret") || l.contains("eap identity") || l.contains("eap_identity") || l.contains("authentication of '") || line.trim_start().starts_with("local  '") {
+            continue;
+        }
+        out.push(line.to_string());
+    }
+    if out.len() > 140 {
+        let mut compact = out[..50].to_vec();
+        compact.push(format!("... {} diagnostic lines omitted ...", out.len() - 140));
+        compact.extend_from_slice(&out[out.len() - 90..]);
+        compact.join("\n")
+    } else {
+        out.join("\n")
+    }
 }
 fn attempt_add(text: &str) {
     if let Ok(mut log) = ATTEMPT_LOG.lock() {
@@ -126,10 +145,10 @@ async fn ping_locations_batch(items: Vec<PingRequest>) -> Result<Vec<PingResult>
 fn helper_output(action: &str, args: &[&str]) -> Result<String, String> {
     let limit = match action {
         "disconnect" => "18s",
-        "connect" | "connect-saved" | "quick-connect" => "12s",
+        "connect" | "connect-saved" | "quick-connect" => "27s",
         _ => "30s",
     };
-    let output = Command::new("timeout").args(["--signal=TERM", limit, "pkexec", HELPER, action]).args(args).output().map_err(|e| e.to_string())?;
+    let output = Command::new("timeout").args(["--signal=TERM", "--kill-after=2s", limit, "pkexec", HELPER, action]).args(args).output().map_err(|e| e.to_string())?;
     let mut text = String::from_utf8_lossy(&output.stdout).to_string();
     text.push_str(&String::from_utf8_lossy(&output.stderr));
     if output.status.success() { Ok(text) }
@@ -302,10 +321,10 @@ fn list_desktop_apps() -> Vec<DesktopApp> {
             if path.extension().and_then(|x| x.to_str()) != Some("desktop") { continue; }
             let id = path.file_name().and_then(|x| x.to_str()).unwrap_or("").to_string();
             if id.is_empty() || seen.contains(&id) { continue; }
-            let Ok(text) = fs::read_to_string(&path) else { continue };
+            let Ok(text) = fs::read_to_string(&path) else { continue; }
             if desktop_value(&text, "NoDisplay").as_deref() == Some("true") || desktop_value(&text, "Hidden").as_deref() == Some("true") { continue; }
-            let Some(name) = desktop_value(&text, "Name") else { continue };
-            let Some(exec) = desktop_value(&text, "Exec") else { continue };
+            let Some(name) = desktop_value(&text, "Name") else { continue; };
+            let Some(exec) = desktop_value(&text, "Exec") else { continue; };
             let icon = desktop_value(&text, "Icon").unwrap_or_default();
             seen.insert(id.clone()); out.push(DesktopApp { id, name, icon, exec });
         }
