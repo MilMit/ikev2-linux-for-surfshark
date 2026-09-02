@@ -4,6 +4,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::{atomic::{AtomicU64, Ordering}, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -11,49 +12,342 @@ mod runtime;
 #[path = "../../../../crates/gui/src/bundled_endpoints.rs"]
 mod bundled_endpoints;
 
-const HELPER:&str="/usr/libexec/milmit-surfshark-helper";
-const LOCATION_SOURCE:&str=include_str!("../../../../crates/gui/src/locations.rs");
-const STATE:&str="/run/milmit-surfshark/restricted.state";
-const LIVE:&str="/run/milmit-surfshark/live.state";
-const USAGE:&str="/var/lib/milmit-surfshark/traffic-usage.state";
-const ALLOWED:&[&str]=&["status","connect","quick-connect","connect-saved","disconnect","watchdog-status","router-status","hotspot-status","hotspot-repair","hotspot-doctor","rules-status","rules-update","health","apply-safe","full-live-test","speed-test","dns-test","mtu-test","save-lkg","support-bundle","emergency-stop","candidates","route-explain","route-test","policy-add","policy-remove","router-options","device-set","guest-start","guest-stop","guest-status","credentials-status","credentials-save","desktop-status","auto-connect","lockdown","lockdown-apply","app-direct-launch"];
+const HELPER: &str = "/usr/libexec/milmit-surfshark-helper";
+const LOCATION_SOURCE: &str = include_str!("../../../../crates/gui/src/locations.rs");
+const STATE: &str = "/run/milmit-surfshark/restricted.state";
+const LIVE: &str = "/run/milmit-surfshark/live.state";
+const USAGE: &str = "/var/lib/milmit-surfshark/traffic-usage.state";
+const ALLOWED: &[&str] = &[
+    "status", "connect", "quick-connect", "connect-saved", "disconnect", "watchdog-status",
+    "router-status", "hotspot-status", "hotspot-repair", "hotspot-doctor", "rules-status",
+    "rules-update", "health", "apply-safe", "full-live-test", "speed-test", "dns-test",
+    "mtu-test", "save-lkg", "support-bundle", "emergency-stop", "candidates", "route-explain",
+    "route-test", "policy-add", "policy-remove", "router-options", "device-set", "guest-start",
+    "guest-stop", "guest-status", "credentials-status", "credentials-save", "desktop-status",
+    "auto-connect", "lockdown", "lockdown-apply", "app-direct-launch",
+];
 
-#[derive(Clone,Serialize)]struct UiLocation{id:String,country:String,city:String,host:String}
-#[derive(Clone,Serialize)]struct ConnectionState{connected:bool,state:String,public_ip:Option<String>,exit_country:Option<String>,latency_ms:Option<u32>}
-#[derive(Clone,Deserialize)]struct PingRequest{id:String,host:String}
-#[derive(Clone,Serialize)]struct PingResult{id:String,ping:Option<u32>}
-#[derive(Clone,Serialize)]struct TrafficSnapshot{connected:bool,rx_bytes:u64,tx_bytes:u64,rx_bps:u64,tx_bps:u64,all_rx_bytes:u64,all_tx_bytes:u64,day_rx_bytes:u64,day_tx_bytes:u64,month_rx_bytes:u64,month_tx_bytes:u64}
-#[derive(Clone,Serialize)]struct DesktopApp{id:String,name:String,icon:String,exec:String}
-fn quoted_field(line:&str,field:&str)->Option<String>{let marker=format!("{field}: \"");let start=line.find(&marker)?+marker.len();let rest=&line[start..];let end=rest.find('"')?;Some(rest[..end].to_string())}
-fn parse_locations()->Vec<UiLocation>{LOCATION_SOURCE.lines().filter(|line|line.trim_start().starts_with("Location {")).filter_map(|line|Some(UiLocation{id:quoted_field(line,"id")?,country:quoted_field(line,"country")?,city:quoted_field(line,"city")?,host:quoted_field(line,"host")?})).collect()}
-#[tauri::command]fn list_locations()->Vec<UiLocation>{parse_locations()}
-fn valid_host(host:&str)->bool{host.len()<=255&&host.chars().all(|c|c.is_ascii_alphanumeric()||matches!(c,'.'|'-'))}
-fn ping_target(host:&str)->String{if host=="ee-tll.prod.surfshark.com"{return "185.174.159.123".into()}bundled_endpoints::for_host(host).first().copied().unwrap_or(host).to_string()}
-fn ping_once(target:&str)->Result<Option<u32>,String>{let output=Command::new("ping").args(["-n","-c","1","-W","1",target]).output().map_err(|e|e.to_string())?;if !output.status.success(){return Ok(None)}let text=String::from_utf8_lossy(&output.stdout);let Some(pos)=text.find("time=")else{return Ok(None)};let rest=&text[pos+5..];let end=rest.find(|c:char|c==' '||c=='\n').unwrap_or(rest.len());Ok(rest[..end].parse::<f64>().ok().map(|v|v.round()as u32))}
-#[tauri::command]async fn ping_location(host:String)->Result<Option<u32>,String>{if !valid_host(&host){return Err("invalid location hostname".into())}tauri::async_runtime::spawn_blocking(move||ping_once(&ping_target(&host))).await.map_err(|e|e.to_string())?}
-fn ping_batch_blocking(items:Vec<PingRequest>)->Result<Vec<PingResult>,String>{if items.len()>256{return Err("too many ping targets".into())}if items.iter().any(|x|x.id.len()>64||!valid_host(&x.host)){return Err("invalid ping target".into())}let mut out=Vec::with_capacity(items.len());for chunk in items.chunks(6){let handles=chunk.iter().cloned().map(|item|thread::spawn(move||PingResult{id:item.id,ping:ping_once(&ping_target(&item.host)).ok().flatten()})).collect::<Vec<_>>();for h in handles{if let Ok(v)=h.join(){out.push(v)}}}Ok(out)}
-#[tauri::command]async fn ping_locations_batch(items:Vec<PingRequest>)->Result<Vec<PingResult>,String>{tauri::async_runtime::spawn_blocking(move||ping_batch_blocking(items)).await.map_err(|e|e.to_string())?}
-fn helper_output(action:&str,args:&[&str])->Result<String,String>{let limit=match action{"disconnect"=>"18s","connect"|"connect-saved"|"quick-connect"=>"50s",_=>"30s"};let output=Command::new("timeout").args(["--signal=TERM",limit,"pkexec",HELPER,action]).args(args).output().map_err(|e|e.to_string())?;let mut text=String::from_utf8_lossy(&output.stdout).to_string();text.push_str(&String::from_utf8_lossy(&output.stderr));if output.status.success(){Ok(text)}else if output.status.code()==Some(124){Err(format!("{action} timed out after {limit}. The backend was stopped instead of freezing the UI.\n{text}"))}else{Err(text)}}
-fn helper_json(action:&str,args:&[&str])->Result<Value,String>{let text=helper_output(action,args)?;serde_json::from_str(&text).map_err(|e|format!("Invalid backend JSON: {e}\n{text}"))}
-fn state_value(path:&str,key:&str)->Option<String>{fs::read_to_string(path).ok()?.lines().find_map(|l|{let(k,v)=l.split_once('=')?;(k==key).then(||v.trim().to_string())})}
-fn state_u64(path:&str,key:&str)->u64{state_value(path,key).and_then(|v|v.parse().ok()).unwrap_or(0)}
-fn connect_location_blocking(id:String)->Result<String,String>{let loc=parse_locations().into_iter().find(|x|x.id==id).ok_or_else(||"unknown location".to_string())?;let mut candidates=Vec::<String>::new();if loc.host=="ee-tll.prod.surfshark.com"{candidates.push("185.174.159.123".into())}for ip in bundled_endpoints::for_host(&loc.host){if !candidates.iter().any(|x|x==ip){candidates.push((*ip).into())}}if candidates.is_empty(){return Err(format!("No trusted direct-IP candidate is bundled for {}. Refresh the endpoint catalog first.",loc.city))}let mut failures=String::new();for ip in candidates{match helper_output("connect-saved",&[&ip,&loc.host]){Ok(text)=>{let mut matched=false;for _ in 0..8{if state_value(STATE,"SERVER_IDENTITY").as_deref()==Some(loc.host.as_str()){matched=true;break}thread::sleep(Duration::from_millis(150))}if !matched{let actual=state_value(STATE,"SERVER_IDENTITY").unwrap_or_else(||"unknown".into());return Err(format!("Tunnel came up but selected-location verification failed. Requested {}, active identity {}.",loc.host,actual))}return Ok(format!("LOCATION={}\nCITY={}\nIDENTITY={}\nENDPOINT={}\n{}",loc.id,loc.city,loc.host,ip,text))},Err(e)=>failures.push_str(&format!("\n[{ip}] {e}\n"))}}Err(format!("All direct-IP candidates failed for {}.{}",loc.city,failures))}
-#[tauri::command]async fn connect_location(id:String)->Result<String,String>{tauri::async_runtime::spawn_blocking(move||connect_location_blocking(id)).await.map_err(|e|e.to_string())?}
-#[tauri::command]fn connection_state()->ConnectionState{let xfrm=Command::new("ip").args(["link","show","milmitxfrm0"]).output().map(|o|o.status.success()).unwrap_or(false);let state=state_value(LIVE,"STATE").or_else(||state_value(LIVE,"HEALTH")).unwrap_or_else(||if xfrm{"CONNECTED".into()}else{"DISCONNECTED".into()});ConnectionState{connected:xfrm,state,public_ip:state_value(STATE,"PUBLIC_IP").or_else(||state_value(LIVE,"PUBLIC_IP")),exit_country:state_value(STATE,"EXIT_COUNTRY").or_else(||state_value(LIVE,"EXIT_COUNTRY")),latency_ms:state_value(LIVE,"LATENCY_MS").and_then(|v|v.parse().ok())}}
-fn read_u64(path:&str)->u64{fs::read_to_string(path).ok().and_then(|v|v.trim().parse::<u64>().ok()).unwrap_or(0)}
-#[tauri::command]fn traffic_snapshot()->TrafficSnapshot{let connected=fs::metadata("/sys/class/net/milmitxfrm0").is_ok();TrafficSnapshot{connected,rx_bytes:if connected{read_u64("/sys/class/net/milmitxfrm0/statistics/rx_bytes")}else{0},tx_bytes:if connected{read_u64("/sys/class/net/milmitxfrm0/statistics/tx_bytes")}else{0},rx_bps:state_u64(LIVE,"RX_BPS"),tx_bps:state_u64(LIVE,"TX_BPS"),all_rx_bytes:state_u64(USAGE,"ALL_RX_BYTES"),all_tx_bytes:state_u64(USAGE,"ALL_TX_BYTES"),day_rx_bytes:state_u64(USAGE,"DAY_RX_BYTES"),day_tx_bytes:state_u64(USAGE,"DAY_TX_BYTES"),month_rx_bytes:state_u64(USAGE,"MONTH_RX_BYTES"),month_tx_bytes:state_u64(USAGE,"MONTH_TX_BYTES")}}
-#[tauri::command]async fn ping_report(kind:String,host:Option<String>)->Result<String,String>{tauri::async_runtime::spawn_blocking(move||{let target=match kind.as_str(){"internet"=>"1.1.1.1".to_string(),"location"|"vpn"=>{let h=host.ok_or_else(||"location hostname required".to_string())?;ping_target(&h)},_=>return Err("invalid ping report kind".into())};let output=Command::new("ping").args(["-n","-c","8","-W","2",&target]).output().map_err(|e|e.to_string())?;let mut raw=String::from_utf8_lossy(&output.stdout).to_string();raw.push_str(&String::from_utf8_lossy(&output.stderr));let loss=raw.lines().find(|l|l.contains("packet loss")).unwrap_or("Packet loss unavailable");let stats=raw.lines().find(|l|l.contains("min/avg/max")||l.contains("round-trip")).unwrap_or("RTT/jitter unavailable");Ok(format!("Target: {target}\n{loss}\n{stats}\n\n{raw}"))}).await.map_err(|e|e.to_string())?}
-#[tauri::command]async fn helper_action(action:String,args:Vec<String>)->Result<String,String>{if !ALLOWED.contains(&action.as_str()){return Err(format!("unsupported helper action: {action}"))}tauri::async_runtime::spawn_blocking(move||{let refs=args.iter().map(String::as_str).collect::<Vec<_>>();helper_output(&action,&refs)}).await.map_err(|e|e.to_string())?}
-#[tauri::command]async fn router_state()->Result<Value,String>{tauri::async_runtime::spawn_blocking(||helper_json("router-status",&[])).await.map_err(|e|e.to_string())?}
-#[tauri::command]async fn desktop_feature_state()->Result<Value,String>{tauri::async_runtime::spawn_blocking(||helper_json("desktop-status",&[])).await.map_err(|e|e.to_string())?}
-fn desktop_dirs()->Vec<PathBuf>{let mut v=Vec::new();if let Ok(home)=std::env::var("HOME"){v.push(PathBuf::from(home).join(".local/share/applications"))}v.push(PathBuf::from("/usr/local/share/applications"));v.push(PathBuf::from("/usr/share/applications"));v}
-fn desktop_value(text:&str,key:&str)->Option<String>{text.lines().find_map(|l|l.strip_prefix(&(key.to_string()+"=")).map(|v|v.trim().to_string()))}
-#[tauri::command]fn list_desktop_apps()->Vec<DesktopApp>{let mut out=Vec::new();let mut seen=HashSet::new();for dir in desktop_dirs(){let Ok(rd)=fs::read_dir(dir)else{continue};for ent in rd.flatten(){let path=ent.path();if path.extension().and_then(|x|x.to_str())!=Some("desktop"){continue}let id=path.file_name().and_then(|x|x.to_str()).unwrap_or("").to_string();if id.is_empty()||seen.contains(&id){continue}let Ok(text)=fs::read_to_string(&path)else{continue};if desktop_value(&text,"NoDisplay").as_deref()==Some("true")||desktop_value(&text,"Hidden").as_deref()==Some("true"){continue}let Some(name)=desktop_value(&text,"Name")else{continue};let Some(exec)=desktop_value(&text,"Exec")else{continue};let icon=desktop_value(&text,"Icon").unwrap_or_default();seen.insert(id.clone());out.push(DesktopApp{id,name,icon,exec})}}out.sort_by(|a,b|a.name.to_lowercase().cmp(&b.name.to_lowercase()));out}
-fn user_config_dir()->PathBuf{PathBuf::from(std::env::var("HOME").unwrap_or_else(|_|".".into())).join(".config/milmit-secure")}
-fn lists_path()->PathBuf{user_config_dir().join("location-lists.json")}
-#[tauri::command]fn get_location_lists()->Value{fs::read_to_string(lists_path()).ok().and_then(|s|serde_json::from_str(&s).ok()).unwrap_or_else(||serde_json::json!([]))}
-#[tauri::command]fn save_location_lists(lists:Value)->Result<(),String>{if !lists.is_array(){return Err("location lists must be an array".into())}let raw=serde_json::to_string_pretty(&lists).map_err(|e|e.to_string())?;if raw.len()>131072{return Err("location lists are too large".into())}let dir=user_config_dir();fs::create_dir_all(&dir).map_err(|e|e.to_string())?;fs::write(lists_path(),raw).map_err(|e|e.to_string())}
-fn autostart_path()->PathBuf{PathBuf::from(std::env::var("HOME").unwrap_or_else(|_|".".into())).join(".config/autostart/milmit-secure.desktop")}
-#[tauri::command]fn launch_at_startup_enabled()->bool{autostart_path().exists()}
-#[tauri::command]fn set_launch_at_startup(enabled:bool)->Result<(),String>{let path=autostart_path();if !enabled{if path.exists(){fs::remove_file(path).map_err(|e|e.to_string())?}return Ok(())}let exe=std::env::current_exe().map_err(|e|e.to_string())?;if let Some(parent)=path.parent(){fs::create_dir_all(parent).map_err(|e|e.to_string())?}let repo_root=exe.parent().and_then(|p|p.parent()).and_then(|p|p.parent()).map(PathBuf::from);let dev_launcher=repo_root.as_ref().map(|r|r.join("scripts/run-tauri-gui.sh"));let exec_line=if let Some(script)=dev_launcher.filter(|p|p.exists()){format!("/bin/bash \"{}\"",script.display())}else{format!("\"{}\"",exe.display())};let content=format!("[Desktop Entry]\nType=Application\nName=MilMit Secure\nExec={exec_line}\nX-GNOME-Autostart-enabled=true\nNoDisplay=true\n");fs::write(path,content).map_err(|e|e.to_string())}
-fn main(){tauri::Builder::default().setup(|app|Ok(runtime::setup(app)?)).invoke_handler(tauri::generate_handler![helper_action,list_locations,ping_location,ping_locations_batch,connect_location,connection_state,traffic_snapshot,ping_report,router_state,desktop_feature_state,list_desktop_apps,get_location_lists,save_location_lists,launch_at_startup_enabled,set_launch_at_startup]).run(tauri::generate_context!()).expect("error while running MilMit Secure")}
+static CONNECT_GENERATION: AtomicU64 = AtomicU64::new(0);
+static ATTEMPT_LOG: Mutex<String> = Mutex::new(String::new());
+
+#[derive(Clone, Serialize)]
+struct UiLocation { id: String, country: String, city: String, host: String }
+#[derive(Clone, Serialize)]
+struct ConnectionState { connected: bool, state: String, public_ip: Option<String>, exit_country: Option<String>, latency_ms: Option<u32> }
+#[derive(Clone, Deserialize)]
+struct PingRequest { id: String, host: String }
+#[derive(Clone, Serialize)]
+struct PingResult { id: String, ping: Option<u32> }
+#[derive(Clone, Serialize)]
+struct TrafficSnapshot { connected: bool, rx_bytes: u64, tx_bytes: u64, rx_bps: u64, tx_bps: u64, all_rx_bytes: u64, all_tx_bytes: u64, day_rx_bytes: u64, day_tx_bytes: u64, month_rx_bytes: u64, month_tx_bytes: u64 }
+#[derive(Clone, Serialize)]
+struct DesktopApp { id: String, name: String, icon: String, exec: String }
+
+fn attempt_clear() {
+    if let Ok(mut log) = ATTEMPT_LOG.lock() { log.clear(); }
+}
+fn sanitize_backend(text: &str) -> String {
+    text.lines()
+        .filter(|line| {
+            let l = line.to_ascii_lowercase();
+            !(l.contains("service_pass") || l.contains("service_user") || l.contains("password") || l.contains("secret") || l.contains("eap identity") || l.contains("authentication of '") )
+        })
+        .take(120)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+fn attempt_add(text: &str) {
+    if let Ok(mut log) = ATTEMPT_LOG.lock() {
+        if !log.is_empty() { log.push('\n'); }
+        log.push_str(text);
+        if log.len() > 48_000 {
+            let keep_from = log.len().saturating_sub(40_000);
+            *log = log[keep_from..].to_string();
+        }
+    }
+}
+#[tauri::command]
+fn connection_attempt_log() -> String { ATTEMPT_LOG.lock().map(|v| v.clone()).unwrap_or_default() }
+
+fn quoted_field(line: &str, field: &str) -> Option<String> {
+    let marker = format!("{field}: \"");
+    let start = line.find(&marker)? + marker.len();
+    let rest = &line[start..];
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
+}
+fn parse_locations() -> Vec<UiLocation> {
+    LOCATION_SOURCE.lines()
+        .filter(|line| line.trim_start().starts_with("Location {"))
+        .filter_map(|line| Some(UiLocation {
+            id: quoted_field(line, "id")?,
+            country: quoted_field(line, "country")?,
+            city: quoted_field(line, "city")?,
+            host: quoted_field(line, "host")?,
+        }))
+        .collect()
+}
+#[tauri::command]
+fn list_locations() -> Vec<UiLocation> { parse_locations() }
+fn valid_host(host: &str) -> bool { host.len() <= 255 && host.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-')) }
+fn ping_target(host: &str) -> String {
+    if host == "ee-tll.prod.surfshark.com" { return "185.174.159.123".into(); }
+    bundled_endpoints::for_host(host).first().copied().unwrap_or(host).to_string()
+}
+fn ping_once(target: &str) -> Result<Option<u32>, String> {
+    let output = Command::new("ping").args(["-n", "-c", "1", "-W", "1", target]).output().map_err(|e| e.to_string())?;
+    if !output.status.success() { return Ok(None); }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let Some(pos) = text.find("time=") else { return Ok(None); };
+    let rest = &text[pos + 5..];
+    let end = rest.find(|c: char| c == ' ' || c == '\n').unwrap_or(rest.len());
+    Ok(rest[..end].parse::<f64>().ok().map(|v| v.round() as u32))
+}
+#[tauri::command]
+async fn ping_location(host: String) -> Result<Option<u32>, String> {
+    if !valid_host(&host) { return Err("invalid location hostname".into()); }
+    tauri::async_runtime::spawn_blocking(move || ping_once(&ping_target(&host))).await.map_err(|e| e.to_string())?
+}
+fn ping_batch_blocking(items: Vec<PingRequest>) -> Result<Vec<PingResult>, String> {
+    if items.len() > 256 { return Err("too many ping targets".into()); }
+    if items.iter().any(|x| x.id.len() > 64 || !valid_host(&x.host)) { return Err("invalid ping target".into()); }
+    let mut out = Vec::with_capacity(items.len());
+    for chunk in items.chunks(6) {
+        let handles = chunk.iter().cloned().map(|item| thread::spawn(move || PingResult { id: item.id, ping: ping_once(&ping_target(&item.host)).ok().flatten() })).collect::<Vec<_>>();
+        for h in handles { if let Ok(v) = h.join() { out.push(v); } }
+    }
+    Ok(out)
+}
+#[tauri::command]
+async fn ping_locations_batch(items: Vec<PingRequest>) -> Result<Vec<PingResult>, String> {
+    tauri::async_runtime::spawn_blocking(move || ping_batch_blocking(items)).await.map_err(|e| e.to_string())?
+}
+
+fn helper_output(action: &str, args: &[&str]) -> Result<String, String> {
+    let limit = match action {
+        "disconnect" => "18s",
+        "connect" | "connect-saved" | "quick-connect" => "12s",
+        _ => "30s",
+    };
+    let output = Command::new("timeout").args(["--signal=TERM", limit, "pkexec", HELPER, action]).args(args).output().map_err(|e| e.to_string())?;
+    let mut text = String::from_utf8_lossy(&output.stdout).to_string();
+    text.push_str(&String::from_utf8_lossy(&output.stderr));
+    if output.status.success() { Ok(text) }
+    else if output.status.code() == Some(124) { Err(format!("{action} timed out after {limit}. The backend was stopped instead of freezing the UI.\n{text}")) }
+    else { Err(text) }
+}
+fn helper_json(action: &str, args: &[&str]) -> Result<Value, String> {
+    let text = helper_output(action, args)?;
+    serde_json::from_str(&text).map_err(|e| format!("Invalid backend JSON: {e}\n{text}"))
+}
+fn state_value(path: &str, key: &str) -> Option<String> {
+    fs::read_to_string(path).ok()?.lines().find_map(|l| {
+        let (k, v) = l.split_once('=')?;
+        (k == key).then(|| v.trim().to_string())
+    })
+}
+fn state_u64(path: &str, key: &str) -> u64 { state_value(path, key).and_then(|v| v.parse().ok()).unwrap_or(0) }
+fn protected_route() -> bool {
+    Command::new("ip").args(["-4", "route", "get", "1.1.1.1"]).output()
+        .map(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).contains("milmitxfrm0"))
+        .unwrap_or(false)
+}
+fn tunnel_active() -> bool {
+    let xfrm = fs::metadata("/sys/class/net/milmitxfrm0").is_ok();
+    let live = state_value(LIVE, "STATE").or_else(|| state_value(LIVE, "HEALTH")).unwrap_or_default().to_ascii_uppercase();
+    xfrm && protected_route() && live != "DISCONNECTED" && live != "UNPROTECTED"
+}
+
+fn connect_location_blocking(id: String, generation: u64) -> Result<String, String> {
+    let loc = parse_locations().into_iter().find(|x| x.id == id).ok_or_else(|| "unknown location".to_string())?;
+    let mut candidates = Vec::<String>::new();
+    if loc.host == "ee-tll.prod.surfshark.com" { candidates.push("185.174.159.123".into()); }
+    for ip in bundled_endpoints::for_host(&loc.host) {
+        if !candidates.iter().any(|x| x == ip) { candidates.push((*ip).into()); }
+    }
+    if candidates.is_empty() { return Err(format!("No trusted direct-IP candidate is bundled for {}. Refresh the endpoint catalog first.", loc.city)); }
+
+    attempt_add(&format!("CONNECT location={} city={} identity={} candidates={}", loc.id, loc.city, loc.host, candidates.join(",")));
+    let mut failures = String::new();
+    let total = candidates.len();
+    for (idx, ip) in candidates.into_iter().enumerate() {
+        if CONNECT_GENERATION.load(Ordering::SeqCst) != generation {
+            attempt_add("CANCELLED before next candidate");
+            return Err("Connection attempt cancelled.".into());
+        }
+        attempt_add(&format!("CANDIDATE {}/{} ip={} identity={}", idx + 1, total, ip, loc.host));
+        match helper_output("connect-saved", &[&ip, &loc.host]) {
+            Ok(text) => {
+                if CONNECT_GENERATION.load(Ordering::SeqCst) != generation {
+                    attempt_add("CANCELLED after backend returned");
+                    return Err("Connection attempt cancelled.".into());
+                }
+                let safe = sanitize_backend(&text);
+                if !safe.trim().is_empty() { attempt_add(&format!("BACKEND_OK ip={}\n{}", ip, safe)); }
+                let mut matched = false;
+                for _ in 0..8 {
+                    if state_value(STATE, "SERVER_IDENTITY").as_deref() == Some(loc.host.as_str()) && tunnel_active() {
+                        matched = true;
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(150));
+                }
+                if !matched {
+                    let actual = state_value(STATE, "SERVER_IDENTITY").unwrap_or_else(|| "unknown".into());
+                    attempt_add(&format!("VERIFY_FAIL requested={} actual={} protected_route={}", loc.host, actual, protected_route()));
+                    return Err(format!("Tunnel backend returned but selected-location verification failed. Requested {}, active identity {}.", loc.host, actual));
+                }
+                attempt_add(&format!("CONNECTED endpoint={} identity={}", ip, loc.host));
+                return Ok(format!("LOCATION={}\nCITY={}\nIDENTITY={}\nENDPOINT={}\n{}", loc.id, loc.city, loc.host, ip, text));
+            }
+            Err(e) => {
+                let safe = sanitize_backend(&e);
+                attempt_add(&format!("CANDIDATE_FAIL ip={}\n{}", ip, safe));
+                if CONNECT_GENERATION.load(Ordering::SeqCst) != generation {
+                    attempt_add("CANCELLED during candidate");
+                    return Err("Connection attempt cancelled.".into());
+                }
+                failures.push_str(&format!("\n[{ip}] {safe}\n"));
+            }
+        }
+    }
+    attempt_add("FAILED all candidates");
+    Err(format!("All direct-IP candidates failed for {}.{}", loc.city, failures))
+}
+#[tauri::command]
+async fn connect_location(id: String) -> Result<String, String> {
+    let generation = CONNECT_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+    attempt_clear();
+    tauri::async_runtime::spawn_blocking(move || connect_location_blocking(id, generation)).await.map_err(|e| e.to_string())?
+}
+#[tauri::command]
+async fn cancel_connect() -> Result<String, String> {
+    CONNECT_GENERATION.fetch_add(1, Ordering::SeqCst);
+    attempt_add("CANCEL requested by user");
+    tauri::async_runtime::spawn_blocking(|| helper_output("disconnect", &[])).await.map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+fn connection_state() -> ConnectionState {
+    let connected = tunnel_active();
+    let raw_state = state_value(LIVE, "STATE").or_else(|| state_value(LIVE, "HEALTH"));
+    let state = if connected {
+        raw_state.filter(|s| !s.eq_ignore_ascii_case("DISCONNECTED") && !s.eq_ignore_ascii_case("UNPROTECTED")).unwrap_or_else(|| "CONNECTED".into())
+    } else {
+        "DISCONNECTED".into()
+    };
+    ConnectionState {
+        connected,
+        state,
+        public_ip: if connected { state_value(STATE, "PUBLIC_IP").or_else(|| state_value(LIVE, "PUBLIC_IP")) } else { None },
+        exit_country: if connected { state_value(STATE, "EXIT_COUNTRY").or_else(|| state_value(LIVE, "EXIT_COUNTRY")) } else { None },
+        latency_ms: if connected { state_value(LIVE, "LATENCY_MS").and_then(|v| v.parse().ok()) } else { None },
+    }
+}
+fn read_u64(path: &str) -> u64 { fs::read_to_string(path).ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0) }
+#[tauri::command]
+fn traffic_snapshot() -> TrafficSnapshot {
+    let connected = tunnel_active();
+    TrafficSnapshot {
+        connected,
+        rx_bytes: if connected { read_u64("/sys/class/net/milmitxfrm0/statistics/rx_bytes") } else { 0 },
+        tx_bytes: if connected { read_u64("/sys/class/net/milmitxfrm0/statistics/tx_bytes") } else { 0 },
+        rx_bps: state_u64(LIVE, "RX_BPS"), tx_bps: state_u64(LIVE, "TX_BPS"),
+        all_rx_bytes: state_u64(USAGE, "ALL_RX_BYTES"), all_tx_bytes: state_u64(USAGE, "ALL_TX_BYTES"),
+        day_rx_bytes: state_u64(USAGE, "DAY_RX_BYTES"), day_tx_bytes: state_u64(USAGE, "DAY_TX_BYTES"),
+        month_rx_bytes: state_u64(USAGE, "MONTH_RX_BYTES"), month_tx_bytes: state_u64(USAGE, "MONTH_TX_BYTES"),
+    }
+}
+#[tauri::command]
+async fn ping_report(kind: String, host: Option<String>) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let target = match kind.as_str() {
+            "internet" => "1.1.1.1".to_string(),
+            "location" | "vpn" => { let h = host.ok_or_else(|| "location hostname required".to_string())?; ping_target(&h) },
+            _ => return Err("invalid ping report kind".into()),
+        };
+        let output = Command::new("ping").args(["-n", "-c", "8", "-W", "2", &target]).output().map_err(|e| e.to_string())?;
+        let mut raw = String::from_utf8_lossy(&output.stdout).to_string();
+        raw.push_str(&String::from_utf8_lossy(&output.stderr));
+        let loss = raw.lines().find(|l| l.contains("packet loss")).unwrap_or("Packet loss unavailable");
+        let stats = raw.lines().find(|l| l.contains("min/avg/max") || l.contains("round-trip")).unwrap_or("RTT/jitter unavailable");
+        Ok(format!("Target: {target}\n{loss}\n{stats}\n\n{raw}"))
+    }).await.map_err(|e| e.to_string())?
+}
+#[tauri::command]
+async fn helper_action(action: String, args: Vec<String>) -> Result<String, String> {
+    if !ALLOWED.contains(&action.as_str()) { return Err(format!("unsupported helper action: {action}")); }
+    tauri::async_runtime::spawn_blocking(move || { let refs = args.iter().map(String::as_str).collect::<Vec<_>>(); helper_output(&action, &refs) }).await.map_err(|e| e.to_string())?
+}
+#[tauri::command]
+async fn router_state() -> Result<Value, String> { tauri::async_runtime::spawn_blocking(|| helper_json("router-status", &[])).await.map_err(|e| e.to_string())? }
+#[tauri::command]
+async fn desktop_feature_state() -> Result<Value, String> { tauri::async_runtime::spawn_blocking(|| helper_json("desktop-status", &[])).await.map_err(|e| e.to_string())? }
+
+fn desktop_dirs() -> Vec<PathBuf> {
+    let mut v = Vec::new();
+    if let Ok(home) = std::env::var("HOME") { v.push(PathBuf::from(home).join(".local/share/applications")); }
+    v.push(PathBuf::from("/usr/local/share/applications"));
+    v.push(PathBuf::from("/usr/share/applications"));
+    v
+}
+fn desktop_value(text: &str, key: &str) -> Option<String> { text.lines().find_map(|l| l.strip_prefix(&(key.to_string() + "=")).map(|v| v.trim().to_string())) }
+#[tauri::command]
+fn list_desktop_apps() -> Vec<DesktopApp> {
+    let mut out = Vec::new(); let mut seen = HashSet::new();
+    for dir in desktop_dirs() {
+        let Ok(rd) = fs::read_dir(dir) else { continue };
+        for ent in rd.flatten() {
+            let path = ent.path();
+            if path.extension().and_then(|x| x.to_str()) != Some("desktop") { continue; }
+            let id = path.file_name().and_then(|x| x.to_str()).unwrap_or("").to_string();
+            if id.is_empty() || seen.contains(&id) { continue; }
+            let Ok(text) = fs::read_to_string(&path) else { continue };
+            if desktop_value(&text, "NoDisplay").as_deref() == Some("true") || desktop_value(&text, "Hidden").as_deref() == Some("true") { continue; }
+            let Some(name) = desktop_value(&text, "Name") else { continue };
+            let Some(exec) = desktop_value(&text, "Exec") else { continue };
+            let icon = desktop_value(&text, "Icon").unwrap_or_default();
+            seen.insert(id.clone()); out.push(DesktopApp { id, name, icon, exec });
+        }
+    }
+    out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase())); out
+}
+fn user_config_dir() -> PathBuf { PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into())).join(".config/milmit-secure") }
+fn lists_path() -> PathBuf { user_config_dir().join("location-lists.json") }
+#[tauri::command]
+fn get_location_lists() -> Value { fs::read_to_string(lists_path()).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_else(|| serde_json::json!([])) }
+#[tauri::command]
+fn save_location_lists(lists: Value) -> Result<(), String> {
+    if !lists.is_array() { return Err("location lists must be an array".into()); }
+    let raw = serde_json::to_string_pretty(&lists).map_err(|e| e.to_string())?;
+    if raw.len() > 131072 { return Err("location lists are too large".into()); }
+    let dir = user_config_dir(); fs::create_dir_all(&dir).map_err(|e| e.to_string())?; fs::write(lists_path(), raw).map_err(|e| e.to_string())
+}
+fn autostart_path() -> PathBuf { PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into())).join(".config/autostart/milmit-secure.desktop") }
+#[tauri::command]
+fn launch_at_startup_enabled() -> bool { autostart_path().exists() }
+#[tauri::command]
+fn set_launch_at_startup(enabled: bool) -> Result<(), String> {
+    let path = autostart_path();
+    if !enabled { if path.exists() { fs::remove_file(path).map_err(|e| e.to_string())?; } return Ok(()); }
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    if let Some(parent) = path.parent() { fs::create_dir_all(parent).map_err(|e| e.to_string())?; }
+    let repo_root = exe.parent().and_then(|p| p.parent()).and_then(|p| p.parent()).map(PathBuf::from);
+    let dev_launcher = repo_root.as_ref().map(|r| r.join("scripts/run-tauri-gui.sh"));
+    let exec_line = if let Some(script) = dev_launcher.filter(|p| p.exists()) { format!("/bin/bash \"{}\"", script.display()) } else { format!("\"{}\"", exe.display()) };
+    let content = format!("[Desktop Entry]\nType=Application\nName=MilMit Secure\nExec={exec_line}\nX-GNOME-Autostart-enabled=true\nNoDisplay=true\n");
+    fs::write(path, content).map_err(|e| e.to_string())
+}
+
+fn main() {
+    tauri::Builder::default()
+        .setup(|app| Ok(runtime::setup(app)?))
+        .invoke_handler(tauri::generate_handler![
+            helper_action, list_locations, ping_location, ping_locations_batch, connect_location, cancel_connect,
+            connection_attempt_log, connection_state, traffic_snapshot, ping_report, router_state,
+            desktop_feature_state, list_desktop_apps, get_location_lists, save_location_lists,
+            launch_at_startup_enabled, set_launch_at_startup
+        ])
+        .run(tauri::generate_context!())
+        .expect("error while running MilMit Secure")
+}
