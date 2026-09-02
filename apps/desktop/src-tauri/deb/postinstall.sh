@@ -16,6 +16,14 @@ systemctl enable --now milmit-surfshark-rules-update.timer >/dev/null 2>&1 || tr
 systemctl enable --now milmit-surfshark-portal.service >/dev/null 2>&1 || true
 systemctl disable --now milmit-surfshark-keepawake.service >/dev/null 2>&1 || true
 
+# Refresh desktop/icon caches so GNOME/KDE show the branded icon immediately.
+if command -v update-desktop-database >/dev/null 2>&1; then
+  update-desktop-database /usr/share/applications >/dev/null 2>&1 || true
+fi
+if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+  gtk-update-icon-cache -q -t -f /usr/share/icons/hicolor >/dev/null 2>&1 || true
+fi
+
 # Keep the user's Auto-connect preference during upgrades.
 if [ -f /var/lib/milmit-surfshark/desktop-features.json ] && grep -q '"auto_connect"[[:space:]]*:[[:space:]]*true' /var/lib/milmit-surfshark/desktop-features.json; then
   systemctl enable milmit-surfshark-autoconnect.service >/dev/null 2>&1 || true
