@@ -45,27 +45,29 @@ HOTSPOT_POLICY=/usr/lib/milmit-surfshark/hotspot-device-policy.sh
 [[ "$MSS" =~ ^[0-9]+$ && "$MSS" -ge 900 && "$MSS" -le 1400 ]] || { echo "MSS must be 900-1400" >&2; exit 64; }
 [[ "$ROUTING_MODE" == vpn_all || "$ROUTING_MODE" == iran_direct ]] || { echo "invalid routing mode" >&2; exit 64; }
 
-ipt_unhook() { local t="$1" b="$2" c="$3"; while iptables -w -t "$t" -D "$b" -j "$c" 2>/dev/null; do :; done; }
-ipt_reset() { local t="$1" c="$2"; iptables -w -t "$t" -N "$c" 2>/dev/null || true; iptables -w -t "$t" -F "$c"; }
-cleanup_rules() {
+ipt_unhook(){ local t="$1" b="$2" c="$3"; while iptables -w -t "$t" -D "$b" -j "$c" 2>/dev/null; do :; done; }
+ipt_reset(){ local t="$1" c="$2"; iptables -w -t "$t" -N "$c" 2>/dev/null || true; iptables -w -t "$t" -F "$c"; }
+cleanup_rules(){
   while ip rule del pref "$RULE_ENDPOINT_PREF" >/dev/null 2>&1; do :; done
   for pref in 101 102 103 104 105 106 107 108; do while ip rule del pref "$pref" >/dev/null 2>&1; do :; done; done
   while ip rule del pref "$RULE_DIRECT_PREF" >/dev/null 2>&1; do :; done
   while ip rule del pref "$RULE_VPN_PREF" >/dev/null 2>&1; do :; done
   while ip rule del pref 220 >/dev/null 2>&1; do :; done
 }
-cleanup_policy() {
+cleanup_policy(){
   ipt_unhook mangle OUTPUT "$CHAIN_HOST"; ipt_unhook mangle OUTPUT "$CHAIN_MSS"; ipt_unhook mangle FORWARD "$CHAIN_MSS"
   ipt_unhook filter OUTPUT "$CHAIN_KILL"; ipt_unhook filter FORWARD "$CHAIN_KILL"
   for spec in "mangle:$CHAIN_HOST" "mangle:$CHAIN_MSS" "filter:$CHAIN_KILL"; do
     local t="${spec%%:*}" c="${spec#*:}"
-    iptables -w -t "$t" -F "$c" 2>/dev/null || true; iptables -w -t "$t" -X "$c" 2>/dev/null || true
+    iptables -w -t "$t" -F "$c" 2>/dev/null || true
+    iptables -w -t "$t" -X "$c" 2>/dev/null || true
   done
   cleanup_rules
   ip route flush table "$ROUTE_TABLE" >/dev/null 2>&1 || true
+  ip route flush cache >/dev/null 2>&1 || true
 }
 
-detect_hotspot_iface() {
+detect_hotspot_iface(){
   if [[ "$HOTSPOT_IFACE_REQUEST" != auto ]]; then
     ip link show "$HOTSPOT_IFACE_REQUEST" >/dev/null 2>&1 && printf '%s' "$HOTSPOT_IFACE_REQUEST"
     return
@@ -81,7 +83,7 @@ detect_hotspot_iface() {
   done < <(nmcli -t -f DEVICE,STATE device status 2>/dev/null || true)
 }
 
-network_of_iface() {
+network_of_iface(){
   local dev="$1" cidr
   cidr="$(ip -4 -o addr show dev "$dev" scope global 2>/dev/null | awk '{print $4}' | head -n1)"
   [[ -n "$cidr" ]] || return 0
@@ -92,11 +94,20 @@ except Exception: pass
 PY
 }
 
+counter(){ cat "/sys/class/net/$XFRM_IF/statistics/$1" 2>/dev/null || echo 0; }
+sa_established(){ swanctl --list-sas 2>/dev/null | grep -Fq "$CONN_NAME"; }
+trace_probe(){
+  local addr="$1"
+  curl -4 --connect-timeout 4 --max-time 6 -ksS "https://$addr/cdn-cgi/trace" 2>/dev/null || true
+}
+
 SERVICE_PASS=""
 if [[ ! -t 0 ]]; then IFS= read -r SERVICE_PASS || true; fi
-install -d -m 0700 "$CRED_DIR"; install -d -m 0755 "$VAR_DIR"
+install -d -m 0700 "$CRED_DIR"
+install -d -m 0755 "$VAR_DIR"
 if [[ -n "$SERVICE_PASS" ]]; then
-  umask 077; printf 'SERVICE_USER=%q\nSERVICE_PASS=%q\n' "$SERVICE_USER" "$SERVICE_PASS" > "$CRED_FILE"
+  umask 077
+  printf 'SERVICE_USER=%q\nSERVICE_PASS=%q\n' "$SERVICE_USER" "$SERVICE_PASS" > "$CRED_FILE"
 elif [[ -f "$CRED_FILE" ]]; then
   # shellcheck disable=SC1090
   source "$CRED_FILE"
@@ -111,6 +122,12 @@ ip link del "$XFRM_IF" >/dev/null 2>&1 || true
 rm -f "$STATE_FILE"
 ip link add "$XFRM_IF" type xfrm if_id "$XFRM_IF_ID"
 ip link set "$XFRM_IF" mtu 1280 up
+# Route-based XFRM is intentionally asymmetric. Strict reverse-path filtering can
+# drop decrypted replies even though IKE/CHILD SAs are healthy, especially after
+# changing between Wi-Fi, fibre and mobile tethering.
+sysctl -qw net.ipv4.conf.all.rp_filter=2 || true
+sysctl -qw net.ipv4.conf.default.rp_filter=2 || true
+sysctl -qw "net.ipv4.conf.$XFRM_IF.rp_filter=0" || true
 
 ESC_PASS="${SERVICE_PASS//\\/\\\\}"; ESC_PASS="${ESC_PASS//\"/\\\"}"
 install -d -m 0755 /etc/swanctl/conf.d
@@ -167,12 +184,14 @@ printf '%s\n' "$CONF_DUMP" | grep -Fq "eap_id: $SERVICE_USER" || { echo "Parsed 
 swanctl --initiate --child "$CHILD_NAME"
 SA_TEXT="$(swanctl --list-sas 2>&1 || true)"; printf '%s\n' "$SA_TEXT"
 printf '%s\n' "$SA_TEXT" | grep -Fq "$CONN_NAME" || { echo "IKE SA was not established." >&2; exit 67; }
+printf '%s\n' "$SA_TEXT" | grep -Fq "INSTALLED, TUNNEL" || { echo "CHILD SA was not installed." >&2; exit 67; }
 VIRTUAL_IP="$(printf '%s\n' "$SA_TEXT" | sed -nE 's/.*local .*\[([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)\].*/\1/p' | head -n1)"
 [[ -n "$VIRTUAL_IP" ]] || { echo "No virtual IPv4 was assigned." >&2; exit 67; }
 PHYS_ROUTE="$(ip -4 route get "$SERVER_IP" 2>/dev/null || true)"
 IFACE="$(sed -nE 's/.* dev ([^ ]+).*/\1/p' <<< "$PHYS_ROUTE" | head -n1)"
 PHYS_SRC="$(sed -nE 's/.* src ([0-9.]+).*/\1/p' <<< "$PHYS_ROUTE" | head -n1)"
 PHYS_GW="$(sed -nE 's/.* via ([0-9.]+).*/\1/p' <<< "$PHYS_ROUTE" | head -n1)"
+[[ -n "$IFACE" ]] && sysctl -qw "net.ipv4.conf.$IFACE.rp_filter=2" || true
 
 ip route replace default dev "$XFRM_IF" src "$VIRTUAL_IP" table "$ROUTE_TABLE"
 IRAN_READY=0
@@ -189,17 +208,19 @@ fi
 cleanup_rules
 ip rule add pref "$RULE_ENDPOINT_PREF" to "$SERVER_IP/32" table main
 pref="$RULE_LOCAL_PREF_BASE"
-for net in 127.0.0.0/8 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16 224.0.0.0/4 255.255.255.255/32; do ip rule add pref "$pref" to "$net" table main; pref=$((pref+1)); done
+for net in 127.0.0.0/8 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16 224.0.0.0/4 255.255.255.255/32; do
+  ip rule add pref "$pref" to "$net" table main
+  pref=$((pref+1))
+done
 ip rule add pref "$RULE_DIRECT_PREF" fwmark "$MARK_DIRECT" table main
 ip rule add pref "$RULE_VPN_PREF" table "$ROUTE_TABLE"
 
 ipt_reset mangle "$CHAIN_HOST"
-# Respect marks set by the higher-priority policy engine. On iptables-nft the
-# negation belongs to the --mark option, not before -m.
 iptables -w -t mangle -A "$CHAIN_HOST" -m mark ! --mark 0 -j RETURN
 iptables -w -t mangle -A "$CHAIN_HOST" -d "$SERVER_IP/32" -j RETURN
 for net in 127.0.0.0/8 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16 224.0.0.0/4 255.255.255.255/32; do
-  iptables -w -t mangle -A "$CHAIN_HOST" -d "$net" -j MARK --set-mark "$MARK_DIRECT"; iptables -w -t mangle -A "$CHAIN_HOST" -d "$net" -j RETURN
+  iptables -w -t mangle -A "$CHAIN_HOST" -d "$net" -j MARK --set-mark "$MARK_DIRECT"
+  iptables -w -t mangle -A "$CHAIN_HOST" -d "$net" -j RETURN
 done
 if [[ "$IRAN_READY" == 1 ]]; then
   iptables -w -t mangle -A "$CHAIN_HOST" -m set --match-set "$IRAN_SET" dst -j MARK --set-mark "$MARK_DIRECT"
@@ -213,19 +234,66 @@ iptables -w -t mangle -A "$CHAIN_MSS" -p tcp --tcp-flags SYN,RST SYN -i "$XFRM_I
 ipt_unhook mangle OUTPUT "$CHAIN_MSS"; iptables -w -t mangle -I OUTPUT 1 -j "$CHAIN_MSS"
 ipt_unhook mangle OUTPUT "$CHAIN_HOST"; iptables -w -t mangle -I OUTPUT 1 -j "$CHAIN_HOST"
 ipt_unhook mangle FORWARD "$CHAIN_MSS"; iptables -w -t mangle -I FORWARD 1 -j "$CHAIN_MSS"
+ip route flush cache >/dev/null 2>&1 || true
 
 IFS=',' read -r -a DNS_ARR <<< "$DNS_CSV"
-if command -v resolvectl >/dev/null 2>&1 && [[ -n "$IFACE" ]]; then resolvectl dns "$IFACE" "${DNS_ARR[@]}" || true; resolvectl domain "$IFACE" '~.' || true; resolvectl flush-caches || true; fi
+if command -v resolvectl >/dev/null 2>&1 && [[ -n "$IFACE" ]]; then
+  resolvectl dns "$IFACE" "${DNS_ARR[@]}" || true
+  resolvectl domain "$IFACE" '~.' || true
+  resolvectl flush-caches || true
+fi
 
 ROUTE_CHECK="$(ip -4 route get 1.1.1.1 2>&1 || true)"; printf 'System route : %s\n' "$ROUTE_CHECK"
 printf '%s' "$ROUTE_CHECK" | grep -Fq "dev $XFRM_IF" || { echo "System route does not select $XFRM_IF" >&2; cleanup_policy; exit 68; }
 printf '%s' "$ROUTE_CHECK" | grep -Fq "src $VIRTUAL_IP" || { echo "System route did not select Surfshark virtual source." >&2; cleanup_policy; exit 68; }
-BEFORE_TX="$(cat /sys/class/net/$XFRM_IF/statistics/tx_packets 2>/dev/null || echo 0)"
-TRACE="$(curl -4 --connect-timeout 6 --max-time 15 -ks https://1.1.1.1/cdn-cgi/trace || true)"
-AFTER_TX="$(cat /sys/class/net/$XFRM_IF/statistics/tx_packets 2>/dev/null || echo 0)"
-PUBLIC_IP="$(sed -n 's/^ip=//p' <<< "$TRACE" | head -n1)"; EXIT_COUNTRY="$(sed -n 's/^loc=//p' <<< "$TRACE" | head -n1)"
-printf 'XFRM packets  : %s -> %s\n' "$BEFORE_TX" "$AFTER_TX"
-[[ -n "$PUBLIC_IP" && "$AFTER_TX" -gt "$BEFORE_TX" ]] || { echo "System data-path verification failed." >&2; cleanup_policy; exit 68; }
+
+BEFORE_TX="$(counter tx_packets)"; BEFORE_RX="$(counter rx_packets)"
+TRACE="$(trace_probe 1.1.1.1)"
+PUBLIC_IP="$(sed -n 's/^ip=//p' <<< "$TRACE" | head -n1)"
+EXIT_COUNTRY="$(sed -n 's/^loc=//p' <<< "$TRACE" | head -n1)"
+if [[ -z "$PUBLIC_IP" ]]; then
+  TRACE="$(trace_probe 1.0.0.1)"
+  PUBLIC_IP="$(sed -n 's/^ip=//p' <<< "$TRACE" | head -n1)"
+  EXIT_COUNTRY="$(sed -n 's/^loc=//p' <<< "$TRACE" | head -n1)"
+fi
+if [[ -z "$PUBLIC_IP" ]]; then
+  ping -4 -n -c 1 -W 2 1.1.1.1 >/dev/null 2>&1 || true
+fi
+AFTER_TX="$(counter tx_packets)"; AFTER_RX="$(counter rx_packets)"
+printf 'XFRM tx packets: %s -> %s\n' "$BEFORE_TX" "$AFTER_TX"
+printf 'XFRM rx packets: %s -> %s\n' "$BEFORE_RX" "$AFTER_RX"
+
+DATA_PATH=verified
+if [[ -n "$PUBLIC_IP" ]]; then
+  DATA_PATH=verified
+elif (( AFTER_RX > BEFORE_RX )); then
+  # The tunnel returned real traffic even if the external trace service did not
+  # return metadata. Do not tear down a healthy SA because one probe endpoint failed.
+  DATA_PATH=packet-verified
+  echo "Data path received encrypted replies; public-IP metadata probe was unavailable." >&2
+else
+  # One recovery pass fixes stale conntrack/route-cache state seen after network
+  # switching and resume without destroying a successfully authenticated SA.
+  ip route flush cache >/dev/null 2>&1 || true
+  command -v conntrack >/dev/null 2>&1 && conntrack -D -p tcp >/dev/null 2>&1 || true
+  sleep 0.4
+  RETRY_RX="$(counter rx_packets)"
+  ping -4 -n -c 1 -W 2 1.0.0.1 >/dev/null 2>&1 || true
+  FINAL_RX="$(counter rx_packets)"
+  if (( FINAL_RX > RETRY_RX )); then
+    DATA_PATH=packet-verified
+    echo "Data path recovered after route/conntrack refresh." >&2
+  elif sa_established; then
+    echo "IKE/CHILD SA is established but no decrypted return traffic was observed." >&2
+    echo "Data path remains unusable after recovery; trying another endpoint is appropriate." >&2
+    cleanup_policy
+    exit 68
+  else
+    echo "VPN SA disappeared during data-path verification." >&2
+    cleanup_policy
+    exit 68
+  fi
+fi
 
 HOTSPOT_IFACE="$(detect_hotspot_iface)"
 HOTSPOT_SUBNET=""
@@ -248,6 +316,7 @@ SYSTEM_VPN=1
 KILL_SWITCH=$KILL_SWITCH
 ROUTING_MODE=$ROUTING_MODE
 IRAN_SET_READY=$IRAN_READY
+DATA_PATH=$DATA_PATH
 HOTSPOT_VPN=$HOTSPOT_VPN
 HOTSPOT_IFACE_REQUEST=$HOTSPOT_IFACE_REQUEST
 HOTSPOT_IFACE=$HOTSPOT_IFACE
@@ -270,7 +339,7 @@ printf '\nRestricted Surfshark IKEv2 is established\n'
 printf 'Server ID     : %s\n' "$SERVER_IDENTITY"
 printf 'Virtual IPv4  : %s\n' "$VIRTUAL_IP"
 printf 'Routing mode  : %s\n' "$ROUTING_MODE"
-printf 'Data-path test: OK\n'
-printf 'Public IPv4   : %s\n' "$PUBLIC_IP"
+printf 'Data-path test: %s\n' "$DATA_PATH"
+printf 'Public IPv4   : %s\n' "${PUBLIC_IP:-unavailable}"
 printf 'Exit country  : %s\n' "${EXIT_COUNTRY:-unknown}"
 if [[ -n "$HOTSPOT_IFACE" ]]; then printf 'Hotspot iface  : %s\n' "$HOTSPOT_IFACE"; fi
