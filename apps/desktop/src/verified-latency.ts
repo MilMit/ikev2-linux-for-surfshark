@@ -9,14 +9,15 @@ const TTL=10*60*1000;
 let locations:Location[]=[];
 let currentFingerprint='';
 let lastConnected=false;
-let lastState='DISCONNECTED';
 let preConnectFingerprint='';
 let masking=false;
+let maskQueued=false;
 
 function load():Record<string,Verified>{try{return JSON.parse(localStorage.getItem(KEY)||'{}')}catch{return{}}}
 function save(v:Record<string,Verified>){localStorage.setItem(KEY,JSON.stringify(v))}
 function selectedId(){return localStorage.getItem('milmit-selected-location')||''}
 function normalizeRoute(s:string){return s.replace(/\s+uid\s+\d+/g,'').replace(/\s+cache\s*/g,' ').replace(/\s+/g,' ').trim()}
+function setText(el:HTMLElement,text:string){if(el.textContent!==text)el.textContent=text}
 
 async function physicalFingerprint(){
   try{
@@ -41,11 +42,6 @@ function findLocationForRow(row:HTMLElement):Location|undefined{
   return locations.find(x=>x.city===city&&x.country===country);
 }
 
-function verifiedOnCurrentNetwork(id:string){
-  const r=load()[id];
-  return !!r&&!!currentFingerprint&&r.fingerprint===currentFingerprint&&Date.now()-r.verifiedAt<TTL;
-}
-
 function maskLatencies(){
   if(masking)return;masking=true;
   try{
@@ -54,23 +50,24 @@ function maskLatencies(){
       const loc=findLocationForRow(row);const badge=row.querySelector<HTMLElement>('.latency');if(!loc||!badge)return;
       const r=records[loc.id];const ok=!!r&&!!currentFingerprint&&r.fingerprint===currentFingerprint&&Date.now()-r.verifiedAt<TTL;
       if(ok&&typeof r.latency==='number'){
-        badge.textContent=`${r.latency} ms`;
-        badge.dataset.realVerified='1';
-        badge.title='Verified by a successful VPN tunnel and data-path test on this network';
+        setText(badge,`${r.latency} ms`);
+        if(badge.dataset.realVerified!=='1')badge.dataset.realVerified='1';
+        if(badge.title!=='Verified by a successful VPN tunnel and data-path test on this network')badge.title='Verified by a successful VPN tunnel and data-path test on this network';
       }else{
-        badge.textContent='—';
-        delete badge.dataset.realVerified;
-        badge.title='Not fully verified on this network yet';
+        setText(badge,'—');
+        if(badge.dataset.realVerified)delete badge.dataset.realVerified;
+        if(badge.title!=='Not fully verified on this network yet')badge.title='Not fully verified on this network yet';
       }
     });
     document.querySelectorAll<HTMLElement>('.country-group').forEach(group=>{
       const badge=group.querySelector<HTMLElement>(':scope > summary .country-latency');if(!badge)return;
       const vals=[...group.querySelectorAll<HTMLElement>('.location-row .latency[data-real-verified="1"]')].map(x=>Number((x.textContent||'').match(/\d+/)?.[0])).filter(Number.isFinite);
-      badge.textContent=vals.length?`${Math.min(...vals)} ms`:'—';
-      badge.title=vals.length?'Best fully verified location on this network':'No fully verified location on this network yet';
+      const text=vals.length?`${Math.min(...vals)} ms`:'—';setText(badge,text);
+      const title=vals.length?'Best fully verified location on this network':'No fully verified location on this network yet';if(badge.title!==title)badge.title=title;
     });
   }finally{masking=false}
 }
+function queueMask(){if(maskQueued)return;maskQueued=true;requestAnimationFrame(()=>{maskQueued=false;maskLatencies()})}
 
 async function poll(){
   try{
@@ -78,31 +75,23 @@ async function poll(){
     const phase=(state.state||'').toUpperCase();
     const connecting=['PREPARING','IKE','AUTHENTICATING','TUNNEL_ESTABLISHED','VERIFYING_DATA','FALLBACK','CONNECTING'].includes(phase);
     if(connecting&&!preConnectFingerprint){preConnectFingerprint=currentFingerprint||await physicalFingerprint()}
-    if(!state.connected&&!connecting){
-      const fp=await physicalFingerprint();if(fp)currentFingerprint=fp;
-    }
+    if(!state.connected&&!connecting){const fp=await physicalFingerprint();if(fp)currentFingerprint=fp}
     if(state.connected&&!lastConnected){
       const id=selectedId();const fp=preConnectFingerprint||currentFingerprint;
-      if(id&&fp){
-        const all=load();all[id]={fingerprint:fp,verifiedAt:Date.now(),latency:cachedLatency(id)??state.latency_ms??null};save(all);
-      }
+      if(id&&fp){const all=load();all[id]={fingerprint:fp,verifiedAt:Date.now(),latency:cachedLatency(id)??state.latency_ms??null};save(all)}
       preConnectFingerprint='';
     }
-    if(!state.connected&&lastConnected){preConnectFingerprint=''}
-    if(!state.connected&&(phase==='FAILED'||phase==='BLOCKED')){
-      const id=selectedId();if(id){const all=load();delete all[id];save(all)}
-    }
-    lastConnected=state.connected;lastState=phase;maskLatencies();
+    if(!state.connected&&lastConnected)preConnectFingerprint='';
+    if(!state.connected&&(phase==='FAILED'||phase==='BLOCKED')){const id=selectedId();if(id){const all=load();delete all[id];save(all)}}
+    lastConnected=state.connected;queueMask();
   }catch{}
 }
 
-function installStyles(){
-  const s=document.createElement('style');s.textContent=`.latency[data-real-verified="1"],.country-latency{transition:opacity .18s ease}.latency[data-real-verified="1"]::before{content:'✓ ';font-size:.8em;opacity:.8}`;document.head.appendChild(s)
-}
+function installStyles(){const s=document.createElement('style');s.textContent=`.latency[data-real-verified="1"],.country-latency{transition:opacity .18s ease}.latency[data-real-verified="1"]::before{content:'✓ ';font-size:.8em;opacity:.8}`;document.head.appendChild(s)}
 
-void invoke<Location[]>('list_locations').then(v=>{locations=v;maskLatencies()}).catch(()=>{});
-void physicalFingerprint().then(v=>{currentFingerprint=v;maskLatencies()});
-new MutationObserver(()=>requestAnimationFrame(maskLatencies)).observe(document.documentElement,{subtree:true,childList:true,characterData:true});
+void invoke<Location[]>('list_locations').then(v=>{locations=v;queueMask()}).catch(()=>{});
+void physicalFingerprint().then(v=>{currentFingerprint=v;queueMask()});
+new MutationObserver(queueMask).observe(document.documentElement,{subtree:true,childList:true,characterData:true});
 installStyles();
 setInterval(()=>void poll(),1200);
 void poll();
