@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=MilMit Secure
+Comment=Native Linux IKEv2 VPN and protected hotspot client
+Exec=milmit-secure-desktop
+Icon=net.milmit.secure
+Terminal=false
+Categories=Network;Utility;Security;
+StartupNotify=true
+StartupWMClass=MilMit Secure
+Keywords=VPN;IKEv2;Surfshark;Privacy;Hotspot;
