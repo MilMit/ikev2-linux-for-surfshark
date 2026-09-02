@@ -12,10 +12,10 @@ pub struct Location {
 // Surfshark manual/OpenVPN server catalogs. Surfshark's account-side IKEv2
 // Locations tab remains the authoritative source if a hostname changes.
 //
-// We intentionally keep at least one usable endpoint per country and add a few
-// extra cities for larger regions. The UI performs latency/availability checks
-// at runtime, so stale/unreachable endpoints can be identified without
-// blocking the interface.
+// Snapshot checked against Surfshark's public server-location catalog on 2026-09-02.
+// It contains every advertised country and every separately selectable city.
+// The UI performs latency/availability checks at runtime, so stale/unreachable
+// endpoints can be identified without blocking the interface.
 pub const LOCATIONS: &[Location] = &[
     Location { id: "al-tia", label: "🇦🇱 Albania · Tirana", country: "Albania", city: "Tirana", host: "al-tia.prod.surfshark.com" },
     Location { id: "dz-alg", label: "🇩🇿 Algeria · Algiers", country: "Algeria", city: "Algiers", host: "dz-alg.prod.surfshark.com" },
@@ -128,6 +128,7 @@ pub const LOCATIONS: &[Location] = &[
     Location { id: "us-mia", label: "🇺🇸 United States · Miami", country: "United States", city: "Miami", host: "us-mia.prod.surfshark.com" },
     Location { id: "us-chi", label: "🇺🇸 United States · Chicago", country: "United States", city: "Chicago", host: "us-chi.prod.surfshark.com" },
     Location { id: "fr-bod", label: "🇫🇷 France · Bordeaux", country: "France", city: "Bordeaux", host: "fr-bod.prod.surfshark.com" },
+    Location { id: "fr-mrs", label: "🇫🇷 France · Marseille", country: "France", city: "Marseille", host: "fr-mrs.prod.surfshark.com" },
     Location { id: "it-rom", label: "🇮🇹 Italy · Rome", country: "Italy", city: "Rome", host: "it-rom.prod.surfshark.com" },
     Location { id: "pl-gdn", label: "🇵🇱 Poland · Gdańsk", country: "Poland", city: "Gdańsk", host: "pl-gdn.prod.surfshark.com" },
     Location { id: "pt-opo", label: "🇵🇹 Portugal · Porto", country: "Portugal", city: "Porto", host: "pt-opo.prod.surfshark.com" },
@@ -142,6 +143,24 @@ pub const LOCATIONS: &[Location] = &[
     Location { id: "au-adl", label: "🇦🇺 Australia · Adelaide", country: "Australia", city: "Adelaide", host: "au-adl.prod.surfshark.com" },
     Location { id: "in-del", label: "🇮🇳 India · Delhi", country: "India", city: "Delhi", host: "in-del.prod.surfshark.com" },
     Location { id: "be-anr", label: "🇧🇪 Belgium · Antwerp", country: "Belgium", city: "Antwerp", host: "be-anr.prod.surfshark.com" },
+    Location { id: "us-bos", label: "🇺🇸 United States · Boston", country: "United States", city: "Boston", host: "us-bos.prod.surfshark.com" },
+    Location { id: "us-buf", label: "🇺🇸 United States · Buffalo", country: "United States", city: "Buffalo", host: "us-buf.prod.surfshark.com" },
+    Location { id: "us-ash", label: "🇺🇸 United States · Ashburn", country: "United States", city: "Ashburn", host: "us-ash.prod.surfshark.com" },
+    Location { id: "us-dtw", label: "🇺🇸 United States · Detroit", country: "United States", city: "Detroit", host: "us-dtw.prod.surfshark.com" },
+    Location { id: "us-clt", label: "🇺🇸 United States · Charlotte", country: "United States", city: "Charlotte", host: "us-clt.prod.surfshark.com" },
+    Location { id: "us-ltm", label: "🇺🇸 United States · Latham", country: "United States", city: "Latham", host: "us-ltm.prod.surfshark.com" },
+    Location { id: "us-bna", label: "🇺🇸 United States · Nashville", country: "United States", city: "Nashville", host: "us-bna.prod.surfshark.com" },
+    Location { id: "us-oma", label: "🇺🇸 United States · Omaha", country: "United States", city: "Omaha", host: "us-oma.prod.surfshark.com" },
+    Location { id: "us-atl", label: "🇺🇸 United States · Atlanta", country: "United States", city: "Atlanta", host: "us-atl.prod.surfshark.com" },
+    Location { id: "us-kan", label: "🇺🇸 United States · Kansas City", country: "United States", city: "Kansas City", host: "us-kan.prod.surfshark.com" },
+    Location { id: "us-den", label: "🇺🇸 United States · Denver", country: "United States", city: "Denver", host: "us-den.prod.surfshark.com" },
+    Location { id: "us-bdn", label: "🇺🇸 United States · Bend", country: "United States", city: "Bend", host: "us-bdn.prod.surfshark.com" },
+    Location { id: "us-slc", label: "🇺🇸 United States · Salt Lake City", country: "United States", city: "Salt Lake City", host: "us-slc.prod.surfshark.com" },
+    Location { id: "us-dal", label: "🇺🇸 United States · Dallas", country: "United States", city: "Dallas", host: "us-dal.prod.surfshark.com" },
+    Location { id: "us-hou", label: "🇺🇸 United States · Houston", country: "United States", city: "Houston", host: "us-hou.prod.surfshark.com" },
+    Location { id: "us-las", label: "🇺🇸 United States · Las Vegas", country: "United States", city: "Las Vegas", host: "us-las.prod.surfshark.com" },
+    Location { id: "us-sjc", label: "🇺🇸 United States · San Jose", country: "United States", city: "San Jose", host: "us-sjc.prod.surfshark.com" },
+    Location { id: "us-phx", label: "🇺🇸 United States · Phoenix", country: "United States", city: "Phoenix", host: "us-phx.prod.surfshark.com" },
 ];
 
 pub fn by_id(id: &str) -> Option<Location> {
@@ -153,4 +172,23 @@ pub fn by_host(host: &str) -> Option<Location> {
         return None;
     }
     LOCATIONS.iter().copied().find(|item| item.host == host)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::LOCATIONS;
+    use std::collections::HashSet;
+
+    #[test]
+    fn catalog_covers_current_surfshark_locations_without_duplicates() {
+        let ids: HashSet<_> = LOCATIONS.iter().map(|item| item.id).collect();
+        let hosts: HashSet<_> = LOCATIONS.iter().map(|item| item.host).collect();
+        let countries: HashSet<_> = LOCATIONS.iter().map(|item| item.country).collect();
+        assert_eq!(ids.len(), LOCATIONS.len(), "duplicate location id");
+        assert_eq!(hosts.len(), LOCATIONS.len(), "duplicate location hostname");
+        assert_eq!(countries.len(), 100, "Surfshark currently advertises 100 countries");
+        for id in ["fr-mrs", "uk-edi", "us-ash", "us-bna", "us-oma", "us-sjc"] {
+            assert!(ids.contains(id), "missing advertised location {id}");
+        }
+    }
 }
