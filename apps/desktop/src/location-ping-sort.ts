@@ -2,6 +2,15 @@
 // Moving nodes with appendChild() breaks React's reconciliation order and can make a clicked
 // country/city appear to select a different stale location. We only assign CSS order here.
 
+// Latency semantics changed from plain ICMP to IKEv2-service readiness. Drop the old
+// cached values once so an ICMP-responsive but unusable VPN endpoint never keeps a stale ms badge.
+const probeVersion = 'ike-service-v1';
+if (localStorage.getItem('milmit-latency-probe-version') !== probeVersion) {
+  localStorage.removeItem('milmit-country-pings-v2');
+  localStorage.removeItem('milmit-location-pings-v2');
+  localStorage.setItem('milmit-latency-probe-version', probeVersion);
+}
+
 const latencyValue = (node: Element | null): number => {
   if (!node) return Number.POSITIVE_INFINITY;
   const m = (node.textContent || '').match(/(\d+)\s*ms/i);
@@ -51,12 +60,8 @@ const queueSort = () => {
 
 // Only observe React-rendered child/text changes. We never move children ourselves, so this
 // cannot create the previous reconciliation loop or detach a row from its React position.
-const observer = new MutationObserver(queueSort);
-observer.observe(document.documentElement, {
-  childList: true,
-  subtree: true,
-  characterData: true,
-});
+const observer=new MutationObserver(queueSort);
+observer.observe(document.documentElement,{childList:true,subtree:true,characterData:true});
 
 window.addEventListener('DOMContentLoaded', queueSort);
 queueSort();
