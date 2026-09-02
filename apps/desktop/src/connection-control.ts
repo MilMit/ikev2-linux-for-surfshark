@@ -34,27 +34,28 @@ async function cancel(){
   try{await invoke<string>('cancel_connect');}catch(e){console.warn('MilMit cancel_connect:',e)}finally{cancelling=false;queueDecorate();}
 }
 
-document.addEventListener('click',async e=>{
+document.addEventListener('click',e=>{
   if(replaying)return;
   const target=e.target as HTMLElement|null;
   const btn=target?.closest<HTMLButtonElement>('[data-milmit-cancel="1"]');
   if(btn&&phase()==='CONNECTING'){
     e.preventDefault();e.stopPropagation();
-    await cancel();
+    void cancel();
     return;
   }
   const loc=target?.closest<HTMLButtonElement>('.location-row,.quick-location');
   if(loc&&phase()==='CONNECTING'){
+    // Switching location must never wait for the old IKE attempt to unwind.
+    // Start cancellation in parallel, then replay the user's selection into React immediately.
     e.preventDefault();e.stopPropagation();
-    await cancel();
+    void cancel();
     replaying=true;
-    try{loc.click();}finally{setTimeout(()=>{replaying=false},0)}
+    try{loc.click();}finally{queueMicrotask(()=>{replaying=false})}
   }
 },true);
 
 // Do not observe class/disabled attributes here. decorate() itself changes those
-// attributes; observing them created a self-triggering MutationObserver loop
-// that could peg the WebView and make the whole app appear frozen on Connect.
+// attributes; observing them created a self-triggering MutationObserver loop.
 const observer=new MutationObserver(()=>queueDecorate());
 observer.observe(document.documentElement,{childList:true,subtree:true,characterData:true});
 setInterval(queueDecorate,500);
