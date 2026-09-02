@@ -1,5 +1,6 @@
-// Keeps Select Location ordered by measured latency without changing React state semantics.
-// Countries with a known lower ping are shown first; unknown/unmeasured entries stay last.
+// Keeps Select Location ordered by measured latency without moving React-owned DOM nodes.
+// Moving nodes with appendChild() breaks React's reconciliation order and can make a clicked
+// country/city appear to select a different stale location. We only assign CSS order here.
 
 const latencyValue = (node: Element | null): number => {
   if (!node) return Number.POSITIVE_INFINITY;
@@ -7,34 +8,34 @@ const latencyValue = (node: Element | null): number => {
   return m ? Number(m[1]) : Number.POSITIVE_INFINITY;
 };
 
-const sortByLatency = () => {
-  const list = document.querySelector('.country-list');
+const nameValue = (node: Element | null) => (node?.textContent || '').trim();
+
+const applyLatencyOrder = () => {
+  const list = document.querySelector<HTMLElement>('.country-list');
   if (!list) return;
 
-  const countries = Array.from(list.querySelectorAll(':scope > .country-group'));
-  countries.sort((a, b) => {
+  // .country-list is already a CSS grid; grid items respect the order property.
+  const countries = Array.from(list.querySelectorAll<HTMLElement>(':scope > .country-group'));
+  const rankedCountries = [...countries].sort((a, b) => {
     const pa = latencyValue(a.querySelector(':scope > summary .country-latency'));
     const pb = latencyValue(b.querySelector(':scope > summary .country-latency'));
     if (pa !== pb) return pa - pb;
-    const an = (a.querySelector(':scope > summary b')?.textContent || '').trim();
-    const bn = (b.querySelector(':scope > summary b')?.textContent || '').trim();
-    return an.localeCompare(bn);
+    return nameValue(a.querySelector(':scope > summary b')).localeCompare(nameValue(b.querySelector(':scope > summary b')));
   });
-  for (const country of countries) list.appendChild(country);
+  rankedCountries.forEach((country, index) => { country.style.order = String(index); });
 
   for (const country of countries) {
-    const cities = country.querySelector('.location-list');
+    const cities = country.querySelector<HTMLElement>('.location-list');
     if (!cities) continue;
-    const rows = Array.from(cities.querySelectorAll(':scope > .location-row'));
-    rows.sort((a, b) => {
+    // .location-list is also a CSS grid, so rows can be visually sorted without DOM mutation.
+    const rows = Array.from(cities.querySelectorAll<HTMLElement>(':scope > .location-row'));
+    const rankedRows = [...rows].sort((a, b) => {
       const pa = latencyValue(a.querySelector('.latency'));
       const pb = latencyValue(b.querySelector('.latency'));
       if (pa !== pb) return pa - pb;
-      const an = (a.querySelector('.loc-main b')?.textContent || '').trim();
-      const bn = (b.querySelector('.loc-main b')?.textContent || '').trim();
-      return an.localeCompare(bn);
+      return nameValue(a.querySelector('.loc-main b')).localeCompare(nameValue(b.querySelector('.loc-main b')));
     });
-    for (const row of rows) cities.appendChild(row);
+    rankedRows.forEach((row, index) => { row.style.order = String(index); });
   }
 };
 
@@ -44,10 +45,12 @@ const queueSort = () => {
   queued = true;
   requestAnimationFrame(() => {
     queued = false;
-    sortByLatency();
+    applyLatencyOrder();
   });
 };
 
+// Only observe React-rendered child/text changes. We never move children ourselves, so this
+// cannot create the previous reconciliation loop or detach a row from its React position.
 const observer = new MutationObserver(queueSort);
 observer.observe(document.documentElement, {
   childList: true,
