@@ -17,10 +17,11 @@ if command -v apt-get >/dev/null 2>&1; then
   if ((${#missing[@]})); then DEBIAN_FRONTEND=noninteractive apt-get install -y "${missing[@]}" >/dev/null 2>&1 || true; fi
 fi
 
-install -d -m 0755 /usr/lib/milmit-surfshark /usr/libexec /usr/share/polkit-1/actions "$RULES_DIR" "$EXT_DIR" /var/lib/milmit-surfshark /var/lib/milmit-surfshark/rules
-for f in restricted-ikev2-connect.sh restricted-ikev2-connect-v2.sh restricted-ikev2-disconnect.sh hotspot-device-policy.sh milmit-surfshark-watchdog.sh control-center.py router-features.py advanced-router.py rules-update.py status-portal.py desktop-features.py hotspot-doctor.py; do
+install -d -m 0755 /usr/lib/milmit-surfshark /usr/libexec /usr/share/polkit-1/actions "$RULES_DIR" "$EXT_DIR" /var/lib/milmit-surfshark /var/lib/milmit-surfshark/rules /usr/lib/systemd/system-sleep
+for f in restricted-ikev2-connect.sh restricted-ikev2-connect-v2.sh restricted-ikev2-disconnect.sh hotspot-device-policy.sh milmit-surfshark-watchdog.sh milmit-surfshark-sleep-hook.sh control-center.py router-features.py advanced-router.py rules-update.py status-portal.py desktop-features.py hotspot-doctor.py; do
   install -o root -g root -m 0755 "$ROOT/scripts/$f" "/usr/lib/milmit-surfshark/$f"
 done
+install -o root -g root -m 0755 "$ROOT/scripts/milmit-surfshark-sleep-hook.sh" /usr/lib/systemd/system-sleep/milmit-surfshark
 install -o root -g root -m 0755 "$ROOT/scripts/install-privileged-helper.sh" /usr/lib/milmit-surfshark/install-privileged-helper.sh
 install -o root -g root -m 0755 "$ROOT/scripts/hotspot-device-manager.py" /usr/lib/milmit-surfshark/hotspot-device-manager.py
 install -o root -g root -m 0755 "$ROOT/scripts/milmit-surfshark-helper" /usr/libexec/milmit-surfshark-helper
@@ -52,4 +53,5 @@ if [[ ! -s /var/lib/milmit-surfshark/rules/ircidr.txt ]]; then /usr/lib/milmit-s
 /usr/lib/milmit-surfshark/desktop-features.py lockdown-apply >/dev/null 2>&1 || true
 
 echo "MilMit Surfshark privileged helper and native desktop/router protection stack installed."
+echo "Suspend/resume recovery hook installed; screen lock leaves the tunnel running and sleep recovery is automatic."
 echo "Authorization model: install/update may ask once; connect/disconnect/tools are passwordless for the active local sudo user."
