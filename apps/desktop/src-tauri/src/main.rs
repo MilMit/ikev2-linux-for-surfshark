@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::{atomic::{AtomicU64, Ordering}, Mutex};
 use std::thread;
+use std::time::Instant;
 
 mod runtime;
 #[path = "../../../../crates/gui/src/bundled_endpoints.rs"]
@@ -17,6 +18,7 @@ const STATE: &str = "/run/milmit-surfshark/restricted.state";
 const LIVE: &str = "/run/milmit-surfshark/live.state";
 const ENGINE_STATE: &str = "/run/milmit-surfshark/engine-v3.json";
 const ENGINE_EVENTS: &str = "/run/milmit-surfshark/engine-v3.events";
+const ENDPOINT_HEALTH: &str = "/var/lib/milmit-surfshark/endpoint-health.json";
 const USAGE: &str = "/var/lib/milmit-surfshark/traffic-usage.state";
 const ALLOWED: &[&str] = &[
     "status", "connect", "quick-connect", "connect-saved", "engine-connect", "engine-status", "disconnect", "cancel-connect", "watchdog-status",
@@ -103,27 +105,59 @@ fn parse_locations() -> Vec<UiLocation> {
 #[tauri::command]
 fn list_locations() -> Vec<UiLocation> { parse_locations() }
 fn valid_host(host: &str) -> bool { host.len() <= 255 && host.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-')) }
-fn ping_target(host: &str) -> String {
-    if host == "ee-tll.prod.surfshark.com" { return "185.174.159.123".into(); }
-    bundled_endpoints::for_host(host).first().copied().unwrap_or(host).to_string()
+fn candidate_ips(host: &str) -> Vec<String> {
+    let mut out = Vec::<String>::new();
+    if host == "ee-tll.prod.surfshark.com" { out.push("185.174.159.123".into()); }
+    for ip in bundled_endpoints::for_host(host) {
+        if !out.iter().any(|x| x == ip) { out.push((*ip).to_string()); }
+    }
+    out
 }
-fn ping_once(target: &str) -> Result<Option<u32>, String> {
-    let output = Command::new("ping").args(["-n", "-c", "1", "-W", "1", target]).output().map_err(|e| e.to_string())?;
-    if !output.status.success() { return Ok(None); }
-    let text = String::from_utf8_lossy(&output.stdout); let Some(pos) = text.find("time=") else { return Ok(None); }; let rest = &text[pos + 5..];
-    let end = rest.find(|c: char| c == ' ' || c == '\n').unwrap_or(rest.len()); Ok(rest[..end].parse::<f64>().ok().map(|v| v.round() as u32))
+fn ping_target(host: &str) -> String { candidate_ips(host).into_iter().next().unwrap_or_else(|| host.to_string()) }
+fn recent_health_blocks(host: &str, endpoint: &str) -> bool {
+    let fresh = fs::metadata(ENDPOINT_HEALTH).and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).map(|d| d.as_secs() < 15 * 60).unwrap_or(false);
+    if !fresh { return false; }
+    let Ok(raw) = fs::read_to_string(ENDPOINT_HEALTH) else { return false; };
+    let Ok(v) = serde_json::from_str::<Value>(&raw) else { return false; };
+    let key = format!("ikev2:{host}:{endpoint}");
+    let outcome = v.get("endpoints").and_then(|x| x.get(&key)).and_then(|x| x.get("last_outcome")).and_then(Value::as_str).unwrap_or("");
+    matches!(outcome, "DATA_PATH_BLOCKED" | "HANDSHAKE_FAILED" | "TIMEOUT" | "POST_TUNNEL_FAILED" | "AUTH_FAILED")
+}
+fn ike_probe_ip(target: &str, nat_t: bool) -> Result<Option<u32>, String> {
+    let mut cmd = Command::new("ike-scan");
+    cmd.arg("--ikev2");
+    if nat_t { cmd.arg("--nat-t"); }
+    cmd.args(["--sport=0", "--retry=1", "--timeout=1200", "--nodns", "--quiet", target]);
+    let started = Instant::now();
+    let output = cmd.output().map_err(|e| format!("ike-scan unavailable: {e}"))?;
+    let elapsed = started.elapsed().as_millis().min(u32::MAX as u128) as u32;
+    let mut text = String::from_utf8_lossy(&output.stdout).to_string();
+    text.push_str(&String::from_utf8_lossy(&output.stderr));
+    let responded = text.lines().any(|line| line.trim_start().starts_with(target));
+    Ok(responded.then_some(elapsed.max(1)))
+}
+fn ike_latency(host: &str) -> Result<Option<u32>, String> {
+    let candidates = candidate_ips(host);
+    if candidates.is_empty() { return Ok(None); }
+    let mut best: Option<u32> = None;
+    for ip in candidates {
+        if recent_health_blocks(host, &ip) { continue; }
+        let measured = ike_probe_ip(&ip, false)?.or(ike_probe_ip(&ip, true)?);
+        if let Some(ms) = measured { best = Some(best.map_or(ms, |b| b.min(ms))); }
+    }
+    Ok(best)
 }
 #[tauri::command]
 async fn ping_location(host: String) -> Result<Option<u32>, String> {
     if !valid_host(&host) { return Err("invalid location hostname".into()); }
-    tauri::async_runtime::spawn_blocking(move || ping_once(&ping_target(&host))).await.map_err(|e| e.to_string())?
+    tauri::async_runtime::spawn_blocking(move || ike_latency(&host)).await.map_err(|e| e.to_string())?
 }
 fn ping_batch_blocking(items: Vec<PingRequest>) -> Result<Vec<PingResult>, String> {
     if items.len() > 256 { return Err("too many ping targets".into()); }
     if items.iter().any(|x| x.id.len() > 64 || !valid_host(&x.host)) { return Err("invalid ping target".into()); }
     let mut out = Vec::with_capacity(items.len());
     for chunk in items.chunks(6) {
-        let handles = chunk.iter().cloned().map(|item| thread::spawn(move || PingResult { id: item.id, ping: ping_once(&ping_target(&item.host)).ok().flatten() })).collect::<Vec<_>>();
+        let handles = chunk.iter().cloned().map(|item| thread::spawn(move || PingResult { id: item.id, ping: ike_latency(&item.host).ok().flatten() })).collect::<Vec<_>>();
         for h in handles { if let Ok(v) = h.join() { out.push(v); } }
     }
     Ok(out)
@@ -158,9 +192,7 @@ fn tunnel_active() -> bool {
 
 fn connect_location_blocking(id: String, generation: u64) -> Result<String, String> {
     let loc = parse_locations().into_iter().find(|x| x.id == id).ok_or_else(|| "unknown location".to_string())?;
-    let mut candidates = Vec::<String>::new();
-    if loc.host == "ee-tll.prod.surfshark.com" { candidates.push("185.174.159.123".into()); }
-    for ip in bundled_endpoints::for_host(&loc.host) { if !candidates.iter().any(|x| x == ip) { candidates.push((*ip).into()); } }
+    let candidates = candidate_ips(&loc.host);
     if candidates.is_empty() { return Err(format!("No trusted direct-IP candidate is bundled for {}. Refresh the endpoint catalog first.", loc.city)); }
     let csv=candidates.join(","); attempt_add(&format!("ENGINE_V3 location={} city={} identity={} candidates={}",loc.id,loc.city,loc.host,csv));
     if CONNECT_GENERATION.load(Ordering::SeqCst) != generation { return Err("Connection attempt cancelled.".into()); }
