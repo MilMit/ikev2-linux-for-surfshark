@@ -3,6 +3,7 @@ set -euo pipefail
 
 CONNECT=/usr/lib/milmit-surfshark/restricted-ikev2-connect-v2.sh
 ENGINE=/usr/lib/milmit-surfshark/connection-engine-v3.py
+DISCOVERY=/usr/lib/milmit-surfshark/secure-endpoint-discovery.py
 DISCONNECT=/usr/lib/milmit-surfshark/restricted-ikev2-disconnect.sh
 DEVICE_POLICY=/usr/lib/milmit-surfshark/hotspot-device-policy.sh
 CONTROL=/usr/lib/milmit-surfshark/control-center.py
@@ -56,19 +57,24 @@ d=dict(zip(k,sys.argv[1:]));d['ike_timeout']='34';print(json.dumps(d,separators=
 PY
 }
 engine_connect(){
-  local identity="${1:-}" csv="${2:-}" candidates opts
+  local identity="${1:-}" csv="${2:-}" candidates opts discovered=""
   [[ -x "$ENGINE" ]] || { echo "connection engine v3 is not installed" >&2; exit 69; }
   [[ "$identity" =~ ^[A-Za-z0-9.-]+$ ]] || { echo "invalid server identity" >&2; exit 64; }
   [[ -n "$csv" && ${#csv} -le 1024 && "$csv" =~ ^[0-9.,]+$ ]] || { echo "invalid candidate list" >&2; exit 64; }
   [[ -s "$CRED_FILE" ]] || { echo "Saved Surfshark credentials are unavailable." >&2; exit 66; }
-  candidates="$(python3 - "$csv" <<'PY'
+  if [[ -x "$DISCOVERY" ]]; then discovered="$("$DISCOVERY" "$identity" "$csv" 2>/dev/null || true)"; fi
+  candidates="$(python3 - "$csv" "$discovered" <<'PY'
 import ipaddress,json,sys
 out=[]
-for x in sys.argv[1].split(','):
-    x=x.strip()
-    if not x: continue
-    ipaddress.ip_address(x)
-    if x not in out: out.append(x)
+try:
+ d=json.loads(sys.argv[2]) if sys.argv[2] else {}
+except Exception:d={}
+for x in list(d.get('addresses') or [])+sys.argv[1].split(','):
+ x=str(x).strip()
+ if not x:continue
+ try: ip=ipaddress.ip_address(x)
+ except ValueError:continue
+ if ip.version==4 and not(ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_unspecified) and x not in out:out.append(x)
 if not out or len(out)>32: raise SystemExit(64)
 print(json.dumps(out,separators=(',',':')))
 PY
