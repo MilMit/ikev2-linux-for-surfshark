@@ -6,6 +6,7 @@ type ConnState={connected:boolean;state:string;latency_ms?:number|null};
 type Verified={fingerprint:string;verifiedAt:number;latency:number|null};
 
 const VERIFIED_KEY='milmit-real-connect-latency-v1';
+const SCAN_FLAG='milmit-real-scan-running';
 const TTL=10*60*1000;
 const CONNECT_DEADLINE_MS=12000;
 let running=false;
@@ -14,7 +15,7 @@ let cancelled=false;
 function loadVerified():Record<string,Verified>{try{return JSON.parse(localStorage.getItem(VERIFIED_KEY)||'{}')}catch{return{}}}
 function saveVerified(v:Record<string,Verified>){localStorage.setItem(VERIFIED_KEY,JSON.stringify(v))}
 function normalizeRoute(s:string){return s.replace(/\s+uid\s+\d+/g,'').replace(/\s+cache\s*/g,' ').replace(/\s+/g,' ').trim()}
-async function fingerprint(){try{const raw=await invoke<string>('helper_action',{action:'route-explain',args:['1.1.1.1']});const v=JSON.parse(raw);return normalizeRoute(String(v?.results?.[0]?.route||''))}catch{return''}}
+async function fingerprint(){try{const raw=await invoke<string>('helper_action',{action:'route-explain',args:['1.1.1.1']});const v=JSON.parse(raw);const route=normalizeRoute(String(v?.results?.[0]?.route||''));if(!route||/milmitxfrm0|table\s+220/i.test(route))return'';return route}catch{return''}}
 function sleep(ms:number){return new Promise(r=>setTimeout(r,ms))}
 
 async function waitDisconnected(maxMs=2200){const end=Date.now()+maxMs;while(Date.now()<end){try{const s=await invoke<ConnState>('connection_state');if(!s.connected&&!['PREPARING','IKE','AUTHENTICATING','TUNNEL_ESTABLISHED','VERIFYING_DATA','FALLBACK','CONNECTING','CANCELLING'].includes((s.state||'').toUpperCase()))return}catch{}await sleep(120)}}
@@ -30,8 +31,6 @@ async function realConnect(loc:Location,preflightMs:number|null){
     const state=await invoke<ConnState>('connection_state').catch(()=>({connected:false,state:'FAILED'} as ConnState));
     if(!state.connected)return null;
     const elapsed=Math.max(1,Math.round(performance.now()-started));
-    // The displayed latency remains an endpoint/IKE latency, but it is only published
-    // after a complete authenticated tunnel + data-path verification succeeds.
     return preflightMs??state.latency_ms??elapsed;
   }finally{
     if(timer)window.clearTimeout(timer);
@@ -52,10 +51,11 @@ async function startRealScan(btn:HTMLButtonElement){
   if(running){cancelled=true;btn.textContent='Stopping…';return}
   const current=await invoke<ConnState>('connection_state').catch(()=>({connected:false,state:'DISCONNECTED'} as ConnState));
   if(current.connected&&!window.confirm('Fast Real Scan temporarily disconnects the active VPN while it verifies countries one by one. Continue?'))return;
-  running=true;cancelled=false;btn.classList.add('is-running');btn.innerHTML='<span class="real-scan-dot"></span><span>Stop real scan</span>';
+  running=true;cancelled=false;localStorage.setItem(SCAN_FLAG,'1');window.dispatchEvent(new CustomEvent('milmit-real-scan-state',{detail:{running:true}}));btn.classList.add('is-running');btn.innerHTML='<span class="real-scan-dot"></span><span>Stop real scan</span>';
   try{
     if(current.connected){await invoke('cancel_connect').catch(()=>{});await waitDisconnected()}
-    const fp=await fingerprint();
+    let fp='';
+    for(let i=0;i<6&&!fp;i++){fp=await fingerprint();if(!fp)await sleep(180)}
     const all=await invoke<Location[]>('list_locations');
     const byCountry=new Map<string,Location[]>();for(const l of all){const a=byCountry.get(l.country)||[];a.push(l);byCountry.set(l.country,a)}
     const reps=[...byCountry.values()].map(v=>v[0]);
@@ -69,19 +69,18 @@ async function startRealScan(btn:HTMLButtonElement){
       done++;const old=verified[loc.id];
       if(old&&fp&&old.fingerprint===fp&&Date.now()-old.verifiedAt<TTL){ok++;setProgress(`Real scan · ${done}/${ordered.length} · ${ok} verified`);continue}
       const quick=preMap.get(loc.id)??null;
-      if(quick==null){delete verified[loc.id];skipped++;setProgress(`Real scan · ${done}/${ordered.length} · ${ok} verified`);continue}
+      if(quick==null){skipped++;setProgress(`Real scan · ${done}/${ordered.length} · ${ok} verified`);continue}
       setProgress(`${loc.country} · connecting · ${done}/${ordered.length}`);
       const latency=await realConnect(loc,quick);
-      if(latency!=null&&fp){verified[loc.id]={fingerprint:fp,verifiedAt:Date.now(),latency};ok++}else delete verified[loc.id];
-      saveVerified(verified);
-      // Give React/verified-latency a render turn between countries.
+      if(latency!=null&&fp){verified[loc.id]={fingerprint:fp,verifiedAt:Date.now(),latency};ok++;saveVerified(verified)}
+      setProgress(`Real scan · ${done}/${ordered.length} · ${ok} verified`);
       await sleep(80);
     }
     saveVerified(verified);
     setProgress(cancelled?`Stopped · ${ok} verified`:`Done · ${ok} verified${skipped?` · ${skipped} unreachable`:''}`);
     window.setTimeout(clearProgress,4200);
   }catch(e){console.warn('Fast Real Scan:',e);setProgress(`Real scan failed: ${String(e).slice(0,80)}`);window.setTimeout(clearProgress,5000)}finally{
-    running=false;cancelled=false;btn.classList.remove('is-running');btn.innerHTML='✓ Real scan';
+    running=false;cancelled=false;localStorage.removeItem(SCAN_FLAG);window.dispatchEvent(new CustomEvent('milmit-real-scan-state',{detail:{running:false}}));btn.classList.remove('is-running');btn.innerHTML='✓ Real scan';
     await invoke('cancel_connect').catch(()=>{});await waitDisconnected();
   }
 }
