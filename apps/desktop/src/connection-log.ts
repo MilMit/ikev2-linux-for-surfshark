@@ -18,7 +18,13 @@ let lastPhase='';
 let lastBackend='';
 
 const stamp=()=>new Date().toLocaleTimeString([],{hour12:false});
-function redact(v:string){return v.replace(/SERVICE_(?:USER|PASS)=[^\s]+/gi,'SERVICE_CREDENTIAL=[redacted]').replace(/secret\s*=\s*"[^"]+"/gi,'secret = [redacted]').replace(/password[^\n]*/gi,'password=[redacted]');}
+function redact(v:string){return v
+  .replace(/SERVICE_(?:USER|PASS)=[^\s]+/gi,'SERVICE_CREDENTIAL=[redacted]')
+  .replace(/secret\s*=\s*"[^"]+"/gi,'secret = [redacted]')
+  .replace(/password[^\n]*/gi,'password=[redacted]')
+  .replace(/(^|\n)(\s*)(?:eap_id|id):\s*[A-Za-z0-9_-]{16,}(?=\s|$)/gi,'$1$2identity: [redacted]')
+  .replace(/(^|\n)(\s*local\s+)'[^']+'\s+@/gi,'$1$2\'[redacted]\' @')
+  .replace(/sending\s+'[A-Za-z0-9_-]{16,}'/gi,"sending '[redacted]'");}
 function add(text:string){for(const line of redact(text).split('\n'))lines.push(`[${stamp()}] ${line}`);if(lines.length>900)lines=lines.slice(-900);render();}
 function render(){if(body)body.textContent=lines.join('\n')||'No connection attempt captured yet.';}
 function currentLocation(list:Location[]){const id=localStorage.getItem('milmit-selected-location');return list.find(x=>x.id===id)||list.find(x=>x.id==='ee-tll')||list[0];}
@@ -56,7 +62,7 @@ async function beginAttempt(){
     if(phase&&phase!==lastPhase){lastPhase=phase;add(`ui_state=${phase}`)}
     const busy=phase==='CONNECTING'||phase==='DISCONNECTING'||phase==='CANCELLING';
     if(!busy&&Date.now()-started>1200){window.clearInterval(timer);const toast=(document.querySelector('.toast')?.textContent||'').trim();if(toast)add(`ui_result=${toast}`);await collectAfter(loc);monitoring=false;return}
-    if(Date.now()-started>75000){window.clearInterval(timer);add('UI monitor exceeded 75s; stopping log monitor without freezing the app.');await collectAfter(loc);monitoring=false;}
+    if(Date.now()-started>120000){window.clearInterval(timer);add('UI monitor exceeded 120s; stopping log monitor without freezing the app.');await collectAfter(loc);monitoring=false;}
   },700);
 }
 function build(){

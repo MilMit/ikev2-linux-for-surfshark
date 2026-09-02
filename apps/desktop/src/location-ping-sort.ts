@@ -14,6 +14,7 @@ const applyLatencyOrder = () => {
   const list = document.querySelector<HTMLElement>('.country-list');
   if (!list) return;
 
+  // .country-list is already a CSS grid; grid items respect the order property.
   const countries = Array.from(list.querySelectorAll<HTMLElement>(':scope > .country-group'));
   const rankedCountries = [...countries].sort((a, b) => {
     const pa = latencyValue(a.querySelector(':scope > summary .country-latency'));
@@ -26,6 +27,7 @@ const applyLatencyOrder = () => {
   for (const country of countries) {
     const cities = country.querySelector<HTMLElement>('.location-list');
     if (!cities) continue;
+    // .location-list is also a CSS grid, so rows can be visually sorted without DOM mutation.
     const rows = Array.from(cities.querySelectorAll<HTMLElement>(':scope > .location-row'));
     const rankedRows = [...rows].sort((a, b) => {
       const pa = latencyValue(a.querySelector('.latency'));
@@ -47,6 +49,8 @@ const queueSort = () => {
   });
 };
 
+// Only observe React-rendered child/text changes. We never move children ourselves, so this
+// cannot create the previous reconciliation loop or detach a row from its React position.
 const observer = new MutationObserver(queueSort);
 observer.observe(document.documentElement, {
   childList: true,

@@ -45,6 +45,8 @@ document.addEventListener('click',e=>{
   }
   const loc=target?.closest<HTMLButtonElement>('.location-row,.quick-location');
   if(loc&&phase()==='CONNECTING'){
+    // Switching location must never wait for the old IKE attempt to unwind.
+    // Start cancellation in parallel, then replay the user's selection into React immediately.
     e.preventDefault();e.stopPropagation();
     void cancel();
     replaying=true;
@@ -52,6 +54,8 @@ document.addEventListener('click',e=>{
   }
 },true);
 
+// Do not observe class/disabled attributes here. decorate() itself changes those
+// attributes; observing them created a self-triggering MutationObserver loop.
 const observer=new MutationObserver(()=>queueDecorate());
 observer.observe(document.documentElement,{childList:true,subtree:true,characterData:true});
 setInterval(queueDecorate,500);
