@@ -1,0 +1,80 @@
+name: Release MilMit Secure v0.1.1
+
+on:
+  push:
+    branches:
+      - release-credentials-v0.1.1-action
+
+permissions:
+  contents: write
+
+jobs:
+  linux:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential pkg-config curl wget file patchelf librsvg2-bin \
+            libwebkit2gtk-4.1-dev libjavascriptcoregtk-4.1-dev libsoup-3.0-dev \
+            libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: './ -> target'
+
+      - name: Render application icons
+        run: bash scripts/prepare-tauri-icons.sh
+
+      - name: Install frontend dependencies
+        working-directory: apps/desktop
+        run: npm install --no-audit --no-fund
+
+      - name: Build Debian and AppImage bundles
+        working-directory: apps/desktop
+        run: npm run tauri build -- --bundles deb,appimage --config '{"version":"0.1.1"}'
+
+      - name: Collect bundles
+        run: |
+          mkdir -p dist-linux
+          find target/release/bundle apps/desktop/src-tauri/target/release/bundle \
+            -type f \( -name '*.deb' -o -name '*.AppImage' \) \
+            -exec cp -v {} dist-linux/ \; 2>/dev/null || true
+          test -n "$(find dist-linux -maxdepth 1 -type f -print -quit)"
+          sha256sum dist-linux/* > dist-linux/SHA256SUMS.txt
+
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: milmit-secure-linux-v0.1.1
+          path: dist-linux/*
+          if-no-files-found: error
+
+      - name: Publish GitHub Release v0.1.1
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v0.1.1
+          name: MilMit Secure v0.1.1
+          target_commitish: ${{ github.sha }}
+          files: dist-linux/*
+          generate_release_notes: true
+          body: |
+            ## MilMit Secure v0.1.1
+
+            - Adds Surfshark service credential management to the Tauri desktop UI.
+            - Stores the service password through the privileged helper using stdin instead of command-line arguments.
+            - Adds saved-credential status feedback in Settings.
+            - Includes the latest main-branch VPN, routing and desktop improvements.
