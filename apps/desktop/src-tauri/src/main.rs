@@ -2,8 +2,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashSet;
 use std::fs;
+use std::io::Write;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::{atomic::{AtomicU64, Ordering}, Mutex};
 use std::thread;
 use std::time::Instant;
@@ -250,9 +251,37 @@ async fn ping_report(kind: String, host: Option<String>) -> Result<String, Strin
         Ok(format!("Target: {target}\n{loss}\n{stats}\n\n{raw}"))
     }).await.map_err(|e| e.to_string())?
 }
+
+fn save_credentials_blocking(username: String, password: String) -> Result<String, String> {
+    if username.is_empty() || username.len() > 128 || username.contains('\n') || username.contains('\r') {
+        return Err("Invalid Surfshark service username.".into());
+    }
+    if password.is_empty() || password.len() > 512 || password.contains('\n') || password.contains('\r') {
+        return Err("Invalid or empty Surfshark service password.".into());
+    }
+    let mut child = Command::new("timeout")
+        .args(["--signal=TERM", "--kill-after=3s", "30s", "pkexec", HELPER, "credentials-save", &username])
+        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
+        .spawn().map_err(|e| e.to_string())?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(password.as_bytes()).map_err(|e| e.to_string())?;
+        stdin.write_all(b"\n").map_err(|e| e.to_string())?;
+    }
+    let output = child.wait_with_output().map_err(|e| e.to_string())?;
+    let mut text = String::from_utf8_lossy(&output.stdout).to_string();
+    text.push_str(&String::from_utf8_lossy(&output.stderr));
+    if output.status.success() { Ok(text) }
+    else if output.status.code() == Some(124) { Err("Saving credentials exceeded its safety deadline.".into()) }
+    else { Err(text) }
+}
+#[tauri::command]
+async fn save_credentials(username: String, password: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || save_credentials_blocking(username, password)).await.map_err(|e| e.to_string())?
+}
 #[tauri::command]
 async fn helper_action(action: String, args: Vec<String>) -> Result<String, String> {
     if !ALLOWED.contains(&action.as_str()) { return Err(format!("unsupported helper action: {action}")); }
+    if action == "credentials-save" { return Err("Use the secure save_credentials command so the password is sent over stdin.".into()); }
     tauri::async_runtime::spawn_blocking(move || { let refs = args.iter().map(String::as_str).collect::<Vec<_>>(); helper_output(&action, &refs) }).await.map_err(|e| e.to_string())?
 }
 #[tauri::command]
@@ -295,7 +324,7 @@ fn set_launch_at_startup(enabled: bool) -> Result<(), String> {
 
 fn main() {
     tauri::Builder::default().setup(|app| Ok(runtime::setup(app)?)).invoke_handler(tauri::generate_handler![
-        helper_action, list_locations, ping_location, ping_locations_batch, connect_location, cancel_connect,
+        helper_action, save_credentials, list_locations, ping_location, ping_locations_batch, connect_location, cancel_connect,
         connection_attempt_log, connection_state, traffic_snapshot, ping_report, router_state,
         desktop_feature_state, list_desktop_apps, get_location_lists, save_location_lists,
         launch_at_startup_enabled, set_launch_at_startup
