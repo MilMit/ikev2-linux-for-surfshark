@@ -21,15 +21,11 @@ missing_modules=(); for module in webkit2gtk-4.1 libsoup-3.0 javascriptcoregtk-4
 if ((${#missing_modules[@]})); then echo "ERROR: pkg-config still cannot find: ${missing_modules[*]}" >&2; echo "PKG_CONFIG_PATH=${PKG_CONFIG_PATH:-<unset>}" >&2; exit 1; fi
 echo "Tauri native dependencies detected:"; pkg-config --modversion webkit2gtk-4.1 libsoup-3.0 javascriptcoregtk-4.1
 
-# Compare the complete privileged stack, not only the helper entrypoint. This
-# prevents a changed watchdog/router/desktop-feature/sleep-hook script from silently
-# using an older installed copy.
 backend_changed=0
-backend_files=(restricted-ikev2-connect.sh restricted-ikev2-connect-v2.sh restricted-ikev2-disconnect.sh hotspot-device-policy.sh milmit-surfshark-watchdog.sh milmit-surfshark-sleep-hook.sh control-center.py router-features.py advanced-router.py rules-update.py status-portal.py desktop-features.py hotspot-doctor.py)
+backend_files=(restricted-ikev2-connect.sh restricted-ikev2-connect-v2.sh restricted-ikev2-disconnect.sh hotspot-device-policy.sh milmit-surfshark-watchdog.sh control-center.py router-features.py advanced-router.py rules-update.py status-portal.py desktop-features.py hotspot-doctor.py milmit-surfshark-sleep-hook.sh)
 for f in "${backend_files[@]}"; do
   [[ -f "/usr/lib/milmit-surfshark/$f" ]] && cmp -s "$ROOT/scripts/$f" "/usr/lib/milmit-surfshark/$f" || backend_changed=1
 done
-[[ -f /usr/lib/systemd/system-sleep/milmit-surfshark ]] && cmp -s "$ROOT/scripts/milmit-surfshark-sleep-hook.sh" /usr/lib/systemd/system-sleep/milmit-surfshark || backend_changed=1
 [[ -f /usr/libexec/milmit-surfshark-helper ]] && cmp -s "$ROOT/scripts/milmit-surfshark-helper" /usr/libexec/milmit-surfshark-helper || backend_changed=1
 [[ -f /etc/systemd/system/milmit-surfshark-autoconnect.service ]] && cmp -s "$ROOT/packaging/milmit-surfshark-autoconnect.service" /etc/systemd/system/milmit-surfshark-autoconnect.service || backend_changed=1
 if ((backend_changed)); then
@@ -42,7 +38,7 @@ if ! command -v rsvg-convert >/dev/null 2>&1; then
   sudo apt-get update
   sudo apt-get install -y librsvg2-bin
 fi
-"$ROOT/scripts/prepare-tauri-icons.sh"
+/bin/bash "$ROOT/scripts/prepare-tauri-icons.sh"
 
 [ -d node_modules ] || npm install
 exec npm run tauri dev
