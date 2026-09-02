@@ -5,9 +5,12 @@ type ConnState={connected:boolean;state:string;latency_ms?:number|null};
 type Verified={fingerprint:string;verifiedAt:number;latency:number|null};
 
 const KEY='milmit-real-connect-latency-v1';
+const SCAN_FLAG='milmit-real-scan-running';
 const TTL=10*60*1000;
 let locations:Location[]=[];
 let currentFingerprint='';
+let pendingFingerprint='';
+let pendingFingerprintCount=0;
 let lastConnected=false;
 let preConnectFingerprint='';
 let masking=false;
@@ -18,14 +21,26 @@ function save(v:Record<string,Verified>){localStorage.setItem(KEY,JSON.stringify
 function selectedId(){return localStorage.getItem('milmit-selected-location')||''}
 function normalizeRoute(s:string){return s.replace(/\s+uid\s+\d+/g,'').replace(/\s+cache\s*/g,' ').replace(/\s+/g,' ').trim()}
 function setText(el:HTMLElement,text:string){if(el.textContent!==text)el.textContent=text}
+function realScanRunning(){return localStorage.getItem(SCAN_FLAG)==='1'}
 
 async function physicalFingerprint(){
   try{
     const raw=await invoke<string>('helper_action',{action:'route-explain',args:['1.1.1.1']});
     const v=JSON.parse(raw);
-    const route=String(v?.results?.[0]?.route||'');
-    return normalizeRoute(route);
+    const route=normalizeRoute(String(v?.results?.[0]?.route||''));
+    // Never learn a tunnel/transient route as the physical-network fingerprint.
+    if(!route||/milmitxfrm0|table\s+220/i.test(route))return '';
+    return route;
   }catch{return ''}
+}
+
+function acceptFingerprint(fp:string){
+  if(!fp)return;
+  if(!currentFingerprint){currentFingerprint=fp;pendingFingerprint='';pendingFingerprintCount=0;return}
+  if(fp===currentFingerprint){pendingFingerprint='';pendingFingerprintCount=0;return}
+  if(fp===pendingFingerprint)pendingFingerprintCount++;else{pendingFingerprint=fp;pendingFingerprintCount=1}
+  // Require three consecutive identical physical-route reads before treating it as a real network change.
+  if(pendingFingerprintCount>=3){currentFingerprint=fp;pendingFingerprint='';pendingFingerprintCount=0}
 }
 
 function cachedLatency(id:string):number|null{
@@ -73,24 +88,34 @@ async function poll(){
   try{
     const state=await invoke<ConnState>('connection_state');
     const phase=(state.state||'').toUpperCase();
-    const connecting=['PREPARING','IKE','AUTHENTICATING','TUNNEL_ESTABLISHED','VERIFYING_DATA','FALLBACK','CONNECTING'].includes(phase);
+    const connecting=['PREPARING','DISCOVERING','IKE','AUTHENTICATING','TUNNEL_ESTABLISHED','VERIFYING_DATA','FALLBACK','CONNECTING','CANCELLING'].includes(phase);
     if(connecting&&!preConnectFingerprint){preConnectFingerprint=currentFingerprint||await physicalFingerprint()}
-    if(!state.connected&&!connecting){const fp=await physicalFingerprint();if(fp)currentFingerprint=fp}
+    // During Real Scan every connect/disconnect mutates routing temporarily. Freeze the network
+    // fingerprint until the scan is over so already verified rows never collapse to dashes.
+    if(!realScanRunning()&&!state.connected&&!connecting){acceptFingerprint(await physicalFingerprint())}
     if(state.connected&&!lastConnected){
       const id=selectedId();const fp=preConnectFingerprint||currentFingerprint;
       if(id&&fp){const all=load();all[id]={fingerprint:fp,verifiedAt:Date.now(),latency:cachedLatency(id)??state.latency_ms??null};save(all)}
       preConnectFingerprint='';
     }
     if(!state.connected&&lastConnected)preConnectFingerprint='';
-    if(!state.connected&&(phase==='FAILED'||phase==='BLOCKED')){const id=selectedId();if(id){const all=load();delete all[id];save(all)}}
+    // Do not delete a previously verified result merely because a later scan attempt failed.
+    // Keep it until TTL expiry or an actual physical-network fingerprint change.
     lastConnected=state.connected;queueMask();
   }catch{}
 }
 
-function installStyles(){const s=document.createElement('style');s.textContent=`.latency[data-real-verified="1"],.country-latency{transition:opacity .18s ease}.latency[data-real-verified="1"]::before{content:'✓ ';font-size:.8em;opacity:.8}`;document.head.appendChild(s)}
+async function refreshAfterScan(){
+  if(realScanRunning())return;
+  for(let i=0;i<4;i++){const fp=await physicalFingerprint();if(fp)acceptFingerprint(fp);await new Promise(r=>setTimeout(r,180))}
+  queueMask();
+}
+
+function installStyles(){if(document.getElementById('milmit-verified-latency-style'))return;const s=document.createElement('style');s.id='milmit-verified-latency-style';s.textContent=`.latency[data-real-verified="1"],.country-latency{transition:opacity .18s ease}.latency[data-real-verified="1"]::before{content:'✓ ';font-size:.8em;opacity:.8}`;document.head.appendChild(s)}
 
 void invoke<Location[]>('list_locations').then(v=>{locations=v;queueMask()}).catch(()=>{});
-void physicalFingerprint().then(v=>{currentFingerprint=v;queueMask()});
+void physicalFingerprint().then(v=>{acceptFingerprint(v);queueMask()});
+window.addEventListener('milmit-real-scan-state',e=>{const running=!!(e as CustomEvent).detail?.running;if(!running)void refreshAfterScan()});
 new MutationObserver(queueMask).observe(document.documentElement,{subtree:true,childList:true,characterData:true});
 installStyles();
 setInterval(()=>void poll(),1200);
