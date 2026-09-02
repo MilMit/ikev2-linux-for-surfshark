@@ -315,13 +315,13 @@ fn desktop_value(text: &str, key: &str) -> Option<String> { text.lines().find_ma
 fn list_desktop_apps() -> Vec<DesktopApp> {
     let mut out = Vec::new(); let mut seen = HashSet::new();
     for dir in desktop_dirs() {
-        let Ok(rd) = fs::read_dir(dir) else { continue };
+        let Ok(rd) = fs::read_dir(dir) else { continue; };
         for ent in rd.flatten() {
             let path = ent.path();
             if path.extension().and_then(|x| x.to_str()) != Some("desktop") { continue; }
             let id = path.file_name().and_then(|x| x.to_str()).unwrap_or("").to_string();
             if id.is_empty() || seen.contains(&id) { continue; }
-            let Ok(text) = fs::read_to_string(&path) else { continue; }
+            let Ok(text) = fs::read_to_string(&path) else { continue; };
             if desktop_value(&text, "NoDisplay").as_deref() == Some("true") || desktop_value(&text, "Hidden").as_deref() == Some("true") { continue; }
             let Some(name) = desktop_value(&text, "Name") else { continue; };
             let Some(exec) = desktop_value(&text, "Exec") else { continue; };
