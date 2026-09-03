@@ -19,7 +19,11 @@ fn status_icon(ok: bool) -> Image<'static> {
     // tray state is visible without copying any third-party icon asset.
     let size = 22u32;
     let mut rgba = vec![0u8; (size * size * 4) as usize];
-    let (r, g, b) = if ok { (55u8, 196u8, 125u8) } else { (220u8, 74u8, 78u8) };
+    let (r, g, b) = if ok {
+        (55u8, 196u8, 125u8)
+    } else {
+        (220u8, 74u8, 78u8)
+    };
     let c = (size as f32 - 1.0) / 2.0;
     for y in 0..size {
         for x in 0..size {
@@ -55,7 +59,13 @@ fn spawn_helper(action: &'static str) {
 
 pub fn setup(app: &tauri::App) -> tauri::Result<()> {
     let open = MenuItem::with_id(app, "tray-open", "Open MilMit Secure", true, None::<&str>)?;
-    let status = MenuItem::with_id(app, "tray-status", "● Checking connection…", false, None::<&str>)?;
+    let status = MenuItem::with_id(
+        app,
+        "tray-status",
+        "● Checking connection…",
+        false,
+        None::<&str>,
+    )?;
     let connect = MenuItem::with_id(app, "tray-connect", "Connect", true, None::<&str>)?;
     let disconnect = MenuItem::with_id(app, "tray-disconnect", "Disconnect", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "tray-quit", "Quit", true, None::<&str>)?;
@@ -117,7 +127,11 @@ pub fn setup(app: &tauri::App) -> tauri::Result<()> {
             let now = connected();
             if last != Some(now) {
                 let _ = tray.set_icon(Some(status_icon(now)));
-                let _ = status_item.set_text(if now { "● Connected · Protected" } else { "● Disconnected" });
+                let _ = status_item.set_text(if now {
+                    "● Connected · Protected"
+                } else {
+                    "● Disconnected"
+                });
                 last = Some(now);
             }
             thread::sleep(Duration::from_secs(2));

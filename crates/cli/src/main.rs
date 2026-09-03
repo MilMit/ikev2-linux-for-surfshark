@@ -30,8 +30,9 @@ fn main() {
         s.trim().to_string()
     });
 
-    let password = env::var("SURFSHARK_SERVICE_PASS")
-        .unwrap_or_else(|_| rpassword::prompt_password("Surfshark service password: ").expect("password"));
+    let password = env::var("SURFSHARK_SERVICE_PASS").unwrap_or_else(|_| {
+        rpassword::prompt_password("Surfshark service password: ").expect("password")
+    });
 
     let creds = ServiceCredentials { username, password };
 

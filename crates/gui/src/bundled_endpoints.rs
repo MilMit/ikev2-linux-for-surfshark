@@ -9,7 +9,12 @@
 /// rotates to the next candidate on failure.
 pub fn for_host(host: &str) -> &'static [&'static str] {
     match host {
-        "tr-ist.prod.surfshark.com" => &["45.136.155.53", "45.136.155.55", "45.136.155.58", "45.136.155.51"],
+        "tr-ist.prod.surfshark.com" => &[
+            "45.136.155.53",
+            "45.136.155.55",
+            "45.136.155.58",
+            "45.136.155.51",
+        ],
         "ee-tll.prod.surfshark.com" => &["185.174.159.107", "185.174.159.109", "185.174.159.194"],
         "nl-ams.prod.surfshark.com" => &["89.46.223.52", "146.70.175.29"],
         "de-ber.prod.surfshark.com" => &["86.38.98.16"],
