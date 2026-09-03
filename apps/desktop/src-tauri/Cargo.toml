@@ -1,6 +1,6 @@
 [package]
 name = "milmit-secure-desktop"
-version = "0.1.0"
+version = "0.1.2"
 edition = "2021"
 description = "Native Linux IKEv2 VPN and protected hotspot client"
 license = "MIT"
