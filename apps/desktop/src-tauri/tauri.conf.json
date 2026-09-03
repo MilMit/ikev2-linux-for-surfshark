@@ -77,7 +77,6 @@
           "/usr/lib/milmit-surfshark/install-privileged-helper.sh": "../../../scripts/install-privileged-helper.sh",
           "/usr/libexec/milmit-surfshark-helper": "../../../scripts/milmit-surfshark-helper",
           "/usr/share/polkit-1/actions/net.milmit.surfshark-ikev2.policy": "../../../packaging/net.milmit.surfshark-ikev2.policy",
-          "/usr/share/applications/net.milmit.secure.desktop": "../../../packaging/net.milmit.secure.desktop",
           "/usr/share/icons/hicolor/scalable/apps/net.milmit.secure.svg": "icons/icon.svg",
           "/usr/share/icons/hicolor/512x512/apps/net.milmit.secure.png": "icons/icon.png",
           "/etc/systemd/system/milmit-surfshark-watchdog.service": "../../../packaging/milmit-surfshark-watchdog.service",

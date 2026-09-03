@@ -202,6 +202,18 @@ if [[ "$ROUTING_MODE" == iran_direct && -s "$IRAN_FILE" && -n "$IFACE" && -n "$P
     [[ -n "$net" && "$net" != \#* ]] || continue
     ipset add "$IRAN_SET" "$net" -exist >/dev/null 2>&1 || continue
   done < "$IRAN_FILE"
+  if [[ -f /var/lib/milmit-surfshark/rules/custom_direct.json ]]; then
+    python3 -c '
+import json, subprocess
+try:
+    d = json.load(open("/var/lib/milmit-surfshark/rules/custom_direct.json"))
+    for r in d.get("rules", []):
+        for ip in r.get("resolved_ips", []):
+            subprocess.run(["ipset", "add", "MILMIT_IRAN", ip, "-exist"], stderr=subprocess.DEVNULL)
+except Exception:
+    pass
+' 2>/dev/null || true
+  fi
   IRAN_READY=1
 fi
 
@@ -236,10 +248,30 @@ ipt_unhook mangle OUTPUT "$CHAIN_HOST"; iptables -w -t mangle -I OUTPUT 1 -j "$C
 ipt_unhook mangle FORWARD "$CHAIN_MSS"; iptables -w -t mangle -I FORWARD 1 -j "$CHAIN_MSS"
 ip route flush cache >/dev/null 2>&1 || true
 
+# Ensure Direct and Iran domestic traffic exiting via physical uplink is masqueraded
+# so packets that initially selected virtual source IP are rewritten to the physical IP.
+iptables -w -t nat -I POSTROUTING 1 -o "$IFACE" -m mark --mark "$MARK_DIRECT" -j MASQUERADE
+if [[ "$IRAN_READY" == 1 ]]; then
+  iptables -w -t nat -I POSTROUTING 1 -o "$IFACE" -m set --match-set "$IRAN_SET" dst -j MASQUERADE
+fi
+
+# Block IPv6 leak to prevent location detection by ChatGPT/Cloudflare
+sysctl -qw net.ipv6.conf.all.disable_ipv6=1 >/dev/null 2>&1 || true
+sysctl -qw net.ipv6.conf.default.disable_ipv6=1 >/dev/null 2>&1 || true
+
 IFS=',' read -r -a DNS_ARR <<< "$DNS_CSV"
-if command -v resolvectl >/dev/null 2>&1 && [[ -n "$IFACE" ]]; then
-  resolvectl dns "$IFACE" "${DNS_ARR[@]}" || true
-  resolvectl domain "$IFACE" '~.' || true
+if command -v resolvectl >/dev/null 2>&1; then
+  for iface_cand in $(ip -o link show | awk -F': ' '{print $2}' | cut -d'@' -f1); do
+    [[ "$iface_cand" =~ ^(lo|docker.*|br-.*|lxc.*|virbr.*|veth.*|milmit.*)$ ]] && continue
+    resolvectl dns "$iface_cand" "${DNS_ARR[@]}" 1.1.1.1 || true
+    resolvectl domain "$iface_cand" '~.' || true
+    resolvectl default-route "$iface_cand" true || true
+  done
+  # When Iran Bypass is enabled, route .ir domains to domestic ISP DNS
+  if [[ "$ROUTING_MODE" == iran_direct && -n "$IFACE" && -n "${PHYS_DNS:-}" ]]; then
+    resolvectl dns "$IFACE" "$PHYS_DNS" || true
+    resolvectl domain "$IFACE" '~ir' || true
+  fi
   resolvectl flush-caches || true
 fi
 

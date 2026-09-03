@@ -1,4 +1,11 @@
 target/
+node_modules/
+**/node_modules/
+dist/
+**/dist/
+*.tsbuildinfo
+__pycache__/
+*.py[cod]
 .env
 *.log
 .idea/

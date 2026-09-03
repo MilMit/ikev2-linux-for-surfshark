@@ -61,11 +61,40 @@ pub fn setup(app: &tauri::App) -> tauri::Result<()> {
     let quit = MenuItem::with_id(app, "tray-quit", "Quit", true, None::<&str>)?;
     let menu = Menu::with_items(app, &[&open, &status, &connect, &disconnect, &quit])?;
 
+    if let Some(window) = app.get_webview_window("main") {
+        let win = window.clone();
+        window.on_window_event(move |event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                let _ = win.hide();
+            }
+        });
+    }
+
     let initial = connected();
     let tray = TrayIconBuilder::with_id("milmit-status")
         .icon(status_icon(initial))
         .menu(&menu)
-        .show_menu_on_left_click(true)
+        .show_menu_on_left_click(false)
+        .on_tray_icon_event(|tray, event| {
+            if let tauri::tray::TrayIconEvent::Click {
+                button: tauri::tray::MouseButton::Left,
+                button_state: tauri::tray::MouseButtonState::Up,
+                ..
+            } = event
+            {
+                let app = tray.app_handle();
+                if let Some(window) = app.get_webview_window("main") {
+                    if window.is_visible().unwrap_or(false) {
+                        let _ = window.hide();
+                    } else {
+                        let _ = window.unminimize();
+                        let _ = window.show();
+                        let _ = window.set_focus();
+                    }
+                }
+            }
+        })
         .on_menu_event(|app, event| match event.id().as_ref() {
             "tray-open" => {
                 if let Some(window) = app.get_webview_window("main") {

@@ -88,18 +88,25 @@ def apply_lockdown(enabled=None):
     run(['iptables','-w','-t','filter','-A',LOCK,'-p','udp','--sport','68','--dport','67','-j','RETURN']);endpoint=kv(LAST).get('SERVER_IP','')
     if re.fullmatch(r'(?:\d{1,3}\.){3}\d{1,3}',endpoint):
         for port in ('500','4500'):run(['iptables','-w','-t','filter','-A',LOCK,'-d',endpoint,'-p','udp','--dport',port,'-j','RETURN'])
+    routing_mode = kv(LAST).get('ROUTING_MODE', 'iran_direct')
+    if routing_mode == 'iran_direct' and d.get('lockdown_allow_iran', True):
+        rc, _ = run(['ipset', 'list', 'MILMIT_IRAN'], 2)
+        if rc == 0:
+            run(['iptables', '-w', '-t', 'filter', '-A', LOCK, '-m', 'set', '--match-set', 'MILMIT_IRAN', 'dst', '-j', 'RETURN'])
     run(['iptables','-w','-t','filter','-A',LOCK,'-j','REJECT','--reject-with','icmp-net-unreachable']);run(['iptables','-w','-t','filter','-I','OUTPUT','1','-j',LOCK]);return {'ok':True,'lockdown':True,'active_block':True}
 def set_autoconnect(enabled):
     d=load();d['auto_connect']=bool(enabled);save(d);unit='milmit-surfshark-autoconnect.service';run(['systemctl','enable' if enabled else 'disable',unit]);return {'ok':True,'auto_connect':bool(enabled)}
 def status():
     d=load();return {'ok':True,**d,'lockdown_blocking':bool(d.get('lockdown')) and not STATE.exists(),'direct_namespace':pathlib.Path('/var/run/netns/'+NS).exists()}
 def main():
-    if os.geteuid()!=0:print(json.dumps({'ok':False,'error':'desktop feature backend must run as root'}));return 77
+    if os.geteuid()!=0:print(json.dumps({'ok':False,'error':'root required'}));return 77
     cmd=sys.argv[1] if len(sys.argv)>1 else 'status'
     try:
         if cmd=='status':r=status()
         elif cmd=='auto-connect':r=set_autoconnect(sys.argv[2]=='1')
         elif cmd=='lockdown':r=apply_lockdown(sys.argv[2]=='1')
+        elif cmd=='lockdown-allow-iran':
+            d=load(); d['lockdown_allow_iran']=sys.argv[2]=='1'; save(d); r=apply_lockdown(None)
         elif cmd=='lockdown-apply':r=apply_lockdown(None)
         elif cmd=='app-direct-launch':r=launch_direct(sys.argv[2])
         else:r={'ok':False,'error':'unknown desktop feature command'}

@@ -1,0 +1,8 @@
+{
+  "private": true,
+  "scripts": {
+    "dev": "npm --prefix apps/desktop run dev",
+    "build": "npm --prefix apps/desktop run build",
+    "tauri": "npm --prefix apps/desktop run tauri"
+  }
+}

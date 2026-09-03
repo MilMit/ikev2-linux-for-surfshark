@@ -131,7 +131,10 @@ PY
   watchdog-status) [[ -f "$LIVE_STATE" ]] && cat "$LIVE_STATE" || echo "HEALTH=UNKNOWN" ;;
   watchdog-start) exec systemctl start milmit-surfshark-watchdog.service ;;
   portal-start) exec systemctl start milmit-surfshark-portal.service ;;
-  health|speed-test|dns-test|mtu-test|save-lkg|lkg-status|emergency-stop|recent-destinations|support-bundle|history) control "$cmd" ;;
+  health|speed-test|dns-test|dns-repair|chatgpt-test|routing-mode-status|mtu-test|save-lkg|lkg-status|emergency-stop|recent-destinations|support-bundle|history|custom-rules-get) control "$cmd" ;;
+  set-routing-mode) [[ "${2:-}" =~ ^(vpn_all|iran_direct)$ ]] || { echo "invalid routing mode" >&2; exit 64; }; control set-routing-mode "$2" ;;
+  custom-rules-add) [[ -n "${2:-}" ]] || { echo "target required" >&2; exit 64; }; control custom-rules-add "$2" ;;
+  custom-rules-remove) [[ -n "${2:-}" ]] || { echo "target required" >&2; exit 64; }; control custom-rules-remove "$2" ;;
   route-test) target="${2:-1.1.1.1}"; [[ ${#target} -le 255 && "$target" != *$'\n'* ]] || { echo "invalid target" >&2; exit 64; }; control route-test "$target" ;;
   router-status|hotspot-status) router status ;;
   router-apply|hotspot-repair) router apply ;;
@@ -155,6 +158,7 @@ PY
   desktop-status) desktop status ;;
   auto-connect) [[ "${2:-}" == 0 || "${2:-}" == 1 ]] || { echo "auto-connect requires 0 or 1" >&2; exit 64; }; desktop auto-connect "$2" ;;
   lockdown) [[ "${2:-}" == 0 || "${2:-}" == 1 ]] || { echo "lockdown requires 0 or 1" >&2; exit 64; }; desktop lockdown "$2" ;;
+  lockdown-allow-iran) [[ "${2:-}" == 0 || "${2:-}" == 1 ]] || { echo "lockdown-allow-iran requires 0 or 1" >&2; exit 64; }; desktop lockdown-allow-iran "$2" ;;
   lockdown-apply) desktop lockdown-apply ;;
   app-direct-launch) [[ "${2:-}" =~ ^[A-Za-z0-9_.+-]+\.desktop$ ]] || { echo "invalid desktop app id" >&2; exit 64; }; desktop app-direct-launch "$2" ;;
   *) echo "unsupported helper action: $cmd" >&2; exit 64 ;;

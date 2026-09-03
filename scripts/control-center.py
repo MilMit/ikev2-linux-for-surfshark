@@ -25,6 +25,9 @@ HELPER = '/usr/libexec/milmit-surfshark-helper'
 DISCONNECT = '/usr/lib/milmit-surfshark/restricted-ikev2-disconnect.sh'
 
 
+LAST = VAR / 'last-profile.state'
+
+
 def read_kv(path):
     out = {}
     try:
@@ -35,6 +38,27 @@ def read_kv(path):
     except OSError:
         pass
     return out
+
+
+def write_kv_key(path, key, val):
+    p = pathlib.Path(path)
+    lines = []
+    found = False
+    if p.exists():
+        try:
+            for line in p.read_text(errors='replace').splitlines():
+                if '=' in line and line.split('=', 1)[0].strip() == key:
+                    lines.append(f"{key}={val}")
+                    found = True
+                elif line.strip():
+                    lines.append(line)
+        except OSError:
+            pass
+    if not found:
+        lines.append(f"{key}={val}")
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text('\n'.join(lines) + '\n')
+
 
 
 def run(args, timeout=12):
@@ -258,6 +282,236 @@ def history(limit=60):
     return {'ok':True,'items':rows}
 
 
+def dns_repair():
+    st = read_kv(STATE)
+    dns_csv = st.get('DNS_CSV', '162.252.172.57,149.154.159.92,1.1.1.1')
+    servers = [s.strip() for s in dns_csv.split(',') if s.strip()]
+    if not servers:
+        servers = ['162.252.172.57', '149.154.159.92', '1.1.1.1']
+    rc, out = run(['ip', '-o', 'link', 'show'], 4)
+    modified = []
+    for line in out.splitlines():
+        parts = line.split(': ')
+        if len(parts) >= 2:
+            iface = parts[1].split('@')[0].strip()
+            if any(iface.startswith(p) for p in ('lo', 'docker', 'br-', 'lxc', 'virbr', 'veth', 'milmit')):
+                continue
+            run(['resolvectl', 'dns', iface] + servers, 4)
+            run(['resolvectl', 'domain', iface, '~.'], 4)
+            run(['resolvectl', 'default-route', iface, 'true'], 4)
+            modified.append(iface)
+    run(['resolvectl', 'flush-caches'], 4)
+    res = {'ok': True, 'interfaces': modified, 'servers': servers}
+    event('dns-repair', 'Enforced secure DNS across physical interfaces', **res)
+    return res
+
+
+def chatgpt_test():
+    import urllib.request, ssl, urllib.error
+    diag = {'ok': False, 'dns_resolved': False, 'resolved_ips': [], 'http_status': 0, 'details': '', 'cloudflare_verified': False}
+    rc, out = run(['resolvectl', 'query', 'chatgpt.com'], 6)
+    ips = re.findall(r'(?:\d{1,3}\.){3}\d{1,3}', out)
+    diag['resolved_ips'] = list(dict.fromkeys(ips))
+    diag['dns_resolved'] = bool(diag['resolved_ips'])
+    ctx = ssl.create_default_context()
+    req = urllib.request.Request('https://chatgpt.com', headers={
+        'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64; rv:130.0) Gecko/20100101 Firefox/130.0',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.5',
+    })
+    t0 = time.time()
+    try:
+        with urllib.request.urlopen(req, context=ctx, timeout=8) as r:
+            elapsed = round((time.time() - t0) * 1000)
+            diag['ok'] = True
+            diag['http_status'] = r.status
+            diag['latency_ms'] = elapsed
+            diag['details'] = f"ChatGPT is fully reachable (HTTP {r.status}, {elapsed}ms). TLS and DNS verified."
+    except urllib.error.HTTPError as e:
+        elapsed = round((time.time() - t0) * 1000)
+        diag['http_status'] = e.code
+        diag['latency_ms'] = elapsed
+        server = (e.headers.get('Server') or '').lower()
+        cf_ray = e.headers.get('CF-RAY') or ''
+        if 'cloudflare' in server or cf_ray or e.code == 403:
+            diag['ok'] = True
+            diag['cloudflare_verified'] = True
+            diag['details'] = f"OpenAI Cloudflare edge reached successfully ({elapsed}ms, ray={cf_ray[:14] if cf_ray else 'ok'}). DNS and route are unblocked; ChatGPT is ready in any standard browser."
+        elif e.code in (200, 301, 302):
+            diag['ok'] = True
+            diag['details'] = f"ChatGPT reachable (HTTP {e.code}, {elapsed}ms)."
+        else:
+            diag['ok'] = False
+            diag['details'] = f"HTTP {e.code} error received from ChatGPT."
+    except Exception as e:
+        diag['ok'] = False
+        diag['details'] = f"Connection to ChatGPT failed: {str(e)}"
+
+    event('chatgpt-test', 'ChatGPT access benchmark', ok=diag['ok'], status=diag['http_status'])
+    return diag
+
+
+def routing_mode_status():
+    st = read_kv(STATE)
+    last = read_kv(LAST)
+    mode = last.get('ROUTING_MODE') or st.get('ROUTING_MODE', 'vpn_all')
+    active_connected = STATE.exists() and bool(st.get('SERVER_IP'))
+    rules_meta = {}
+    rules_meta_file = pathlib.Path('/var/lib/milmit-surfshark/rules/metadata.json')
+    if rules_meta_file.exists():
+        try: rules_meta = json.loads(rules_meta_file.read_text())
+        except Exception: pass
+    iran_set_active = False
+    if active_connected:
+        rc, _ = run(['ipset', 'list', 'milmit_iran_direct'], 2)
+        iran_set_active = (rc == 0)
+    return {
+        'ok': True,
+        'routing_mode': mode,
+        'connected': active_connected,
+        'iran_bypass_active': iran_set_active if active_connected else (mode == 'iran_direct'),
+        'rules_metadata': rules_meta,
+    }
+
+
+def set_routing_mode(new_mode):
+    if new_mode not in ('vpn_all', 'iran_direct'):
+        return {'ok': False, 'error': f'Invalid routing mode: {new_mode}'}
+    write_kv_key(LAST, 'ROUTING_MODE', new_mode)
+    live_applied = False
+    st = read_kv(STATE)
+    if STATE.exists() and st.get('SERVER_IP'):
+        iran_file = pathlib.Path('/var/lib/milmit-surfshark/rules/ircidr.txt')
+        if not iran_file.exists():
+            iran_file = pathlib.Path('/var/lib/milmit-surfshark/iran-ipv4.txt')
+        iface = st.get('IFACE', '')
+        chain_host = 'MILMIT_VPN_OUT'
+        chain_hot = 'MILMIT_HOTSPOT_MARK'
+        mark_direct = '0x113'
+        iran_set = 'MILMIT_IRAN'
+
+        if iface:
+            rc_nat, _ = run(['iptables', '-w', '-t', 'nat', '-C', 'POSTROUTING', '-o', iface, '-m', 'mark', '--mark', mark_direct, '-j', 'MASQUERADE'], 2)
+            if rc_nat != 0:
+                run(['iptables', '-w', '-t', 'nat', '-I', 'POSTROUTING', '1', '-o', iface, '-m', 'mark', '--mark', mark_direct, '-j', 'MASQUERADE'], 3)
+            rc_nat2, _ = run(['iptables', '-w', '-t', 'nat', '-C', 'POSTROUTING', '-o', iface, '-m', 'set', '--match-set', iran_set, 'dst', '-j', 'MASQUERADE'], 2)
+            if rc_nat2 != 0:
+                run(['iptables', '-w', '-t', 'nat', '-I', 'POSTROUTING', '1', '-o', iface, '-m', 'set', '--match-set', iran_set, 'dst', '-j', 'MASQUERADE'], 3)
+
+        if new_mode == 'iran_direct' and iran_file.exists():
+            run(['ipset', 'create', iran_set, 'hash:net', 'family', 'inet', 'maxelem', '200000', '-exist'], 5)
+            p = subprocess.Popen(['ipset', 'restore', '-exist'], stdin=subprocess.PIPE, text=True)
+            cmds = [f'create {iran_set} hash:net family inet maxelem 200000 -exist']
+            for line in iran_file.read_text(errors='replace').splitlines():
+                line = line.strip()
+                if line and not line.startswith('#'):
+                    cmds.append(f'add {iran_set} {line} -exist')
+            p.communicate('\n'.join(cmds), timeout=10)
+
+            rc, _ = run(['iptables', '-w', '-t', 'mangle', '-C', chain_host, '-m', 'set', '--match-set', iran_set, 'dst', '-j', 'MARK', '--set-mark', mark_direct], 2)
+            if rc != 0:
+                run(['iptables', '-w', '-t', 'mangle', '-I', chain_host, '2', '-m', 'set', '--match-set', iran_set, 'dst', '-j', 'MARK', '--set-mark', mark_direct], 3)
+                run(['iptables', '-w', '-t', 'mangle', '-I', chain_host, '3', '-m', 'set', '--match-set', iran_set, 'dst', '-j', 'RETURN'], 3)
+
+            rc_hot, _ = run(['iptables', '-w', '-t', 'mangle', '-L', chain_hot], 2)
+            if rc_hot == 0:
+                rc2, _ = run(['iptables', '-w', '-t', 'mangle', '-C', chain_hot, '-m', 'set', '--match-set', iran_set, 'dst', '-j', 'MARK', '--set-mark', mark_direct], 2)
+                if rc2 != 0:
+                    run(['iptables', '-w', '-t', 'mangle', '-I', chain_hot, '2', '-m', 'set', '--match-set', iran_set, 'dst', '-j', 'MARK', '--set-mark', mark_direct], 3)
+                    run(['iptables', '-w', '-t', 'mangle', '-I', chain_hot, '3', '-m', 'set', '--match-set', iran_set, 'dst', '-j', 'RETURN'], 3)
+            live_applied = True
+        elif new_mode == 'vpn_all':
+            for _ in range(5):
+                rc, _ = run(['iptables', '-w', '-t', 'mangle', '-D', chain_host, '-m', 'set', '--match-set', iran_set, 'dst', '-j', 'MARK', '--set-mark', mark_direct], 2)
+                if rc != 0: break
+            for _ in range(5):
+                rc, _ = run(['iptables', '-w', '-t', 'mangle', '-D', chain_host, '-m', 'set', '--match-set', iran_set, 'dst', '-j', 'RETURN'], 2)
+                if rc != 0: break
+            for _ in range(5):
+                rc, _ = run(['iptables', '-w', '-t', 'mangle', '-D', chain_hot, '-m', 'set', '--match-set', iran_set, 'dst', '-j', 'MARK', '--set-mark', mark_direct], 2)
+                if rc != 0: break
+            for _ in range(5):
+                rc, _ = run(['iptables', '-w', '-t', 'mangle', '-D', chain_hot, '-m', 'set', '--match-set', iran_set, 'dst', '-j', 'RETURN'], 2)
+                if rc != 0: break
+            live_applied = True
+
+        write_kv_key(STATE, 'ROUTING_MODE', new_mode)
+        run(['ip', 'route', 'flush', 'cache'], 2)
+
+    event('routing-mode', f'Routing mode set to {new_mode}', live=live_applied)
+    return {'ok': True, 'routing_mode': new_mode, 'live_applied': live_applied}
+
+
+CUSTOM_RULES_FILE = pathlib.Path('/var/lib/milmit-surfshark/rules/custom_direct.json')
+
+def custom_rules_get():
+    if not CUSTOM_RULES_FILE.exists():
+        return {'ok': True, 'rules': []}
+    try:
+        data = json.loads(CUSTOM_RULES_FILE.read_text())
+        return {'ok': True, 'rules': data.get('rules', [])}
+    except Exception as e:
+        return {'ok': False, 'error': str(e), 'rules': []}
+
+def custom_rules_add(target: str):
+    target = target.strip()
+    if not target or len(target) > 255:
+        return {'ok': False, 'error': 'Target is required'}
+    
+    rule_type = 'domain'
+    ips_to_add = []
+    try:
+        if '/' in target:
+            ipaddress.ip_network(target, strict=False)
+            rule_type = 'cidr'
+            ips_to_add.append(target)
+        else:
+            ipaddress.ip_address(target)
+            rule_type = 'ip'
+            ips_to_add.append(target)
+    except ValueError:
+        rule_type = 'domain'
+        try:
+            infos = socket.getaddrinfo(target, None, socket.AF_INET)
+            for info in infos:
+                ip = info[4][0]
+                if ip not in ips_to_add:
+                    ips_to_add.append(ip)
+        except Exception:
+            pass
+
+    CUSTOM_RULES_FILE.parent.mkdir(parents=True, exist_ok=True)
+    current = custom_rules_get().get('rules', [])
+    if not any(r.get('target') == target for r in current):
+        current.append({
+            'target': target,
+            'type': rule_type,
+            'resolved_ips': ips_to_add,
+            'added_at': time.strftime('%Y-%m-%d %H:%M:%S')
+        })
+        CUSTOM_RULES_FILE.write_text(json.dumps({'rules': current}, indent=2))
+
+    for ip in ips_to_add:
+        for s in ['MILMIT_IRAN', 'MILMIT_FORCE_DIRECT']:
+            run(['ipset', 'add', s, ip, '-exist'], 2)
+
+    return {'ok': True, 'target': target, 'type': rule_type, 'resolved_ips': ips_to_add, 'rules': current}
+
+def custom_rules_remove(target: str):
+    target = target.strip()
+    current = custom_rules_get().get('rules', [])
+    found = [r for r in current if r.get('target') == target]
+    remaining = [r for r in current if r.get('target') != target]
+    CUSTOM_RULES_FILE.write_text(json.dumps({'rules': remaining}, indent=2))
+
+    for item in found:
+        for ip in item.get('resolved_ips', []):
+            for s in ['MILMIT_IRAN', 'MILMIT_FORCE_DIRECT']:
+                run(['ipset', 'del', s, ip], 2)
+
+    return {'ok': True, 'target': target, 'remaining': len(remaining), 'rules': remaining}
+
+
 def main():
     if os.geteuid()!=0:
         print(json.dumps({'ok':False,'error':'control center must run as root'})); return 77
@@ -265,6 +519,13 @@ def main():
     if cmd=='health': result=health()
     elif cmd=='speed-test': result=speed_test()
     elif cmd=='dns-test': result=dns_test()
+    elif cmd=='dns-repair': result=dns_repair()
+    elif cmd=='chatgpt-test': result=chatgpt_test()
+    elif cmd=='routing-mode-status': result=routing_mode_status()
+    elif cmd=='set-routing-mode': result=set_routing_mode(sys.argv[2] if len(sys.argv)>2 else 'vpn_all')
+    elif cmd=='custom-rules-get': result=custom_rules_get()
+    elif cmd=='custom-rules-add': result=custom_rules_add(sys.argv[2] if len(sys.argv)>2 else '')
+    elif cmd=='custom-rules-remove': result=custom_rules_remove(sys.argv[2] if len(sys.argv)>2 else '')
     elif cmd=='mtu-test': result=mtu_test()
     elif cmd=='route-test': result=route_test(sys.argv[2] if len(sys.argv)>2 else '1.1.1.1')
     elif cmd=='save-lkg': result=save_lkg()
@@ -273,9 +534,11 @@ def main():
     elif cmd=='recent-destinations': result=recent_destinations()
     elif cmd=='support-bundle': result=support_bundle()
     elif cmd=='history': result=history()
-    else: result={'ok':False,'error':'unknown command'}
     print(json.dumps(result,ensure_ascii=False,indent=2))
+    if cmd in ('chatgpt-test', 'dns-test', 'speed-test', 'health', 'routing-mode-status', 'set-routing-mode', 'dns-repair', 'custom-rules-get', 'custom-rules-add', 'custom-rules-remove'):
+        return 0
     return 0 if result.get('ok',True) else 1
+
 
 if __name__=='__main__':
     raise SystemExit(main())

@@ -20,6 +20,7 @@ CHAIN_KILL=MILMIT_VPN_KILL
 CHAIN_POLICY=MILMIT_ADV_POLICY
 CHAIN_BLOCK=MILMIT_ADV_BLOCK
 CHAIN_DEVICE_BLOCK=MILMIT_DEVICE_BLOCK
+MARK_DIRECT=0x113
 DESKTOP=/usr/lib/milmit-surfshark/desktop-features.py
 
 [[ $EUID -eq 0 ]] || { echo "This helper must run as root." >&2; exit 77; }
@@ -54,10 +55,16 @@ for _ in 1 2 3 4 5; do swanctl --list-sas 2>/dev/null | grep -qE 'milmit-surfsha
 remove_chains
 for pref in 100 101 102 103 104 105 106 107 108 109 110 220; do while ip rule del pref "$pref" >/dev/null 2>&1; do :; done; done
 ip route flush table "$ROUTE_TABLE" >/dev/null 2>&1 || true; ip route flush cache >/dev/null 2>&1 || true
+if [[ -n "$IFACE" ]]; then
+  while iptables -w -t nat -D POSTROUTING -o "$IFACE" -m mark --mark "$MARK_DIRECT" -j MASQUERADE 2>/dev/null; do :; done
+  while iptables -w -t nat -D POSTROUTING -o "$IFACE" -m set --match-set "$IRAN_SET" dst -j MASQUERADE 2>/dev/null; do :; done
+fi
 command -v ipset >/dev/null 2>&1 && { ipset destroy "$IRAN_SET" >/dev/null 2>&1 || true; ipset destroy MILMIT_FORCE_DIRECT >/dev/null 2>&1 || true; ipset destroy MILMIT_FORCE_VPN >/dev/null 2>&1 || true; ipset destroy MILMIT_BLOCK >/dev/null 2>&1 || true; }
 if [[ -n "$HOTSPOT_SUBNET" && -n "$VIRTUAL_IP" ]]; then while iptables -w -t nat -D POSTROUTING -s "$HOTSPOT_SUBNET" -o "$XFRM_IF" -j SNAT --to-source "$VIRTUAL_IP" 2>/dev/null; do :; done; fi
 if [[ -n "$HOTSPOT_SUBNET" ]] && command -v conntrack >/dev/null 2>&1; then conntrack -D -s "$HOTSPOT_SUBNET" >/dev/null 2>&1 || true; conntrack -D -d "$HOTSPOT_SUBNET" >/dev/null 2>&1 || true; fi
 ip link del "$XFRM_IF" >/dev/null 2>&1 || true
+sysctl -qw net.ipv6.conf.all.disable_ipv6=0 >/dev/null 2>&1 || true
+sysctl -qw net.ipv6.conf.default.disable_ipv6=0 >/dev/null 2>&1 || true
 if [[ -n "$IFACE" ]] && command -v resolvectl >/dev/null 2>&1; then resolvectl revert "$IFACE" >/dev/null 2>&1 || true; resolvectl flush-caches >/dev/null 2>&1 || true; fi
 if command -v nmcli >/dev/null 2>&1; then nmcli connection down "$NM_MARKER" >/dev/null 2>&1 || true; nmcli connection delete "$NM_MARKER" >/dev/null 2>&1 || true; if [[ "${RECOVER_NETWORK:-1}" == 1 && -n "$IFACE" ]]; then nmcli device reapply "$IFACE" >/dev/null 2>&1 || true; fi; fi
 rm -f "$STATE_FILE" "$STATE_DIR/live.state" "$STATE_DIR/watchdog-recovering"

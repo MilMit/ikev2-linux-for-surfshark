@@ -10,6 +10,7 @@ use std::thread;
 use std::time::Instant;
 
 mod runtime;
+mod network_diagnostics;
 #[path = "../../../../crates/gui/src/bundled_endpoints.rs"]
 mod bundled_endpoints;
 
@@ -28,7 +29,9 @@ const ALLOWED: &[&str] = &[
     "mtu-test", "save-lkg", "support-bundle", "emergency-stop", "candidates", "route-explain",
     "route-test", "policy-add", "policy-remove", "router-options", "device-set", "guest-start",
     "guest-stop", "guest-status", "credentials-status", "credentials-save", "desktop-status",
-    "auto-connect", "lockdown", "lockdown-apply", "app-direct-launch",
+    "auto-connect", "lockdown", "lockdown-allow-iran", "lockdown-apply", "app-direct-launch",
+    "dns-repair", "chatgpt-test", "routing-mode-status", "set-routing-mode",
+    "custom-rules-get", "custom-rules-add", "custom-rules-remove",
 ];
 
 static CONNECT_GENERATION: AtomicU64 = AtomicU64::new(0);
@@ -327,6 +330,6 @@ fn main() {
         helper_action, save_credentials, list_locations, ping_location, ping_locations_batch, connect_location, cancel_connect,
         connection_attempt_log, connection_state, traffic_snapshot, ping_report, router_state,
         desktop_feature_state, list_desktop_apps, get_location_lists, save_location_lists,
-        launch_at_startup_enabled, set_launch_at_startup
+        launch_at_startup_enabled, set_launch_at_startup, network_diagnostics::network_diagnostics
     ]).run(tauri::generate_context!()).expect("error while running MilMit Secure")
 }
