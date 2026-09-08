@@ -3,7 +3,8 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::net::{IpAddr, ToSocketAddrs};
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::thread;
 use surfshark_ikev2_core::platform::{
     PlatformAdapter, PlatformConnectionStatus, PlatformDiagnostics, PlatformStatus, VpnProtocol,
 };
@@ -20,9 +21,7 @@ const OVPN_DIR: &str = "/etc/milmit-surfshark/openvpn";
 pub struct LinuxPlatformAdapter;
 
 impl LinuxPlatformAdapter {
-    pub fn new() -> Self {
-        Self
-    }
+    pub fn new() -> Self { Self }
 
     fn helper(&self, action: &str, args: &[&str], timeout: &str) -> Result<String, String> {
         if !Path::new(HELPER).is_file() {
@@ -35,29 +34,38 @@ impl LinuxPlatformAdapter {
             .map_err(|e| format!("failed to launch privileged helper: {e}"))?;
         let mut text = String::from_utf8_lossy(&output.stdout).to_string();
         text.push_str(&String::from_utf8_lossy(&output.stderr));
-        if output.status.success() {
-            Ok(text)
-        } else if output.status.code() == Some(124) {
-            Err(format!("{action} exceeded its safety deadline ({timeout})"))
-        } else {
-            Err(text.trim().to_string())
+        if output.status.success() { Ok(text) }
+        else if output.status.code() == Some(124) { Err(format!("{action} exceeded its safety deadline ({timeout})")) }
+        else { Err(text.trim().to_string()) }
+    }
+
+    fn spawn_connect(&self, identity: String, candidates: String) -> Result<(), String> {
+        if !Path::new(HELPER).is_file() {
+            return Err(format!("privileged helper is not installed at {HELPER}"));
         }
+        let mut child = Command::new("timeout")
+            .args(["--signal=TERM", "--kill-after=3s", "170s", "pkexec", HELPER, "engine-connect"])
+            .arg(identity)
+            .arg(candidates)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| format!("failed to start VPN connection worker: {e}"))?;
+        thread::spawn(move || { let _ = child.wait(); });
+        Ok(())
     }
 
     fn candidates(&self, location: &Location) -> Result<Vec<String>, String> {
         let mut out = BTreeSet::new();
         for ip in &location.endpoint.fallback_ips {
-            if matches!(ip, IpAddr::V4(_)) {
-                out.insert(ip.to_string());
-            }
+            if matches!(ip, IpAddr::V4(_)) { out.insert(ip.to_string()); }
         }
         if out.is_empty() {
             let target = format!("{}:{}", location.endpoint.hostname, location.endpoint.ike_port);
             if let Ok(addrs) = target.to_socket_addrs() {
                 for addr in addrs {
-                    if addr.ip().is_ipv4() {
-                        out.insert(addr.ip().to_string());
-                    }
+                    if addr.ip().is_ipv4() { out.insert(addr.ip().to_string()); }
                 }
             }
         }
@@ -70,11 +78,7 @@ impl LinuxPlatformAdapter {
     fn parse_engine_status(&self) -> PlatformStatus {
         let raw = fs::read_to_string(ENGINE_STATE).unwrap_or_default();
         let value: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
-        let phase = value
-            .get("phase")
-            .and_then(Value::as_str)
-            .unwrap_or("DISCONNECTED")
-            .to_ascii_uppercase();
+        let phase = value.get("phase").and_then(Value::as_str).unwrap_or("DISCONNECTED").to_ascii_uppercase();
         let status = match phase.as_str() {
             "PREPARING" | "IKE" | "AUTHENTICATING" | "TUNNEL_ESTABLISHED" | "VERIFYING_DATA" | "FALLBACK" => PlatformConnectionStatus::Connecting,
             "CONNECTED" => PlatformConnectionStatus::Connected,
@@ -105,22 +109,28 @@ impl PlatformAdapter for LinuxPlatformAdapter {
         match protocol {
             VpnProtocol::Auto | VpnProtocol::Ikev2 => {
                 let candidates = self.candidates(location)?.join(",");
-                self.helper("engine-connect", &[identity, &candidates], "170s")?;
+                self.spawn_connect(identity.to_string(), candidates)?;
+                Ok(PlatformStatus {
+                    status: PlatformConnectionStatus::Connecting,
+                    protocol: Some(match protocol { VpnProtocol::Ikev2 => "ikev2", _ => "auto" }.into()),
+                    endpoint: None,
+                    public_ip: None,
+                    message: Some("Linux connection engine started".into()),
+                })
             }
             VpnProtocol::WireGuard => {
                 if !Self::profile_exists(WG_DIR, identity, "conf") {
                     return Err(format!("WireGuard profile is missing for {identity}"));
                 }
-                return Err("explicit WireGuard selection is not exposed by the installed helper yet; Auto can use WireGuard fallback when the profile exists".into());
+                Err("explicit WireGuard selection is not exposed by the installed helper yet; Auto can use WireGuard fallback when the profile exists".into())
             }
             VpnProtocol::OpenVpn => {
                 if !Self::profile_exists(OVPN_DIR, identity, "ovpn") {
                     return Err(format!("OpenVPN profile is missing for {identity}"));
                 }
-                return Err("explicit OpenVPN selection is not exposed by the installed helper yet; Auto can use OpenVPN fallback when the profile exists".into());
+                Err("explicit OpenVPN selection is not exposed by the installed helper yet; Auto can use OpenVPN fallback when the profile exists".into())
             }
         }
-        Ok(self.parse_engine_status())
     }
 
     fn disconnect(&self) -> Result<PlatformStatus, String> {
@@ -128,9 +138,7 @@ impl PlatformAdapter for LinuxPlatformAdapter {
         Ok(self.parse_engine_status())
     }
 
-    fn status(&self) -> Result<PlatformStatus, String> {
-        Ok(self.parse_engine_status())
-    }
+    fn status(&self) -> Result<PlatformStatus, String> { Ok(self.parse_engine_status()) }
 
     fn set_kill_switch(&self, enabled: bool) -> Result<(), String> {
         let flag = if enabled { "1" } else { "0" };
@@ -143,9 +151,7 @@ impl PlatformAdapter for LinuxPlatformAdapter {
         let helper_available = Path::new(HELPER).is_file();
         let engine_status = if helper_available {
             self.helper("engine-status", &[], "30s").ok().and_then(|text| serde_json::from_str::<Value>(&text).ok())
-        } else {
-            None
-        };
+        } else { None };
         Ok(PlatformDiagnostics {
             adapter: "linux-helper-v1".into(),
             available: cfg!(target_os = "linux"),
