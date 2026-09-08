@@ -114,7 +114,8 @@ jobs:
           flutter create --platforms=ios --org net.milmit --project-name milmit_vpn_client .
           cd ../..
           cp "$CUSTOM/Runner/AppDelegate.swift" apps/flutter/ios/Runner/AppDelegate.swift
-          cp "$CUSTOM/Runner/MobileCredentialStore.swift" apps/flutter/ios/Runner/MobileCredentialStore.swift
+          printf '\n' >> apps/flutter/ios/Runner/AppDelegate.swift
+          cat "$CUSTOM/Runner/MobileCredentialStore.swift" >> apps/flutter/ios/Runner/AppDelegate.swift
           cp "$CUSTOM/Runner/Runner.entitlements" apps/flutter/ios/Runner/Runner.entitlements
           mkdir -p apps/flutter/ios/PacketTunnel apps/flutter/ios/OpenVPNPacketTunnel
           cp -R "$CUSTOM/PacketTunnel/." apps/flutter/ios/PacketTunnel/
