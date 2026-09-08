@@ -4,6 +4,7 @@ import NetworkExtension
 final class MobileVpnBridge: NSObject {
     static let channelName = "net.milmit.vpn/ios"
     static let providerBundleIdentifier = "net.milmit.vpn.PacketTunnel"
+    static let appGroup = "group.net.milmit.vpn"
 
     static func register(with messenger: FlutterBinaryMessenger) {
         let channel = FlutterMethodChannel(name: channelName, binaryMessenger: messenger)
@@ -14,13 +15,7 @@ final class MobileVpnBridge: NSObject {
     private func handle(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
         switch call.method {
         case "prepare":
-            loadManager { manager, error in
-                if let error = error {
-                    result(FlutterError(code: "manager_load_failed", message: error.localizedDescription, details: nil))
-                    return
-                }
-                result(manager != nil)
-            }
+            result(true)
         case "connect":
             guard
                 let args = call.arguments as? [String: Any],
@@ -58,6 +53,11 @@ final class MobileVpnBridge: NSObject {
     }
 
     private func connect(providerId: String, serverId: String, result: @escaping FlutterResult) {
+        guard let wgQuickConfig = Self.loadProfile(serverId: serverId) else {
+            result(FlutterError(code: "profile_missing", message: "WireGuard profile is missing from the app group", details: nil))
+            return
+        }
+
         loadManager { manager, error in
             if let error = error {
                 result(FlutterError(code: "manager_load_failed", message: error.localizedDescription, details: nil))
@@ -90,7 +90,8 @@ final class MobileVpnBridge: NSObject {
                     do {
                         try vpnManager.connection.startVPNTunnel(options: [
                             "serverId" as NSString: serverId as NSString,
-                            "providerId" as NSString: providerId as NSString
+                            "providerId" as NSString: providerId as NSString,
+                            "wgQuickConfig" as NSString: wgQuickConfig as NSString
                         ])
                         result(nil)
                     } catch {
@@ -113,6 +114,17 @@ final class MobileVpnBridge: NSObject {
             }
             completion(manager, nil)
         }
+    }
+
+    private static func loadProfile(serverId: String) -> String? {
+        guard let root = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: appGroup) else {
+            return nil
+        }
+        let url = root
+            .appendingPathComponent("wireguard", isDirectory: true)
+            .appendingPathComponent("\(serverId).conf", isDirectory: false)
+        guard let data = try? Data(contentsOf: url), data.count <= 64 * 1024 else { return nil }
+        return String(data: data, encoding: .utf8)
     }
 
     private static func safeToken(_ value: String, max: Int) -> Bool {
