@@ -9,6 +9,9 @@ packages:
   WireGuardKit:
     url: https://github.com/WireGuard/wireguard-apple.git
     revision: 2fec12a6e1f6e3460b6ee483aa00ad29cddadab1
+  OpenVPNAdapter:
+    url: https://github.com/ss-abramchuk/OpenVPNAdapter.git
+    revision: 33afba081c8592e8632128c7f9d6ebe53cae3d08
 
 targets:
   PacketTunnel:
@@ -46,11 +49,44 @@ targets:
           fi
           /usr/bin/make -C "$WG_GO"
 
+  OpenVPNPacketTunnel:
+    type: app-extension
+    platform: macOS
+    deploymentTarget: "12.0"
+    sources:
+      - path: OpenVPNPacketTunnel
+        excludes:
+          - Info.plist
+          - OpenVPNPacketTunnel.entitlements
+    info:
+      path: OpenVPNPacketTunnel/Info.plist
+    dependencies:
+      - package: OpenVPNAdapter
+        product: OpenVPNAdapter
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: net.milmit.vpn.OpenVPNPacketTunnel
+        PRODUCT_NAME: OpenVPNPacketTunnel
+        SWIFT_VERSION: 5.0
+        CODE_SIGN_ENTITLEMENTS: OpenVPNPacketTunnel/OpenVPNPacketTunnel.entitlements
+        SKIP_INSTALL: YES
+        GENERATE_INFOPLIST_FILE: NO
+        CLANG_CXX_LANGUAGE_STANDARD: gnu++14
+        LD_RUNPATH_SEARCH_PATHS: "$(inherited) @executable_path/../Frameworks @executable_path/../../../../Frameworks"
+
 schemes:
   PacketTunnel:
     build:
       targets:
         PacketTunnel: all
+    run:
+      config: Debug
+    archive:
+      config: Release
+  OpenVPNPacketTunnel:
+    build:
+      targets:
+        OpenVPNPacketTunnel: all
     run:
       config: Debug
     archive:
