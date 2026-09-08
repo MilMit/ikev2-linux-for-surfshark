@@ -11,6 +11,8 @@ typedef _GetStringNative = Pointer<Utf8> Function();
 typedef _GetStringDart = Pointer<Utf8> Function();
 typedef _ConnectNative = Pointer<Utf8> Function(Pointer<Utf8>);
 typedef _ConnectDart = Pointer<Utf8> Function(Pointer<Utf8>);
+typedef _SetBoolNative = Pointer<Utf8> Function(Bool);
+typedef _SetBoolDart = Pointer<Utf8> Function(bool);
 typedef _FreeNative = Void Function(Pointer<Utf8>);
 typedef _FreeDart = void Function(Pointer<Utf8>);
 
@@ -21,6 +23,10 @@ class RustFfiVpnCore implements VpnCore {
         _listServers = _library.lookupFunction<_GetStringNative, _GetStringDart>('milmit_vpn_list_servers'),
         _connect = _library.lookupFunction<_ConnectNative, _ConnectDart>('milmit_vpn_connect'),
         _disconnect = _library.lookupFunction<_GetStringNative, _GetStringDart>('milmit_vpn_disconnect'),
+        _setKillSwitch = _library.lookupFunction<_SetBoolNative, _SetBoolDart>('milmit_vpn_set_kill_switch'),
+        _setDnsProtection = _library.lookupFunction<_SetBoolNative, _SetBoolDart>('milmit_vpn_set_dns_protection'),
+        _setIpv6Protection = _library.lookupFunction<_SetBoolNative, _SetBoolDart>('milmit_vpn_set_ipv6_protection'),
+        _runDiagnostics = _library.lookupFunction<_GetStringNative, _GetStringDart>('milmit_vpn_run_diagnostics'),
         _free = _library.lookupFunction<_FreeNative, _FreeDart>('milmit_vpn_string_free');
 
   factory RustFfiVpnCore.open() => RustFfiVpnCore._(_openLibrary());
@@ -31,6 +37,10 @@ class RustFfiVpnCore implements VpnCore {
   final _GetStringDart _listServers;
   final _ConnectDart _connect;
   final _GetStringDart _disconnect;
+  final _SetBoolDart _setKillSwitch;
+  final _SetBoolDart _setDnsProtection;
+  final _SetBoolDart _setIpv6Protection;
+  final _GetStringDart _runDiagnostics;
   final _FreeDart _free;
 
   final _controller = StreamController<VpnConnectionState>.broadcast();
@@ -51,6 +61,13 @@ class RustFfiVpnCore implements VpnCore {
 
   Map<String, dynamic> _jsonObject(Pointer<Utf8> pointer) =>
       jsonDecode(_readOwned(pointer)) as Map<String, dynamic>;
+
+  void _requireOk(Pointer<Utf8> pointer, String fallback) {
+    final result = _jsonObject(pointer);
+    if (result['ok'] != true) {
+      throw StateError((result['error'] as String?) ?? fallback);
+    }
+  }
 
   Future<VpnConnectionState> _readState() async {
     final raw = _jsonObject(_getState());
@@ -127,10 +144,7 @@ class RustFfiVpnCore implements VpnCore {
     final selected = server ?? (await listServers(providerId: providerId)).first;
     final input = selected.id.toNativeUtf8();
     try {
-      final result = _jsonObject(_connect(input));
-      if (result['ok'] != true) {
-        throw StateError((result['error'] as String?) ?? 'Native connect failed');
-      }
+      _requireOk(_connect(input), 'Native connect failed');
       _controller.add(await _readState());
     } finally {
       malloc.free(input);
@@ -139,26 +153,26 @@ class RustFfiVpnCore implements VpnCore {
 
   @override
   Future<void> disconnect() async {
-    final result = _jsonObject(_disconnect());
-    if (result['ok'] != true) {
-      throw StateError((result['error'] as String?) ?? 'Native disconnect failed');
-    }
+    _requireOk(_disconnect(), 'Native disconnect failed');
     _controller.add(await _readState());
   }
 
   @override
-  Future<void> setKillSwitch(bool enabled) async {}
+  Future<void> setKillSwitch(bool enabled) async =>
+      _requireOk(_setKillSwitch(enabled), 'Could not update kill switch');
 
   @override
-  Future<void> setDnsProtection(bool enabled) async {}
+  Future<void> setDnsProtection(bool enabled) async =>
+      _requireOk(_setDnsProtection(enabled), 'Could not update DNS protection');
 
   @override
-  Future<void> setIpv6Protection(bool enabled) async {}
+  Future<void> setIpv6Protection(bool enabled) async =>
+      _requireOk(_setIpv6Protection(enabled), 'Could not update IPv6 protection');
 
   @override
-  Future<Map<String, Object?>> runDiagnostics() async => {
-        'core': 'rust-ffi',
-        'version': _readOwned(_version()),
-        'library': _library.toString(),
-      };
+  Future<Map<String, Object?>> runDiagnostics() async {
+    final raw = _jsonObject(_runDiagnostics());
+    raw['ffi_version'] = _readOwned(_version());
+    return raw.cast<String, Object?>();
+  }
 }
