@@ -39,6 +39,10 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - uses: ilammy/msvc-dev-cmd@v1
+      - name: Compile WFP kill-switch helper
+        shell: cmd
+        run: cl /nologo /O2 /W4 /DUNICODE /D_UNICODE native\windows\wfp-helper\wfp_helper.c /Fe:native\windows\wfp-helper\wfp-helper.exe /link Fwpuclnt.lib Rpcrt4.lib Ws2_32.lib
       - name: Check Windows adapter
         run: cargo check -p milmit-vpn-platform-windows
       - name: Check Windows privileged service
