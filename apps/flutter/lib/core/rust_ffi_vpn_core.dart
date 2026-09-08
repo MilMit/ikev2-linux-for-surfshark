@@ -29,6 +29,7 @@ class RustFfiVpnCore implements VpnCore {
         _init = _library.lookupFunction<_OneStringNative, _OneStringDart>('milmit_vpn_init'),
         _getState = _library.lookupFunction<_GetStringNative, _GetStringDart>('milmit_vpn_get_state'),
         _listServers = _library.lookupFunction<_OneStringNative, _OneStringDart>('milmit_vpn_list_servers'),
+        _probeServer = _library.lookupFunction<_TwoStringNative, _TwoStringDart>('milmit_vpn_probe_server'),
         _applyCatalog = _library.lookupFunction<_TwoStringNative, _TwoStringDart>('milmit_vpn_apply_catalog_update'),
         _nextEndpoint = _library.lookupFunction<_TwoStringNative, _TwoStringDart>('milmit_vpn_next_endpoint'),
         _reportHealth = _library.lookupFunction<_HealthNative, _HealthDart>('milmit_vpn_report_server_health'),
@@ -37,6 +38,8 @@ class RustFfiVpnCore implements VpnCore {
         _setKillSwitch = _library.lookupFunction<_BoolNative, _BoolDart>('milmit_vpn_set_kill_switch'),
         _setDnsProtection = _library.lookupFunction<_BoolNative, _BoolDart>('milmit_vpn_set_dns_protection'),
         _setIpv6Protection = _library.lookupFunction<_BoolNative, _BoolDart>('milmit_vpn_set_ipv6_protection'),
+        _credentialsStatus = _library.lookupFunction<_GetStringNative, _GetStringDart>('milmit_vpn_credentials_status'),
+        _saveCredentials = _library.lookupFunction<_TwoStringNative, _TwoStringDart>('milmit_vpn_save_credentials'),
         _diagnostics = _library.lookupFunction<_GetStringNative, _GetStringDart>('milmit_vpn_diagnostics'),
         _free = _library.lookupFunction<_FreeNative, _FreeDart>('milmit_vpn_string_free');
 
@@ -47,6 +50,7 @@ class RustFfiVpnCore implements VpnCore {
   final _OneStringDart _init;
   final _GetStringDart _getState;
   final _OneStringDart _listServers;
+  final _TwoStringDart _probeServer;
   final _TwoStringDart _applyCatalog;
   final _TwoStringDart _nextEndpoint;
   final _HealthDart _reportHealth;
@@ -55,6 +59,8 @@ class RustFfiVpnCore implements VpnCore {
   final _BoolDart _setKillSwitch;
   final _BoolDart _setDnsProtection;
   final _BoolDart _setIpv6Protection;
+  final _GetStringDart _credentialsStatus;
+  final _TwoStringDart _saveCredentials;
   final _GetStringDart _diagnostics;
   final _FreeDart _free;
 
@@ -172,6 +178,17 @@ class RustFfiVpnCore implements VpnCore {
   }
 
   @override
+  Future<int?> probeServer({required String providerId, required String serverId}) async {
+    await _ensureInitialized();
+    final p = _utf8(providerId), s = _utf8(serverId);
+    try {
+      final result = _jsonObject(_probeServer(p, s));
+      if (result['ok'] != true) throw StateError((result['error'] as String?) ?? 'Server probe failed');
+      return result['latency_ms'] as int?;
+    } finally { malloc.free(p); malloc.free(s); }
+  }
+
+  @override
   Future<void> refreshServers({required String providerId}) async {
     await _ensureInitialized();
     final mirrors = _catalogMirrors(providerId);
@@ -227,7 +244,6 @@ class RustFfiVpnCore implements VpnCore {
         await reportServerHealth(selected.id, success: false);
         throw StateError((result['error'] as String?) ?? 'Native connect failed');
       }
-      await reportServerHealth(selected.id, success: true);
       _controller.add(await _readState());
     } finally { malloc.free(p); malloc.free(l); malloc.free(proto); }
   }
@@ -252,6 +268,24 @@ class RustFfiVpnCore implements VpnCore {
   Future<void> setDnsProtection(bool enabled) => _setFlag(_setDnsProtection, enabled);
   @override
   Future<void> setIpv6Protection(bool enabled) => _setFlag(_setIpv6Protection, enabled);
+
+  @override
+  Future<bool> credentialsSaved() async {
+    await _ensureInitialized();
+    final result = _jsonObject(_credentialsStatus());
+    if (result['ok'] != true) throw StateError((result['error'] as String?) ?? 'Credential status failed');
+    return result['saved'] == true;
+  }
+
+  @override
+  Future<void> saveCredentials({required String username, required String password}) async {
+    await _ensureInitialized();
+    final u = _utf8(username), p = _utf8(password);
+    try {
+      final result = _jsonObject(_saveCredentials(u, p));
+      if (result['ok'] != true) throw StateError((result['error'] as String?) ?? 'Saving credentials failed');
+    } finally { malloc.free(u); malloc.free(p); }
+  }
 
   @override
   Future<Map<String, Object?>> runDiagnostics() async {
