@@ -22,7 +22,7 @@ fi
 
 install -d -m 0755 /usr/lib/milmit-surfshark /usr/libexec /usr/share/polkit-1/actions "$RULES_DIR" "$EXT_DIR" /var/lib/milmit-surfshark /var/lib/milmit-surfshark/rules /usr/lib/systemd/system-sleep
 install -d -o root -g root -m 0700 /etc/milmit-surfshark /etc/milmit-surfshark/openvpn /etc/milmit-surfshark/wireguard
-for f in restricted-ikev2-connect.sh restricted-ikev2-connect-v2.sh restricted-ikev2-disconnect.sh connection-engine-v3.py hotspot-device-policy.sh milmit-surfshark-watchdog.sh milmit-surfshark-sleep-hook.sh control-center.py router-features.py advanced-router.py rules-update.py status-portal.py desktop-features.py hotspot-doctor.py; do
+for f in restricted-ikev2-connect.sh restricted-ikev2-connect-v2.sh restricted-ikev2-disconnect.sh connection-engine-v3.py protocol-connect-v1.py hotspot-device-policy.sh milmit-surfshark-watchdog.sh milmit-surfshark-sleep-hook.sh control-center.py router-features.py advanced-router.py rules-update.py status-portal.py desktop-features.py hotspot-doctor.py; do
   install -o root -g root -m 0755 "$ROOT/scripts/$f" "/usr/lib/milmit-surfshark/$f"
 done
 install -o root -g root -m 0755 "$ROOT/scripts/milmit-surfshark-sleep-hook.sh" /usr/lib/systemd/system-sleep/milmit-surfshark
@@ -58,5 +58,6 @@ if [[ ! -s /var/lib/milmit-surfshark/rules/ircidr.txt ]]; then /usr/lib/milmit-s
 echo "MilMit Surfshark privileged helper and Connection Engine v3 installed."
 echo "Location latency now probes the actual IKEv2 service instead of trusting ICMP ping alone."
 echo "Fallback transports: WireGuard/OpenVPN engines are available when matching manual profiles are present under /etc/milmit-surfshark/."
+echo "Explicit WireGuard/OpenVPN selection is available through protocol-connect-v1.py and reuses Engine v3 verification/cleanup."
 echo "Suspend/resume recovery hook installed; screen lock leaves the tunnel running and sleep recovery is automatic."
 echo "Authorization model: install/update may ask once; connect/disconnect/tools are passwordless for the active local sudo user."
