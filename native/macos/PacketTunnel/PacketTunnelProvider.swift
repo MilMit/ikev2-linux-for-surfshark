@@ -27,20 +27,12 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         }
 
         self.engine = engine
-        setTunnelNetworkSettings(configuration.baseNetworkSettings()) { [weak self] error in
-            guard let self else {
-                completionHandler(NSError(domain: "net.milmit.vpn", code: 4, userInfo: [NSLocalizedDescriptionKey: "Packet tunnel provider was released during startup"]))
-                return
-            }
-            if let error {
-                self.engine = nil
-                completionHandler(error)
-                return
-            }
-            engine.start(configuration: configuration, packetFlow: self.packetFlow) { [weak self] startError in
-                if startError != nil { self?.engine = nil }
-                completionHandler(startError)
-            }
+        // The protocol engine owns tunnel network settings. WireGuardKit calculates
+        // addresses, DNS and routes from the reviewed WireGuard configuration before
+        // activating the backend; applying an empty settings object here can race it.
+        engine.start(configuration: configuration, packetFlow: packetFlow) { [weak self] startError in
+            if startError != nil { self?.engine = nil }
+            completionHandler(startError)
         }
     }
 
