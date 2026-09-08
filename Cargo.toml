@@ -6,5 +6,7 @@ members = [
   "crates/gui",
   "crates/flutter-ffi",
   "crates/platform-linux",
+  "crates/platform-windows",
+  "crates/platform-macos",
   "apps/desktop/src-tauri",
 ]
