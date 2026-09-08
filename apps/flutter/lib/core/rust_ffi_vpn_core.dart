@@ -16,6 +16,8 @@ typedef _TwoStringNative = Pointer<Utf8> Function(Pointer<Utf8>, Pointer<Utf8>);
 typedef _TwoStringDart = Pointer<Utf8> Function(Pointer<Utf8>, Pointer<Utf8>);
 typedef _ThreeStringNative = Pointer<Utf8> Function(Pointer<Utf8>, Pointer<Utf8>, Pointer<Utf8>);
 typedef _ThreeStringDart = Pointer<Utf8> Function(Pointer<Utf8>, Pointer<Utf8>, Pointer<Utf8>);
+typedef _HealthNative = Pointer<Utf8> Function(Pointer<Utf8>, Int64, Int32);
+typedef _HealthDart = Pointer<Utf8> Function(Pointer<Utf8>, int, int);
 typedef _BoolNative = Pointer<Utf8> Function(Bool);
 typedef _BoolDart = Pointer<Utf8> Function(bool);
 typedef _FreeNative = Void Function(Pointer<Utf8>);
@@ -28,6 +30,8 @@ class RustFfiVpnCore implements VpnCore {
         _getState = _library.lookupFunction<_GetStringNative, _GetStringDart>('milmit_vpn_get_state'),
         _listServers = _library.lookupFunction<_OneStringNative, _OneStringDart>('milmit_vpn_list_servers'),
         _applyCatalog = _library.lookupFunction<_TwoStringNative, _TwoStringDart>('milmit_vpn_apply_catalog_update'),
+        _nextEndpoint = _library.lookupFunction<_TwoStringNative, _TwoStringDart>('milmit_vpn_next_endpoint'),
+        _reportHealth = _library.lookupFunction<_HealthNative, _HealthDart>('milmit_vpn_report_server_health'),
         _connect = _library.lookupFunction<_ThreeStringNative, _ThreeStringDart>('milmit_vpn_connect'),
         _disconnect = _library.lookupFunction<_GetStringNative, _GetStringDart>('milmit_vpn_disconnect'),
         _setKillSwitch = _library.lookupFunction<_BoolNative, _BoolDart>('milmit_vpn_set_kill_switch'),
@@ -44,6 +48,8 @@ class RustFfiVpnCore implements VpnCore {
   final _GetStringDart _getState;
   final _OneStringDart _listServers;
   final _TwoStringDart _applyCatalog;
+  final _TwoStringDart _nextEndpoint;
+  final _HealthDart _reportHealth;
   final _ThreeStringDart _connect;
   final _GetStringDart _disconnect;
   final _BoolDart _setKillSwitch;
@@ -53,6 +59,7 @@ class RustFfiVpnCore implements VpnCore {
   final _FreeDart _free;
 
   final _controller = StreamController<VpnConnectionState>.broadcast();
+  final Map<String, int> _mirrorCursor = {};
   Timer? _poller;
   Future<void>? _initialization;
 
@@ -72,9 +79,7 @@ class RustFfiVpnCore implements VpnCore {
     final input = cache.path.toNativeUtf8();
     try {
       final result = _jsonObject(_init(input));
-      if (result['ok'] != true) {
-        throw StateError((result['error'] as String?) ?? 'Native catalog initialization failed');
-      }
+      if (result['ok'] != true) throw StateError((result['error'] as String?) ?? 'Native catalog initialization failed');
     } finally {
       malloc.free(input);
     }
@@ -89,14 +94,13 @@ class RustFfiVpnCore implements VpnCore {
   Map<String, dynamic> _jsonObject(Pointer<Utf8> pointer) => jsonDecode(_readOwned(pointer)) as Map<String, dynamic>;
   Pointer<Utf8> _utf8(String value) => value.toNativeUtf8();
 
-  String? _catalogUrl(String providerId) {
-    switch (providerId.toLowerCase()) {
-      case 'surfshark':
-        const value = String.fromEnvironment('VPN_CATALOG_SURFSHARK_URL');
-        return value.isEmpty ? null : value;
-      default:
-        return null;
-    }
+  List<Uri> _catalogMirrors(String providerId) {
+    final raw = switch (providerId.toLowerCase()) {
+      'surfshark' => const String.fromEnvironment('VPN_CATALOG_SURFSHARK_URLS'),
+      _ => '',
+    };
+    if (raw.trim().isEmpty) return const [];
+    return raw.split(',').map((value) => value.trim()).where((value) => value.isNotEmpty).map(Uri.parse).toList(growable: false);
   }
 
   Future<String> _downloadCatalog(Uri uri) async {
@@ -105,9 +109,7 @@ class RustFfiVpnCore implements VpnCore {
       final request = await client.getUrl(uri).timeout(const Duration(seconds: 10));
       request.headers.set(HttpHeaders.acceptHeader, 'application/json');
       final response = await request.close().timeout(const Duration(seconds: 12));
-      if (response.statusCode != HttpStatus.ok) {
-        throw HttpException('Catalog update HTTP ${response.statusCode}', uri: uri);
-      }
+      if (response.statusCode != HttpStatus.ok) throw HttpException('Catalog update HTTP ${response.statusCode}', uri: uri);
       return response.transform(utf8.decoder).join().timeout(const Duration(seconds: 12));
     } finally {
       client.close(force: true);
@@ -116,14 +118,9 @@ class RustFfiVpnCore implements VpnCore {
 
   Future<Map<String, dynamic>> _applyCatalogJson(String providerId, String catalogJson) async {
     await _ensureInitialized();
-    final provider = _utf8(providerId);
-    final jsonPtr = _utf8(catalogJson);
-    try {
-      return _jsonObject(_applyCatalog(provider, jsonPtr));
-    } finally {
-      malloc.free(provider);
-      malloc.free(jsonPtr);
-    }
+    final provider = _utf8(providerId), jsonPtr = _utf8(catalogJson);
+    try { return _jsonObject(_applyCatalog(provider, jsonPtr)); }
+    finally { malloc.free(provider); malloc.free(jsonPtr); }
   }
 
   Future<VpnConnectionState> _readState() async {
@@ -141,10 +138,7 @@ class RustFfiVpnCore implements VpnCore {
     final locationId = raw['location_id'] as String?;
     if (locationId != null) {
       for (final item in await listServers(providerId: providerId)) {
-        if (item.id == locationId) {
-          server = item;
-          break;
-        }
+        if (item.id == locationId) { server = item; break; }
       }
     }
     return VpnConnectionState(status: status, server: server, protocol: raw['protocol'] as String?);
@@ -153,11 +147,8 @@ class RustFfiVpnCore implements VpnCore {
   @override
   Stream<VpnConnectionState> watchConnection() {
     _poller ??= Timer.periodic(const Duration(seconds: 1), (_) async {
-      try {
-        _controller.add(await _readState());
-      } catch (error) {
-        _controller.add(VpnConnectionState(status: VpnConnectionStatus.error, errorMessage: error.toString()));
-      }
+      try { _controller.add(await _readState()); }
+      catch (error) { _controller.add(VpnConnectionState(status: VpnConnectionStatus.error, errorMessage: error.toString())); }
     });
     Future(() async => _controller.add(await _readState()));
     return _controller.stream;
@@ -177,21 +168,49 @@ class RustFfiVpnCore implements VpnCore {
         hostname: item['hostname'] as String,
         latencyMs: item['latency_ms'] as int?,
       )).toList(growable: false);
-    } finally {
-      malloc.free(input);
-    }
+    } finally { malloc.free(input); }
   }
 
   @override
   Future<void> refreshServers({required String providerId}) async {
     await _ensureInitialized();
-    final source = _catalogUrl(providerId);
-    if (source == null) return;
-    final catalogJson = await _downloadCatalog(Uri.parse(source));
-    final result = await _applyCatalogJson(providerId, catalogJson);
-    if (result['ok'] != true) {
-      throw StateError((result['error'] as String?) ?? 'Catalog update rejected');
+    final mirrors = _catalogMirrors(providerId);
+    if (mirrors.isEmpty) return;
+    final start = (_mirrorCursor[providerId] ?? 0) % mirrors.length;
+    final errors = <String>[];
+    for (var offset = 0; offset < mirrors.length; offset++) {
+      final index = (start + offset) % mirrors.length;
+      final uri = mirrors[index];
+      try {
+        final catalogJson = await _downloadCatalog(uri);
+        final result = await _applyCatalogJson(providerId, catalogJson);
+        if (result['ok'] != true) throw StateError((result['error'] as String?) ?? 'Catalog update rejected');
+        _mirrorCursor[providerId] = (index + 1) % mirrors.length;
+        return;
+      } catch (error) {
+        errors.add('${uri.host}: $error');
+      }
     }
+    throw StateError('All catalog mirrors failed: ${errors.join(' | ')}');
+  }
+
+  Future<void> reportServerHealth(String serverId, {int? latencyMs, bool? success}) async {
+    await _ensureInitialized();
+    final id = _utf8(serverId);
+    try {
+      final result = _jsonObject(_reportHealth(id, latencyMs ?? -1, success == null ? 0 : (success ? 1 : -1)));
+      if (result['ok'] != true) throw StateError((result['error'] as String?) ?? 'Health report rejected');
+    } finally { malloc.free(id); }
+  }
+
+  Future<String> nextEndpoint(String providerId, String locationId) async {
+    await _ensureInitialized();
+    final p = _utf8(providerId), l = _utf8(locationId);
+    try {
+      final result = _jsonObject(_nextEndpoint(p, l));
+      if (result['ok'] != true) throw StateError((result['error'] as String?) ?? 'Endpoint rotation failed');
+      return result['endpoint'] as String;
+    } finally { malloc.free(p); malloc.free(l); }
   }
 
   @override
@@ -200,18 +219,17 @@ class RustFfiVpnCore implements VpnCore {
     final servers = await listServers(providerId: providerId);
     if (servers.isEmpty) throw StateError('No valid bundled or cached servers are available.');
     final selected = server ?? servers.first;
-    final p = _utf8(providerId);
-    final l = _utf8(selected.id);
-    final proto = _utf8(protocol.toLowerCase());
+    await nextEndpoint(providerId, selected.id);
+    final p = _utf8(providerId), l = _utf8(selected.id), proto = _utf8(protocol.toLowerCase());
     try {
       final result = _jsonObject(_connect(p, l, proto));
-      if (result['ok'] != true) throw StateError((result['error'] as String?) ?? 'Native connect failed');
+      if (result['ok'] != true) {
+        await reportServerHealth(selected.id, success: false);
+        throw StateError((result['error'] as String?) ?? 'Native connect failed');
+      }
+      await reportServerHealth(selected.id, success: true);
       _controller.add(await _readState());
-    } finally {
-      malloc.free(p);
-      malloc.free(l);
-      malloc.free(proto);
-    }
+    } finally { malloc.free(p); malloc.free(l); malloc.free(proto); }
   }
 
   @override
