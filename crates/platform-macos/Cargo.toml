@@ -1,0 +1,8 @@
+[package]
+name = "milmit-vpn-platform-macos"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+surfshark-ikev2-core = { path = "../core" }
+serde_json = "1"
