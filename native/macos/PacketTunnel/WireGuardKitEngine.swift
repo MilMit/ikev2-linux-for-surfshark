@@ -51,7 +51,7 @@ enum MilMitWgQuickParser {
             dict[key.lowercased(), default: []].append(value)
         }
 
-        for rawLine in text.split(whereSeparator: \ .isNewline) {
+        for rawLine in text.split(whereSeparator: \.isNewline) {
             let trimmed = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
             if trimmed.isEmpty || trimmed.hasPrefix("#") { continue }
             if trimmed.caseInsensitiveCompare("[Interface]") == .orderedSame {
@@ -73,8 +73,9 @@ enum MilMitWgQuickParser {
             case .interface:
                 add(key, value, to: &interfaceValues)
             case .peer:
-                if currentPeer == nil { currentPeer = [:] }
-                add(key, value, to: &currentPeer!)
+                var peer = currentPeer ?? [:]
+                add(key, value, to: &peer)
+                currentPeer = peer
             case .none:
                 continue
             }
@@ -88,8 +89,8 @@ enum MilMitWgQuickParser {
         var interface = InterfaceConfiguration(privateKey: privateKey)
         interface.addresses = csv(interfaceValues["address"]).compactMap { IPAddressRange(from: $0) }
         interface.dns = csv(interfaceValues["dns"]).compactMap { DNSServer(from: $0) }
-        if let port = interfaceValues["listenport"]?.last.flatMap(UInt16.init) { interface.listenPort = port }
-        if let mtu = interfaceValues["mtu"]?.last.flatMap(UInt16.init) { interface.mtu = mtu }
+        if let portText = interfaceValues["listenport"]?.last, let port = UInt16(portText) { interface.listenPort = port }
+        if let mtuText = interfaceValues["mtu"]?.last, let mtu = UInt16(mtuText) { interface.mtu = mtu }
 
         let peers: [PeerConfiguration] = try peerValues.map { values in
             guard let publicKeyText = values["publickey"]?.last,
@@ -106,7 +107,7 @@ enum MilMitWgQuickParser {
                 guard let endpoint = Endpoint(from: endpointText) else { throw parseError("Invalid WireGuard endpoint") }
                 peer.endpoint = endpoint
             }
-            if let keepalive = values["persistentkeepalive"]?.last.flatMap(UInt16.init) {
+            if let keepaliveText = values["persistentkeepalive"]?.last, let keepalive = UInt16(keepaliveText) {
                 peer.persistentKeepAlive = keepalive
             }
             return peer
