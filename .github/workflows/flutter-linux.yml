@@ -1,0 +1,100 @@
+name: Flutter Linux packages
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - phase-1-flutter-foundation
+    paths:
+      - 'apps/flutter/**'
+      - 'crates/core/**'
+      - 'crates/flutter-ffi/**'
+      - 'crates/platform-linux/**'
+      - 'scripts/**'
+      - 'packaging/**'
+      - '.github/workflows/flutter-linux.yml'
+  pull_request:
+    paths:
+      - 'apps/flutter/**'
+      - 'crates/core/**'
+      - 'crates/flutter-ffi/**'
+      - 'crates/platform-linux/**'
+      - 'scripts/**'
+      - 'packaging/**'
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential clang cmake ninja-build pkg-config libgtk-3-dev \
+            liblzma-dev libstdc++-12-dev curl wget file patchelf \
+            dpkg-dev policykit-1 iproute2 iptables strongswan-swanctl \
+            wireguard-tools openvpn
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Generate Linux scaffold
+        working-directory: apps/flutter
+        run: |
+          if [ ! -d linux ]; then flutter create --platforms=linux .; fi
+
+      - name: Flutter analyze
+        working-directory: apps/flutter
+        run: |
+          flutter pub get
+          flutter analyze
+
+      - name: Rust checks
+        run: |
+          cargo fmt --all -- --check
+          cargo check --workspace --all-targets
+          cargo test --workspace
+
+      - name: Build Flutter Linux bundle
+        run: bash scripts/build-flutter-linux-release.sh
+
+      - name: Install appimagetool
+        run: |
+          wget -q https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage -O /usr/local/bin/appimagetool
+          sudo chmod +x /usr/local/bin/appimagetool
+
+      - name: Build DEB and AppImage
+        env:
+          VERSION: 0.1.0
+        run: bash scripts/package-flutter-linux.sh
+
+      - name: Verify packages
+        run: |
+          test -f dist/packages/milmit-vpn_0.1.0_amd64.deb
+          test -f dist/packages/MilMit-VPN-0.1.0-x86_64.AppImage
+          dpkg-deb --info dist/packages/milmit-vpn_0.1.0_amd64.deb
+          chmod +x dist/packages/MilMit-VPN-0.1.0-x86_64.AppImage
+          dist/packages/MilMit-VPN-0.1.0-x86_64.AppImage --appimage-extract >/dev/null
+          test -x squashfs-root/AppRun
+          cat dist/packages/SHA256SUMS.txt
+
+      - name: Upload Linux packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: milmit-vpn-flutter-linux
+          path: |
+            dist/packages/*.deb
+            dist/packages/*.AppImage
+            dist/packages/SHA256SUMS.txt
+          if-no-files-found: error
