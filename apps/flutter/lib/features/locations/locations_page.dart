@@ -1,25 +1,20 @@
 import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
 
-class LocationsPage extends StatefulWidget {
+import '../../core/vpn_core.dart';
+import '../../core/vpn_core_providers.dart';
+
+class LocationsPage extends ConsumerStatefulWidget {
   const LocationsPage({super.key});
 
   @override
-  State<LocationsPage> createState() => _LocationsPageState();
+  ConsumerState<LocationsPage> createState() => _LocationsPageState();
 }
 
-class _LocationsPageState extends State<LocationsPage> {
+class _LocationsPageState extends ConsumerState<LocationsPage> {
   final controller = TextEditingController();
-  final favorites = <String>{'Germany|Frankfurt'};
+  final favorites = <String>{'de-fra'};
   final recent = <String>[];
-
-  static const locations = [
-    ('Fastest location', 'Automatic', '—'),
-    ('Germany', 'Frankfurt', '42 ms'),
-    ('Netherlands', 'Amsterdam', '48 ms'),
-    ('United Kingdom', 'London', '61 ms'),
-    ('United States', 'New York', '88 ms'),
-    ('Canada', 'Toronto', '96 ms'),
-  ];
 
   @override
   void dispose() {
@@ -27,35 +22,33 @@ class _LocationsPageState extends State<LocationsPage> {
     super.dispose();
   }
 
-  String keyFor((String, String, String) item) => '${item.$1}|${item.$2}';
-
-  void toggleFavorite((String, String, String) item) {
-    final key = keyFor(item);
+  void toggleFavorite(VpnServer server) {
     setState(() {
-      favorites.contains(key) ? favorites.remove(key) : favorites.add(key);
+      favorites.contains(server.id) ? favorites.remove(server.id) : favorites.add(server.id);
     });
   }
 
-  void markRecent((String, String, String) item) {
-    final key = keyFor(item);
+  void markRecent(VpnServer server) {
     setState(() {
-      recent.remove(key);
-      recent.insert(0, key);
+      recent.remove(server.id);
+      recent.insert(0, server.id);
       if (recent.length > 5) recent.removeLast();
     });
   }
 
+  Future<void> connect(VpnServer server) async {
+    markRecent(server);
+    await ref.read(vpnCoreProvider).connect(
+          providerId: server.providerId,
+          server: server,
+          protocol: 'auto',
+        );
+  }
+
   @override
   Widget build(BuildContext context) {
+    final serversAsync = ref.watch(surfsharkServersProvider);
     final query = controller.text.trim().toLowerCase();
-    final filtered = locations.where((item) {
-      return item.$1.toLowerCase().contains(query) || item.$2.toLowerCase().contains(query);
-    }).toList();
-
-    final favoriteItems = locations.where((item) => favorites.contains(keyFor(item))).toList();
-    final recentItems = recent
-        .map((key) => locations.firstWhere((item) => keyFor(item) == key))
-        .toList();
 
     return SafeArea(
       child: Padding(
@@ -72,69 +65,112 @@ class _LocationsPageState extends State<LocationsPage> {
                   controller: controller,
                   hintText: 'Search country or city',
                   leading: const Icon(Icons.search),
+                  trailing: [
+                    IconButton(
+                      tooltip: 'Refresh servers',
+                      onPressed: () async {
+                        await ref.read(vpnCoreProvider).refreshServers(providerId: 'surfshark');
+                        ref.invalidate(surfsharkServersProvider);
+                      },
+                      icon: const Icon(Icons.refresh),
+                    ),
+                  ],
                   onChanged: (_) => setState(() {}),
                 ),
-                if (favoriteItems.isNotEmpty || recentItems.isNotEmpty) ...[
-                  const SizedBox(height: 16),
-                  SizedBox(
-                    height: 76,
-                    child: ListView(
-                      scrollDirection: Axis.horizontal,
-                      children: [
-                        for (final item in favoriteItems)
-                          Padding(
-                            padding: const EdgeInsetsDirectional.only(end: 8),
-                            child: ActionChip(
-                              avatar: const Icon(Icons.star, size: 18),
-                              label: Text('${item.$1} · ${item.$2}'),
-                              onPressed: () => markRecent(item),
-                            ),
-                          ),
-                        for (final item in recentItems)
-                          if (!favorites.contains(keyFor(item)))
-                            Padding(
-                              padding: const EdgeInsetsDirectional.only(end: 8),
-                              child: ActionChip(
-                                avatar: const Icon(Icons.history, size: 18),
-                                label: Text('${item.$1} · ${item.$2}'),
-                                onPressed: () => markRecent(item),
-                              ),
-                            ),
-                      ],
-                    ),
-                  ),
-                ],
-                const SizedBox(height: 8),
+                const SizedBox(height: 12),
                 Expanded(
-                  child: Card(
-                    clipBehavior: Clip.antiAlias,
-                    child: ListView.separated(
-                      itemCount: filtered.length,
-                      separatorBuilder: (_, __) => const Divider(height: 1),
-                      itemBuilder: (context, index) {
-                        final item = filtered[index];
-                        final isFavorite = favorites.contains(keyFor(item));
-                        return ListTile(
-                          leading: CircleAvatar(child: Icon(item.$1 == 'Fastest location' ? Icons.bolt : Icons.public)),
-                          title: Text(item.$1),
-                          subtitle: Text(item.$2),
-                          trailing: Row(
-                            mainAxisSize: MainAxisSize.min,
-                            children: [
-                              Text(item.$3),
-                              const SizedBox(width: 8),
-                              IconButton(
-                                tooltip: isFavorite ? 'Remove favorite' : 'Favorite',
-                                onPressed: () => toggleFavorite(item),
-                                icon: Icon(isFavorite ? Icons.star : Icons.star_border),
+                  child: serversAsync.when(
+                    loading: () => const Center(child: CircularProgressIndicator()),
+                    error: (error, _) => Center(child: Text('Could not load servers: $error')),
+                    data: (servers) {
+                      final filtered = servers.where((server) {
+                        return server.country.toLowerCase().contains(query) ||
+                            server.city.toLowerCase().contains(query) ||
+                            server.hostname.toLowerCase().contains(query);
+                      }).toList();
+
+                      final favoriteItems = servers.where((server) => favorites.contains(server.id)).toList();
+                      final byId = {for (final server in servers) server.id: server};
+                      final recentItems = recent.map((id) => byId[id]).whereType<VpnServer>().toList();
+
+                      return Column(
+                        children: [
+                          if (favoriteItems.isNotEmpty || recentItems.isNotEmpty) ...[
+                            SizedBox(
+                              height: 52,
+                              child: ListView(
+                                scrollDirection: Axis.horizontal,
+                                children: [
+                                  for (final server in favoriteItems)
+                                    Padding(
+                                      padding: const EdgeInsetsDirectional.only(end: 8),
+                                      child: ActionChip(
+                                        avatar: const Icon(Icons.star, size: 18),
+                                        label: Text('${server.country} · ${server.city}'),
+                                        onPressed: () => connect(server),
+                                      ),
+                                    ),
+                                  for (final server in recentItems)
+                                    if (!favorites.contains(server.id))
+                                      Padding(
+                                        padding: const EdgeInsetsDirectional.only(end: 8),
+                                        child: ActionChip(
+                                          avatar: const Icon(Icons.history, size: 18),
+                                          label: Text('${server.country} · ${server.city}'),
+                                          onPressed: () => connect(server),
+                                        ),
+                                      ),
+                                ],
                               ),
-                              const Icon(Icons.chevron_right),
-                            ],
+                            ),
+                            const SizedBox(height: 8),
+                          ],
+                          Expanded(
+                            child: Card(
+                              clipBehavior: Clip.antiAlias,
+                              child: ListView.separated(
+                                itemCount: filtered.length + 1,
+                                separatorBuilder: (_, __) => const Divider(height: 1),
+                                itemBuilder: (context, index) {
+                                  if (index == 0) {
+                                    return ListTile(
+                                      leading: const CircleAvatar(child: Icon(Icons.bolt)),
+                                      title: const Text('Fastest location'),
+                                      subtitle: Text(servers.isEmpty ? 'No servers available' : 'Automatic'),
+                                      trailing: const Icon(Icons.chevron_right),
+                                      enabled: servers.isNotEmpty,
+                                      onTap: servers.isEmpty ? null : () => connect(servers.first),
+                                    );
+                                  }
+
+                                  final server = filtered[index - 1];
+                                  final isFavorite = favorites.contains(server.id);
+                                  return ListTile(
+                                    leading: const CircleAvatar(child: Icon(Icons.public)),
+                                    title: Text(server.country),
+                                    subtitle: Text('${server.city} · ${server.hostname}'),
+                                    trailing: Row(
+                                      mainAxisSize: MainAxisSize.min,
+                                      children: [
+                                        Text(server.latencyMs == null ? '—' : '${server.latencyMs} ms'),
+                                        const SizedBox(width: 8),
+                                        IconButton(
+                                          tooltip: isFavorite ? 'Remove favorite' : 'Favorite',
+                                          onPressed: () => toggleFavorite(server),
+                                          icon: Icon(isFavorite ? Icons.star : Icons.star_border),
+                                        ),
+                                        const Icon(Icons.chevron_right),
+                                      ],
+                                    ),
+                                    onTap: () => connect(server),
+                                  );
+                                },
+                              ),
+                            ),
                           ),
-                          onTap: () => markRecent(item),
-                        );
-                      },
-                    ),
+                        ],
+                      );
+                    },
                   ),
                 ),
               ],
