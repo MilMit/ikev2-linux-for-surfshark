@@ -15,6 +15,7 @@ class _LocationsPageState extends ConsumerState<LocationsPage> {
   final controller = TextEditingController();
   final favorites = <String>{'de-fra'};
   final recent = <String>[];
+  final probing = <String>{};
 
   @override
   void dispose() {
@@ -43,6 +44,25 @@ class _LocationsPageState extends ConsumerState<LocationsPage> {
           server: server,
           protocol: 'auto',
         );
+  }
+
+  Future<void> probe(VpnServer server) async {
+    if (probing.contains(server.id)) return;
+    setState(() => probing.add(server.id));
+    try {
+      await ref.read(vpnCoreProvider).probeServer(providerId: server.providerId, serverId: server.id);
+      ref.invalidate(surfsharkServersProvider);
+    } catch (error) {
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Latency test failed: $error')));
+    } finally {
+      if (mounted) setState(() => probing.remove(server.id));
+    }
+  }
+
+  Future<void> probeVisible(List<VpnServer> servers) async {
+    for (final server in servers.take(24)) {
+      await probe(server);
+    }
   }
 
   @override
@@ -95,6 +115,21 @@ class _LocationsPageState extends ConsumerState<LocationsPage> {
 
                       return Column(
                         children: [
+                          Row(
+                            children: [
+                              Expanded(
+                                child: Text(
+                                  'Real IKEv2 latency is measured by the Linux adapter and feeds server ranking.',
+                                  style: Theme.of(context).textTheme.bodySmall,
+                                ),
+                              ),
+                              TextButton.icon(
+                                onPressed: filtered.isEmpty || probing.isNotEmpty ? null : () => probeVisible(filtered),
+                                icon: const Icon(Icons.speed),
+                                label: const Text('Test visible'),
+                              ),
+                            ],
+                          ),
                           if (favoriteItems.isNotEmpty || recentItems.isNotEmpty) ...[
                             SizedBox(
                               height: 52,
@@ -136,7 +171,7 @@ class _LocationsPageState extends ConsumerState<LocationsPage> {
                                     return ListTile(
                                       leading: const CircleAvatar(child: Icon(Icons.bolt)),
                                       title: const Text('Fastest location'),
-                                      subtitle: Text(servers.isEmpty ? 'No servers available' : 'Automatic'),
+                                      subtitle: Text(servers.isEmpty ? 'No servers available' : 'Health-ranked automatic selection'),
                                       trailing: const Icon(Icons.chevron_right),
                                       enabled: servers.isNotEmpty,
                                       onTap: servers.isEmpty ? null : () => connect(servers.first),
@@ -145,6 +180,7 @@ class _LocationsPageState extends ConsumerState<LocationsPage> {
 
                                   final server = filtered[index - 1];
                                   final isFavorite = favorites.contains(server.id);
+                                  final isProbing = probing.contains(server.id);
                                   return ListTile(
                                     leading: const CircleAvatar(child: Icon(Icons.public)),
                                     title: Text(server.country),
@@ -152,8 +188,15 @@ class _LocationsPageState extends ConsumerState<LocationsPage> {
                                     trailing: Row(
                                       mainAxisSize: MainAxisSize.min,
                                       children: [
-                                        Text(server.latencyMs == null ? '—' : '${server.latencyMs} ms'),
-                                        const SizedBox(width: 8),
+                                        if (isProbing)
+                                          const SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2))
+                                        else
+                                          Text(server.latencyMs == null ? '—' : '${server.latencyMs} ms'),
+                                        IconButton(
+                                          tooltip: 'Measure IKEv2 latency',
+                                          onPressed: isProbing ? null : () => probe(server),
+                                          icon: const Icon(Icons.speed_outlined),
+                                        ),
                                         IconButton(
                                           tooltip: isFavorite ? 'Remove favorite' : 'Favorite',
                                           onPressed: () => toggleFavorite(server),
