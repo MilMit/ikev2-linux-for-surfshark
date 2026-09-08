@@ -7,10 +7,8 @@ import android.app.PendingIntent
 import android.content.Intent
 import android.net.VpnService
 import android.os.Build
-import android.os.ParcelFileDescriptor
 import androidx.core.app.NotificationCompat
 import java.io.File
-import java.net.InetAddress
 import java.util.concurrent.atomic.AtomicReference
 
 class MilMitVpnService : VpnService() {
@@ -27,8 +25,7 @@ class MilMitVpnService : VpnService() {
         fun currentState(): String = state.get()
     }
 
-    private var tun: ParcelFileDescriptor? = null
-    private val wireGuardBackend: WireGuardBackend = UnavailableWireGuardBackend()
+    private val wireGuardBackend: WireGuardBackend = WireGuardAndroidBackend()
 
     override fun onCreate() {
         super.onCreate()
@@ -52,7 +49,7 @@ class MilMitVpnService : VpnService() {
 
         val serverId = intent.getStringExtra(EXTRA_SERVER_ID)?.takeIf { it.matches(Regex("[A-Za-z0-9._:-]{1,160}")) }
             ?: run {
-                state.set("error")
+                state.set("invalid_server")
                 stopSelf()
                 return
             }
@@ -64,8 +61,15 @@ class MilMitVpnService : VpnService() {
         }
 
         val profile = File(filesDir, "wireguard/$serverId.conf")
-        if (!profile.isFile || profile.length() == 0L) {
+        if (!profile.isFile || profile.length() == 0L || profile.length() > 64 * 1024) {
             state.set("profile_missing")
+            stopSelf()
+            return
+        }
+
+        val tunnelName = serverId.replace(Regex("[^A-Za-z0-9_=+.-]"), "-").take(15)
+        if (tunnelName.isBlank()) {
+            state.set("invalid_tunnel_name")
             stopSelf()
             return
         }
@@ -73,28 +77,15 @@ class MilMitVpnService : VpnService() {
         state.set("connecting")
         startForeground(NOTIFICATION_ID, buildNotification("Connecting…"))
 
-        val address = extractInterfaceAddress(profile) ?: run {
-            fail("profile_invalid")
+        val result = wireGuardBackend.start(this, tunnelName, profile)
+        if (result.isFailure) {
+            fail(result.exceptionOrNull()?.message ?: "wireguard_start_failed")
             return
         }
 
-        tun?.close()
-        tun = Builder()
-            .setSession("MilMit VPN")
-            .setMtu(1280)
-            .addAddress(address.first, address.second)
-            .addRoute("0.0.0.0", 0)
-            .addDnsServer("1.1.1.1")
-            .establish()
-
-        val descriptor = tun ?: run {
-            fail("tun_create_failed")
-            return
-        }
-
-        val backendResult = wireGuardBackend.start(this, descriptor, profile)
-        if (backendResult.isFailure) {
-            fail(backendResult.exceptionOrNull()?.message ?: "wireguard_start_failed")
+        val backendState = wireGuardBackend.state()
+        if (backendState != "connected") {
+            fail("wireguard_backend_not_up")
             return
         }
 
@@ -103,26 +94,8 @@ class MilMitVpnService : VpnService() {
             .notify(NOTIFICATION_ID, buildNotification("Connected"))
     }
 
-    private fun extractInterfaceAddress(profile: File): Pair<String, Int>? {
-        val line = profile.useLines { lines ->
-            lines.map { it.trim() }
-                .firstOrNull { it.startsWith("Address", ignoreCase = true) && it.contains('=') }
-        } ?: return null
-        val value = line.substringAfter('=').trim().substringBefore(',').trim()
-        val host = value.substringBefore('/')
-        val prefix = value.substringAfter('/', "32").toIntOrNull() ?: return null
-        return try {
-            val parsed = InetAddress.getByName(host)
-            if (parsed.address.size != 4 || prefix !in 0..32) null else host to prefix
-        } catch (_: Exception) {
-            null
-        }
-    }
-
     private fun fail(code: String) {
         wireGuardBackend.stop()
-        tun?.close()
-        tun = null
         state.set(code)
         stopForegroundCompat()
         stopSelf()
@@ -131,8 +104,6 @@ class MilMitVpnService : VpnService() {
     private fun stopTunnel() {
         state.set("disconnecting")
         wireGuardBackend.stop()
-        tun?.close()
-        tun = null
         state.set("disconnected")
         stopForegroundCompat()
         stopSelf()
