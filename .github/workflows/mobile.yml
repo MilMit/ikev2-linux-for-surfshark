@@ -1,0 +1,119 @@
+name: Mobile platforms
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - phase-5-mobile
+    paths:
+      - 'apps/flutter/**'
+      - 'native/ios/**'
+      - '.github/workflows/mobile.yml'
+  pull_request:
+    paths:
+      - 'apps/flutter/**'
+      - 'native/ios/**'
+      - '.github/workflows/mobile.yml'
+
+jobs:
+  android:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Generate Android scaffold and overlay mobile adapter
+        shell: bash
+        run: |
+          set -euo pipefail
+          CUSTOM="$RUNNER_TEMP/android-custom"
+          cp -R apps/flutter/android "$CUSTOM"
+          rm -rf apps/flutter/android
+          cd apps/flutter
+          flutter create --platforms=android --org net.milmit --project-name milmit_vpn_client .
+          cd ../..
+          rm -rf apps/flutter/android/app/src/main/kotlin
+          cp -R "$CUSTOM/app/src/main/kotlin" apps/flutter/android/app/src/main/
+          cp "$CUSTOM/app/src/main/AndroidManifest.xml" apps/flutter/android/app/src/main/AndroidManifest.xml
+          cp "$CUSTOM/app/build.gradle.kts" apps/flutter/android/app/build.gradle.kts
+
+      - name: Flutter analyze
+        working-directory: apps/flutter
+        run: |
+          flutter pub get
+          flutter analyze
+
+      - name: Build Android APK
+        working-directory: apps/flutter
+        run: flutter build apk --debug
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: milmit-vpn-android-debug
+          path: apps/flutter/build/app/outputs/flutter-apk/app-debug.apk
+
+  ios:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Install native build tools
+        run: brew install xcodegen go
+
+      - name: Generate iOS Flutter scaffold and overlay bridge
+        shell: bash
+        run: |
+          set -euo pipefail
+          CUSTOM="$RUNNER_TEMP/ios-custom"
+          cp -R apps/flutter/ios "$CUSTOM"
+          rm -rf apps/flutter/ios
+          cd apps/flutter
+          flutter create --platforms=ios --org net.milmit --project-name milmit_vpn_client .
+          cd ../..
+          cp "$CUSTOM/Runner/AppDelegate.swift" apps/flutter/ios/Runner/AppDelegate.swift
+          cp "$CUSTOM/Runner/Runner.entitlements" apps/flutter/ios/Runner/Runner.entitlements
+          mkdir -p apps/flutter/ios/PacketTunnel
+          cp -R "$CUSTOM/PacketTunnel/." apps/flutter/ios/PacketTunnel/
+
+      - name: Build Flutter iOS app without signing
+        working-directory: apps/flutter
+        run: |
+          flutter pub get
+          flutter build ios --debug --no-codesign
+
+      - name: Generate PacketTunnel project
+        working-directory: native/ios
+        run: xcodegen generate
+
+      - name: Build WireGuard PacketTunnel without signing
+        working-directory: native/ios
+        run: |
+          xcodebuild \
+            -project MilMitVPNMobileNative.xcodeproj \
+            -scheme PacketTunnel \
+            -configuration Debug \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            build
+
+      - name: Verify PacketTunnel extension
+        shell: bash
+        run: |
+          set -euo pipefail
+          find "$HOME/Library/Developer/Xcode/DerivedData" -path '*PacketTunnel.appex' -type d -print -quit | grep -q PacketTunnel.appex
