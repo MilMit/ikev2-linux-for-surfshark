@@ -17,10 +17,11 @@ if command -v apt-get >/dev/null 2>&1; then
   command -v openvpn >/dev/null 2>&1 || missing+=(openvpn)
   command -v wg-quick >/dev/null 2>&1 || missing+=(wireguard-tools)
   command -v ike-scan >/dev/null 2>&1 || missing+=(ike-scan)
+  command -v resolvectl >/dev/null 2>&1 || missing+=(systemd-resolved)
   if ((${#missing[@]})); then DEBIAN_FRONTEND=noninteractive apt-get install -y "${missing[@]}" >/dev/null 2>&1 || true; fi
 fi
 
-install -d -m 0755 /usr/lib/milmit-surfshark /usr/libexec /usr/share/polkit-1/actions "$RULES_DIR" "$EXT_DIR" /var/lib/milmit-surfshark /var/lib/milmit-surfshark/rules /usr/lib/systemd/system-sleep
+install -d -m 0755 /usr/lib/milmit-surfshark /usr/libexec /usr/share/polkit-1/actions "$RULES_DIR" "$EXT_DIR" /var/lib/milmit-surfshark /var/lib/milmit-surfshark/rules /var/lib/milmit-surfshark/platform /usr/lib/systemd/system-sleep
 install -d -o root -g root -m 0700 /etc/milmit-surfshark /etc/milmit-surfshark/openvpn /etc/milmit-surfshark/wireguard
 for f in restricted-ikev2-connect.sh restricted-ikev2-connect-v2.sh restricted-ikev2-disconnect.sh connection-engine-v3.py protocol-connect-v1.py hotspot-device-policy.sh milmit-surfshark-watchdog.sh milmit-surfshark-sleep-hook.sh control-center.py router-features.py advanced-router.py rules-update.py status-portal.py desktop-features.py hotspot-doctor.py; do
   install -o root -g root -m 0755 "$ROOT/scripts/$f" "/usr/lib/milmit-surfshark/$f"
@@ -29,10 +30,12 @@ install -o root -g root -m 0755 "$ROOT/scripts/milmit-surfshark-sleep-hook.sh" /
 install -o root -g root -m 0755 "$ROOT/scripts/install-privileged-helper.sh" /usr/lib/milmit-surfshark/install-privileged-helper.sh
 install -o root -g root -m 0755 "$ROOT/scripts/hotspot-device-manager.py" /usr/lib/milmit-surfshark/hotspot-device-manager.py
 install -o root -g root -m 0755 "$ROOT/scripts/milmit-surfshark-helper" /usr/libexec/milmit-surfshark-helper
+install -o root -g root -m 0755 "$ROOT/scripts/milmit-vpn-platform-helper" /usr/libexec/milmit-vpn-platform-helper
 install -o root -g root -m 0644 "$ROOT/packaging/net.milmit.surfshark-ikev2.policy" /usr/share/polkit-1/actions/net.milmit.surfshark-ikev2.policy
 cat > "$RULES_FILE" <<'RULE'
 polkit.addRule(function(action, subject) {
-    if (action.id == "net.milmit.surfshark-ikev2.manage" &&
+    if ((action.id == "net.milmit.surfshark-ikev2.manage" ||
+         action.id == "net.milmit.surfshark-ikev2.platform") &&
         subject.active && subject.local && subject.isInGroup("sudo")) {
         return polkit.Result.YES;
     }
@@ -55,9 +58,10 @@ systemctl try-reload-or-restart polkit.service >/dev/null 2>&1 || true
 if [[ ! -s /var/lib/milmit-surfshark/rules/ircidr.txt ]]; then /usr/lib/milmit-surfshark/rules-update.py update >/var/log/milmit-surfshark-rules-update.log 2>&1 || true; fi
 /usr/lib/milmit-surfshark/desktop-features.py lockdown-apply >/dev/null 2>&1 || true
 
-echo "MilMit Surfshark privileged helper and Connection Engine v3 installed."
-echo "Location latency now probes the actual IKEv2 service instead of trusting ICMP ping alone."
+echo "MilMit privileged VPN helpers and Connection Engine v3 installed."
+echo "Location latency probes the actual IKEv2 service instead of trusting ICMP ping alone."
 echo "Fallback transports: WireGuard/OpenVPN engines are available when matching manual profiles are present under /etc/milmit-surfshark/."
-echo "Explicit WireGuard/OpenVPN selection is available through protocol-connect-v1.py and reuses Engine v3 verification/cleanup."
+echo "Explicit WireGuard/OpenVPN selection reuses Engine v3 verification/cleanup."
+echo "Native DNS protection, IPv6 protection, and CIDR split-tunnel controls are installed through milmit-vpn-platform-helper."
 echo "Suspend/resume recovery hook installed; screen lock leaves the tunnel running and sleep recovery is automatic."
-echo "Authorization model: install/update may ask once; connect/disconnect/tools are passwordless for the active local sudo user."
+echo "Authorization model: install/update may ask once; VPN/network controls are passwordless for the active local sudo user."
