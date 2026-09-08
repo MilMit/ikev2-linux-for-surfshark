@@ -1,0 +1,50 @@
+name: Desktop platform adapters
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - phase-1-flutter-foundation
+    paths:
+      - 'crates/core/**'
+      - 'crates/flutter-ffi/**'
+      - 'crates/platform-windows/**'
+      - 'crates/platform-macos/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/desktop-platforms.yml'
+  pull_request:
+    paths:
+      - 'crates/core/**'
+      - 'crates/flutter-ffi/**'
+      - 'crates/platform-windows/**'
+      - 'crates/platform-macos/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Check Windows adapter
+        run: cargo check -p milmit-vpn-platform-windows
+      - name: Test core
+        run: cargo test -p surfshark-ikev2-core
+      - name: Check Flutter FFI on Windows
+        run: cargo check -p milmit-vpn-flutter-ffi
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Check macOS adapter
+        run: cargo check -p milmit-vpn-platform-macos
+      - name: Test core
+        run: cargo test -p surfshark-ikev2-core
+      - name: Check Flutter FFI on macOS
+        run: cargo check -p milmit-vpn-flutter-ffi
