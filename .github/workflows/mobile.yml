@@ -5,18 +5,19 @@ on:
   push:
     branches:
       - phase-5-mobile
+      - phase-6-protocol-parity
     paths:
       - 'apps/flutter/**'
       - 'native/ios/**'
       - 'scripts/**'
-      - 'docs/PHASE5_MOBILE_HANDOFF.md'
+      - 'docs/**'
       - '.github/workflows/mobile.yml'
   pull_request:
     paths:
       - 'apps/flutter/**'
       - 'native/ios/**'
       - 'scripts/**'
-      - 'docs/PHASE5_MOBILE_HANDOFF.md'
+      - 'docs/**'
       - '.github/workflows/mobile.yml'
 
 jobs:
@@ -24,17 +25,18 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
-      - name: Build Phase 5 source ZIP
+      - name: Build source ZIP
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p dist
-          git archive --format=zip --output=dist/milmit-vpn-phase-5-mobile.zip HEAD
+          NAME="milmit-vpn-${GITHUB_REF_NAME//\//-}.zip"
+          git archive --format=zip --output="dist/$NAME" HEAD
       - uses: actions/upload-artifact@v4
         with:
-          name: milmit-vpn-phase-5-source
+          name: milmit-vpn-source
           if-no-files-found: error
-          path: dist/milmit-vpn-phase-5-mobile.zip
+          path: dist/*.zip
 
   android:
     runs-on: ubuntu-22.04
@@ -62,12 +64,21 @@ jobs:
           cp -R "$CUSTOM/app/src/main/kotlin" apps/flutter/android/app/src/main/
           cp "$CUSTOM/app/src/main/AndroidManifest.xml" apps/flutter/android/app/src/main/AndroidManifest.xml
           cp "$CUSTOM/app/build.gradle.kts" apps/flutter/android/app/build.gradle.kts
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('apps/flutter/android/settings.gradle.kts')
+          text = p.read_text()
+          marker = 'repositories {\n        google()\n        mavenCentral()'
+          if 'https://jitpack.io' not in text and marker in text:
+              text = text.replace(marker, marker + '\n        maven { url = uri("https://jitpack.io") }', 1)
+          p.write_text(text)
+          PY
           rm -f apps/flutter/test/widget_test.dart
       - name: Flutter analyze
         working-directory: apps/flutter
         run: |
           flutter pub get
-          flutter analyze --no-fatal-infos
+          flutter analyze --no-fatal-infos --no-fatal-warnings
       - name: Build Android APK
         working-directory: apps/flutter
         run: flutter build apk --debug
@@ -92,7 +103,7 @@ jobs:
           cache: true
       - name: Install native build tools
         run: brew install xcodegen go
-      - name: Generate iOS Flutter scaffold and overlay bridge
+      - name: Generate iOS Flutter scaffold and overlay native bridges
         shell: bash
         run: |
           set -euo pipefail
@@ -103,9 +114,11 @@ jobs:
           flutter create --platforms=ios --org net.milmit --project-name milmit_vpn_client .
           cd ../..
           cp "$CUSTOM/Runner/AppDelegate.swift" apps/flutter/ios/Runner/AppDelegate.swift
+          cp "$CUSTOM/Runner/MobileCredentialStore.swift" apps/flutter/ios/Runner/MobileCredentialStore.swift
           cp "$CUSTOM/Runner/Runner.entitlements" apps/flutter/ios/Runner/Runner.entitlements
-          mkdir -p apps/flutter/ios/PacketTunnel
+          mkdir -p apps/flutter/ios/PacketTunnel apps/flutter/ios/OpenVPNPacketTunnel
           cp -R "$CUSTOM/PacketTunnel/." apps/flutter/ios/PacketTunnel/
+          cp -R "$CUSTOM/OpenVPNPacketTunnel/." apps/flutter/ios/OpenVPNPacketTunnel/
           rm -f apps/flutter/test/widget_test.dart
       - name: Build Flutter iOS app without signing
         working-directory: apps/flutter
@@ -129,7 +142,7 @@ jobs:
           elif not text.startswith('// swift-tools-version:5.5'):
               raise SystemExit('unexpected WireGuardKit Package.swift header')
           PY
-      - name: Generate PacketTunnel project
+      - name: Generate PacketTunnel projects
         working-directory: native/ios
         run: xcodegen generate
       - name: Build WireGuard PacketTunnel without signing
@@ -144,15 +157,30 @@ jobs:
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             build
-      - name: Collect PacketTunnel extension
+      - name: Build OpenVPN PacketTunnel without signing
+        working-directory: native/ios
+        run: |
+          xcodebuild \
+            -project MilMitVPNMobileNative.xcodeproj \
+            -scheme OpenVPNPacketTunnel \
+            -configuration Debug \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            build
+      - name: Collect PacketTunnel extensions
         shell: bash
         run: |
           set -euo pipefail
-          APPEX="$(find "$HOME/Library/Developer/Xcode/DerivedData" -path '*PacketTunnel.appex' -type d -print -quit)"
-          test -n "$APPEX"
+          WG_APPEX="$(find "$HOME/Library/Developer/Xcode/DerivedData" -path '*PacketTunnel.appex' ! -path '*OpenVPNPacketTunnel.appex' -type d -print -quit)"
+          OVPN_APPEX="$(find "$HOME/Library/Developer/Xcode/DerivedData" -path '*OpenVPNPacketTunnel.appex' -type d -print -quit)"
+          test -n "$WG_APPEX"
+          test -n "$OVPN_APPEX"
           rm -rf native/ios/out
           mkdir -p native/ios/out
-          cp -R "$APPEX" native/ios/out/PacketTunnel.appex
+          cp -R "$WG_APPEX" native/ios/out/PacketTunnel.appex
+          cp -R "$OVPN_APPEX" native/ios/out/OpenVPNPacketTunnel.appex
       - uses: actions/upload-artifact@v4
         with:
           name: milmit-vpn-ios-nosign-debug
@@ -160,3 +188,4 @@ jobs:
           path: |
             apps/flutter/build/ios/iphoneos/Runner.app
             native/ios/out/PacketTunnel.appex
+            native/ios/out/OpenVPNPacketTunnel.appex
