@@ -11,6 +11,7 @@ on:
       - 'packages/milmit_vpn_macos/**'
       - 'crates/core/**'
       - 'crates/flutter-ffi/**'
+      - 'crates/platform-linux/**'
       - 'crates/platform-windows/**'
       - 'crates/platform-macos/**'
       - 'native/windows/**'
@@ -28,6 +29,7 @@ on:
       - 'packages/milmit_vpn_macos/**'
       - 'crates/core/**'
       - 'crates/flutter-ffi/**'
+      - 'crates/platform-linux/**'
       - 'crates/platform-windows/**'
       - 'crates/platform-macos/**'
       - 'native/windows/**'
@@ -40,6 +42,19 @@ on:
       - 'Cargo.lock'
 
 jobs:
+  linux:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Check Linux adapter
+        run: cargo check -p milmit-vpn-platform-linux
+      - name: Test core
+        run: cargo test -p surfshark-ikev2-core
+      - name: Check Flutter FFI on Linux
+        run: cargo check -p milmit-vpn-flutter-ffi
+
   windows:
     runs-on: windows-latest
     steps:
