@@ -13,7 +13,10 @@ class _SplitTunnelPageState extends State<SplitTunnelPage> {
   final controls = LinuxPlatformControls();
   bool enabled = false;
   bool loading = true;
+  bool loadingApps = false;
   List<Map<String, dynamic>> rules = const [];
+  List<Map<String, dynamic>> apps = const [];
+  String appQuery = '';
 
   @override
   void initState() {
@@ -32,6 +35,31 @@ class _SplitTunnelPageState extends State<SplitTunnelPage> {
       });
     } catch (_) {
       if (mounted) setState(() => loading = false);
+    }
+  }
+
+  Future<void> _loadApps() async {
+    if (loadingApps || apps.isNotEmpty || !controls.supported) return;
+    setState(() => loadingApps = true);
+    try {
+      final result = await controls.listDesktopApps();
+      if (mounted) setState(() => apps = result);
+    } catch (error) {
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(error.toString())));
+    } finally {
+      if (mounted) setState(() => loadingApps = false);
+    }
+  }
+
+  Future<void> _launchDirect(Map<String, dynamic> app) async {
+    try {
+      final result = await controls.launchAppDirect('${app['desktop_id']}');
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('${result['name'] ?? app['name']} launched outside VPN.')),
+      );
+    } catch (error) {
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(error.toString())));
     }
   }
 
@@ -61,7 +89,7 @@ class _SplitTunnelPageState extends State<SplitTunnelPage> {
             child: Column(
               mainAxisSize: MainAxisSize.min,
               children: [
-                const Text('Linux native split tunnel currently accepts CIDR targets, for example 10.0.0.0/8 or 203.0.113.10/32.'),
+                const Text('Use a CIDR target, for example 10.0.0.0/8 or 203.0.113.10/32.'),
                 const SizedBox(height: 12),
                 TextField(controller: controller, decoration: const InputDecoration(labelText: 'CIDR target', border: OutlineInputBorder())),
                 const SizedBox(height: 12),
@@ -113,6 +141,12 @@ class _SplitTunnelPageState extends State<SplitTunnelPage> {
 
   @override
   Widget build(BuildContext context) {
+    final filteredApps = apps.where((app) {
+      final q = appQuery.trim().toLowerCase();
+      if (q.isEmpty) return true;
+      return '${app['name']}'.toLowerCase().contains(q) || '${app['desktop_id']}'.toLowerCase().contains(q);
+    }).toList();
+
     return SafeArea(
       child: Padding(
         padding: const EdgeInsets.all(24),
@@ -123,22 +157,24 @@ class _SplitTunnelPageState extends State<SplitTunnelPage> {
               children: [
                 Text('Split Tunnel', style: Theme.of(context).textTheme.headlineMedium),
                 const SizedBox(height: 8),
-                const Text('Native Linux CIDR bypass rules are applied through a privileged routing helper.'),
+                const Text('Route CIDRs or selected Linux applications outside the VPN.'),
                 const SizedBox(height: 20),
                 Card(
                   child: SwitchListTile(
                     value: enabled,
                     onChanged: loading || !controls.supported ? null : _setEnabled,
                     title: const Text('Enable split tunneling'),
-                    subtitle: Text(controls.supported ? 'Rules are persisted under the privileged Linux platform store.' : 'This native implementation is currently available on Linux.'),
+                    subtitle: Text(controls.supported ? 'Native Linux routing rules are persisted by the privileged helper.' : 'This implementation is currently available on Linux.'),
                   ),
                 ),
                 const SizedBox(height: 16),
+                Text('CIDR rules', style: Theme.of(context).textTheme.titleLarge),
+                const SizedBox(height: 8),
                 Card(
                   child: loading
                       ? const Padding(padding: EdgeInsets.all(24), child: Center(child: CircularProgressIndicator()))
                       : rules.isEmpty
-                          ? const Padding(padding: EdgeInsets.all(24), child: Text('No split tunnel rules yet.'))
+                          ? const Padding(padding: EdgeInsets.all(24), child: Text('No CIDR rules yet.'))
                           : Column(
                               children: [
                                 for (final rule in rules)
@@ -151,10 +187,51 @@ class _SplitTunnelPageState extends State<SplitTunnelPage> {
                               ],
                             ),
                 ),
-                const SizedBox(height: 16),
+                const SizedBox(height: 12),
                 Align(
                   alignment: Alignment.centerLeft,
                   child: FilledButton.icon(onPressed: enabled && controls.supported ? _addRule : null, icon: const Icon(Icons.add), label: const Text('Add CIDR rule')),
+                ),
+                const SizedBox(height: 28),
+                Row(
+                  children: [
+                    Expanded(child: Text('Applications', style: Theme.of(context).textTheme.titleLarge)),
+                    FilledButton.tonalIcon(
+                      onPressed: controls.supported ? _loadApps : null,
+                      icon: const Icon(Icons.apps),
+                      label: Text(apps.isEmpty ? 'Load apps' : 'Refresh'),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 8),
+                const Text('Launch a selected desktop application inside the direct network namespace so only that app bypasses the VPN.'),
+                const SizedBox(height: 12),
+                SearchBar(
+                  hintText: 'Search installed apps',
+                  leading: const Icon(Icons.search),
+                  onTap: _loadApps,
+                  onChanged: (value) { setState(() => appQuery = value); _loadApps(); },
+                ),
+                const SizedBox(height: 12),
+                Card(
+                  child: loadingApps
+                      ? const Padding(padding: EdgeInsets.all(24), child: Center(child: CircularProgressIndicator()))
+                      : apps.isEmpty
+                          ? const Padding(padding: EdgeInsets.all(24), child: Text('Load installed desktop applications to use per-app bypass.'))
+                          : Column(
+                              children: [
+                                for (final app in filteredApps.take(80))
+                                  ListTile(
+                                    leading: const CircleAvatar(child: Icon(Icons.apps_outlined)),
+                                    title: Text('${app['name']}'),
+                                    subtitle: Text('${app['desktop_id']}'),
+                                    trailing: FilledButton.tonal(
+                                      onPressed: enabled ? () => _launchDirect(app) : null,
+                                      child: const Text('Launch direct'),
+                                    ),
+                                  ),
+                              ],
+                            ),
                 ),
               ],
             ),
