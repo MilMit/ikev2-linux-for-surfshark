@@ -59,14 +59,34 @@ pub trait PlatformAdapter: Send + Sync {
     fn disconnect(&self) -> Result<PlatformStatus, String>;
     fn status(&self) -> Result<PlatformStatus, String>;
     fn set_kill_switch(&self, enabled: bool) -> Result<(), String>;
-    fn set_dns_protection(&self, _enabled: bool) -> Result<(), String> { Ok(()) }
-    fn set_ipv6_protection(&self, _enabled: bool) -> Result<(), String> { Ok(()) }
+
+    fn set_dns_protection(&self, _enabled: bool) -> Result<(), String> {
+        Err("DNS protection is not implemented by this platform adapter".into())
+    }
+
+    fn set_ipv6_protection(&self, _enabled: bool) -> Result<(), String> {
+        Err("IPv6 protection is not implemented by this platform adapter".into())
+    }
+
     fn credentials_status(&self) -> Result<bool, String>;
     fn save_credentials(&self, username: &str, password: &str) -> Result<(), String>;
     fn probe_latency(&self, location: &Location) -> Result<Option<u32>, String>;
-    fn split_tunnel_status(&self) -> Result<serde_json::Value, String>;
-    fn set_split_tunnel_enabled(&self, enabled: bool) -> Result<serde_json::Value, String>;
-    fn add_split_tunnel_rule(&self, target: &str, mode: &str) -> Result<serde_json::Value, String>;
-    fn remove_split_tunnel_rule(&self, target: &str) -> Result<serde_json::Value, String>;
+
+    fn split_tunnel_status(&self) -> Result<serde_json::Value, String> {
+        Err("Split tunneling is not implemented by this platform adapter".into())
+    }
+
+    fn set_split_tunnel_enabled(&self, _enabled: bool) -> Result<serde_json::Value, String> {
+        Err("Split tunneling is not implemented by this platform adapter".into())
+    }
+
+    fn add_split_tunnel_rule(&self, _target: &str, _mode: &str) -> Result<serde_json::Value, String> {
+        Err("Split tunneling is not implemented by this platform adapter".into())
+    }
+
+    fn remove_split_tunnel_rule(&self, _target: &str) -> Result<serde_json::Value, String> {
+        Err("Split tunneling is not implemented by this platform adapter".into())
+    }
+
     fn diagnostics(&self) -> Result<PlatformDiagnostics, String>;
 }
