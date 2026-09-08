@@ -1,3 +1,5 @@
+pub mod catalog;
+
 use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
 use thiserror::Error;
