@@ -14,13 +14,13 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         let raw = protocolConfiguration.providerConfiguration ?? [:]
         let configuration: MilMitTunnelConfiguration
         do {
-            configuration = try MilMitTunnelConfiguration(providerConfiguration: raw)
+            configuration = try MilMitTunnelConfiguration(providerConfiguration: raw, runtimeOptions: options)
         } catch {
             completionHandler(error)
             return
         }
 
-        guard let engine = MilMitPacketTunnelEngineFactory.make(engine: configuration.engine) else {
+        guard let engine = MilMitPacketTunnelEngineFactory.make(engine: configuration.engine, provider: self) else {
             logger.error("Requested engine \(configuration.engine, privacy: .public) is not linked into the signed extension")
             completionHandler(NSError(domain: "net.milmit.vpn", code: 3, userInfo: [NSLocalizedDescriptionKey: "Signed packet tunnel engine bridge is not linked"] ))
             return
