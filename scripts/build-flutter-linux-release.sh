@@ -21,16 +21,11 @@ BUNDLE="$APP/build/linux/x64/release/bundle"
 [[ -d "$BUNDLE" ]] || { echo "Flutter Linux bundle not found at $BUNDLE" >&2; exit 1; }
 
 rm -rf "$OUT"
-mkdir -p "$OUT/app/lib" "$OUT/privileged/scripts" "$OUT/privileged/packaging"
+mkdir -p "$OUT/app/lib" "$OUT/privileged"
 cp -a "$BUNDLE/." "$OUT/app/"
 cp "$ROOT/target/release/libmilmit_vpn_flutter_ffi.so" "$OUT/app/lib/"
-
-cp "$ROOT/scripts/install-privileged-helper.sh" "$OUT/privileged/scripts/"
-cp "$ROOT/scripts/milmit-surfshark-helper" "$OUT/privileged/scripts/"
-cp "$ROOT/scripts/milmit-vpn-platform-helper" "$OUT/privileged/scripts/"
-cp "$ROOT/scripts/connection-engine-v3.py" "$OUT/privileged/scripts/"
-cp "$ROOT/scripts/protocol-connect-v1.py" "$OUT/privileged/scripts/"
-cp "$ROOT/packaging/net.milmit.surfshark-ikev2.policy" "$OUT/privileged/packaging/"
+cp -a "$ROOT/scripts" "$OUT/privileged/"
+cp -a "$ROOT/packaging" "$OUT/privileged/"
 
 cat > "$OUT/install.sh" <<'SH'
 #!/usr/bin/env bash
@@ -39,10 +34,9 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 APP_DIR=/opt/milmit-vpn
 sudo install -d -m 0755 "$APP_DIR"
 sudo cp -a "$ROOT/app/." "$APP_DIR/"
-if [[ -x "$ROOT/privileged/scripts/install-privileged-helper.sh" ]]; then
-  sudo bash "$ROOT/privileged/scripts/install-privileged-helper.sh"
-fi
+sudo bash "$ROOT/privileged/scripts/install-privileged-helper.sh"
 echo "Flutter Linux app installed under $APP_DIR"
+echo "Launch the binary from $APP_DIR or create a desktop entry in the final package step."
 SH
 chmod +x "$OUT/install.sh"
 
