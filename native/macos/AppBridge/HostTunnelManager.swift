@@ -62,13 +62,17 @@ final class MilMitHostTunnelManager {
         }
     }
 
-    func start(completion: @escaping (Error?) -> Void) {
+    func start(wireGuardQuickConfig: String? = nil, completion: @escaping (Error?) -> Void) {
         loadManager { result in
             switch result {
             case .failure(let error): completion(error)
             case .success(let manager):
                 do {
-                    try manager.connection.startVPNTunnel()
+                    var options: [String: NSObject]? = nil
+                    if let wireGuardQuickConfig, !wireGuardQuickConfig.isEmpty {
+                        options = ["wireGuardQuickConfig": wireGuardQuickConfig as NSString]
+                    }
+                    try manager.connection.startVPNTunnel(options: options)
                     completion(nil)
                 } catch {
                     completion(error)
