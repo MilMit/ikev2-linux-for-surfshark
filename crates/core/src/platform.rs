@@ -59,5 +59,10 @@ pub trait PlatformAdapter: Send + Sync {
     fn disconnect(&self) -> Result<PlatformStatus, String>;
     fn status(&self) -> Result<PlatformStatus, String>;
     fn set_kill_switch(&self, enabled: bool) -> Result<(), String>;
+    fn set_dns_protection(&self, _enabled: bool) -> Result<(), String> { Ok(()) }
+    fn set_ipv6_protection(&self, _enabled: bool) -> Result<(), String> { Ok(()) }
+    fn credentials_status(&self) -> Result<bool, String>;
+    fn save_credentials(&self, username: &str, password: &str) -> Result<(), String>;
+    fn probe_latency(&self, location: &Location) -> Result<Option<u32>, String>;
     fn diagnostics(&self) -> Result<PlatformDiagnostics, String>;
 }
