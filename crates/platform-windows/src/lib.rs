@@ -32,10 +32,6 @@ impl WindowsPlatformAdapter {
         if output.status.success() { Ok(text.trim().to_string()) } else { Err(text.trim().to_string()) }
     }
 
-    fn require_admin_error(context: &str, error: String) -> String {
-        format!("{context} failed. This operation must run through MilMitVpnService/administrator: {error}")
-    }
-
     fn state_path() -> PathBuf { Self::program_data().join("windows-policy.json") }
 
     fn load_policy_state() -> serde_json::Value {
@@ -53,7 +49,7 @@ impl WindowsPlatformAdapter {
 
     fn vpn_profile_exists(name: &str) -> bool {
         let escaped = name.replace('\'', "''");
-        Self::powershell(&format!("if (Get-VpnConnection -Name '{escaped}' -ErrorAction SilentlyContinue) {{ exit 0 }} else {{ exit 1 }}")).is_ok()
+        Self::powershell(&format!("if ((Get-VpnConnection -Name '{escaped}' -ErrorAction SilentlyContinue) -or (Get-VpnConnection -AllUserConnection -Name '{escaped}' -ErrorAction SilentlyContinue)) {{ exit 0 }} else {{ exit 1 }}")).is_ok()
     }
 
     fn connect_ikev2(location: &Location) -> Result<(), String> {
@@ -100,10 +96,6 @@ impl WindowsPlatformAdapter {
         }
     }
 
-    fn managed_profile_script(body: &str) -> String {
-        format!("$profiles=Get-VpnConnection -ErrorAction SilentlyContinue | Where-Object {{$_.Name -like 'MilMit *'}}; foreach($p in $profiles){{ $n=$p.Name; {body} }}")
-    }
-
     fn resolve_endpoint_ip(location: &Location) -> Result<String, String> {
         if let Some(ip) = location.endpoint.fallback_ips.first() { return Ok(ip.to_string()); }
         (location.endpoint.hostname.as_str(), 443).to_socket_addrs()
@@ -128,7 +120,7 @@ impl WindowsPlatformAdapter {
         let addr = SERVICE_IPC.parse().map_err(|e| format!("invalid service IPC address: {e}"))?;
         let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2))
             .map_err(|e| format!("MilMitVpnService IPC unavailable: {e}"))?;
-        stream.set_read_timeout(Some(Duration::from_secs(4))).map_err(|e| e.to_string())?;
+        stream.set_read_timeout(Some(Duration::from_secs(6))).map_err(|e| e.to_string())?;
         stream.set_write_timeout(Some(Duration::from_secs(4))).map_err(|e| e.to_string())?;
         let mut request = serde_json::to_vec(&payload).map_err(|e| e.to_string())?;
         request.push(b'\n');
@@ -183,12 +175,11 @@ impl PlatformAdapter for WindowsPlatformAdapter {
     }
 
     fn set_dns_protection(&self, enabled: bool) -> Result<(), String> {
-        let script = if enabled {
-            "$old=Get-DnsClientNrptRule -ErrorAction SilentlyContinue | Where-Object {$_.Comment -eq 'MilMit VPN DNS'}; $old | Remove-DnsClientNrptRule -Force -ErrorAction SilentlyContinue; Add-DnsClientNrptRule -Namespace '.' -NameServers @('162.252.172.57','149.154.159.92') -Comment 'MilMit VPN DNS' | Out-Null"
-        } else {
-            "Get-DnsClientNrptRule -ErrorAction SilentlyContinue | Where-Object {$_.Comment -eq 'MilMit VPN DNS'} | Remove-DnsClientNrptRule -Force -ErrorAction Stop"
-        };
-        Self::powershell(script).map_err(|e| Self::require_admin_error("NRPT DNS policy", e))?;
+        Self::service_call(serde_json::json!({
+            "action":"dns_protection",
+            "enabled":enabled,
+            "servers":["162.252.172.57","149.154.159.92"]
+        }))?;
         let mut state = Self::load_policy_state();
         state["dns"] = serde_json::Value::Bool(enabled);
         Self::save_policy_state(&state)
@@ -210,9 +201,7 @@ impl PlatformAdapter for WindowsPlatformAdapter {
     fn split_tunnel_status(&self) -> Result<serde_json::Value, String> { Ok(Self::load_policy_state()) }
 
     fn set_split_tunnel_enabled(&self, enabled: bool) -> Result<serde_json::Value, String> {
-        let value = if enabled { "$true" } else { "$false" };
-        Self::powershell(&Self::managed_profile_script(&format!("Set-VpnConnection -Name $n -SplitTunneling {value} -Force -ErrorAction Stop | Out-Null")))
-            .map_err(|e| Self::require_admin_error("Windows VPN split-tunnel policy", e))?;
+        Self::service_call(serde_json::json!({"action":"split_tunnel","enabled":enabled}))?;
         let mut state = Self::load_policy_state();
         state["split_enabled"] = serde_json::Value::Bool(enabled);
         Self::save_policy_state(&state)?;
@@ -222,9 +211,7 @@ impl PlatformAdapter for WindowsPlatformAdapter {
     fn add_split_tunnel_rule(&self, target: &str, mode: &str) -> Result<serde_json::Value, String> {
         if mode != "vpn" { return Err("Windows bypass-CIDR requires dedicated physical-uplink route resolution and remains fail-closed".into()); }
         let target = target.trim();
-        if target.is_empty() || target.contains('\'') || target.contains('"') || target.contains(';') { return Err("invalid_split_target".into()); }
-        let body = format!("Add-VpnConnectionRoute -ConnectionName $n -DestinationPrefix '{target}' -PassThru -ErrorAction Stop | Out-Null");
-        Self::powershell(&Self::managed_profile_script(&body)).map_err(|e| Self::require_admin_error("Windows VPN route", e))?;
+        Self::service_call(serde_json::json!({"action":"split_route_add","target":target}))?;
         let mut state = Self::load_policy_state();
         let mut rules = state.get("rules").and_then(|v| v.as_array()).cloned().unwrap_or_default();
         if !rules.iter().any(|r| r.get("target").and_then(|v| v.as_str()) == Some(target)) { rules.push(serde_json::json!({"target":target,"mode":"vpn"})); }
@@ -235,9 +222,7 @@ impl PlatformAdapter for WindowsPlatformAdapter {
 
     fn remove_split_tunnel_rule(&self, target: &str) -> Result<serde_json::Value, String> {
         let target = target.trim();
-        if target.is_empty() || target.contains('\'') || target.contains('"') || target.contains(';') { return Err("invalid_split_target".into()); }
-        let body = format!("Remove-VpnConnectionRoute -ConnectionName $n -DestinationPrefix '{target}' -PassThru -ErrorAction SilentlyContinue | Out-Null");
-        Self::powershell(&Self::managed_profile_script(&body)).map_err(|e| Self::require_admin_error("Windows VPN route removal", e))?;
+        Self::service_call(serde_json::json!({"action":"split_route_remove","target":target}))?;
         let mut state = Self::load_policy_state();
         let rules = state.get("rules").and_then(|v| v.as_array()).cloned().unwrap_or_default().into_iter().filter(|r| r.get("target").and_then(|v| v.as_str()) != Some(target)).collect();
         state["rules"] = serde_json::Value::Array(rules);
@@ -248,7 +233,7 @@ impl PlatformAdapter for WindowsPlatformAdapter {
     fn diagnostics(&self) -> Result<PlatformDiagnostics, String> {
         let service_available = Self::service_available();
         Ok(PlatformDiagnostics {
-            adapter: "windows-native-v4".into(),
+            adapter: "windows-native-v5".into(),
             available: cfg!(target_os = "windows"),
             helper_available: service_available,
             credentials_available: false,
@@ -256,18 +241,19 @@ impl PlatformAdapter for WindowsPlatformAdapter {
             wireguard_available: Self::wireguard_exe().is_some(),
             openvpn_available: Self::openvpn_exe().is_some(),
             kill_switch_supported: service_available,
-            dns_protection_supported: true,
-            split_tunnel_supported: true,
+            dns_protection_supported: service_available,
+            split_tunnel_supported: service_available,
             details: serde_json::json!({
                 "program_data":Self::program_data(),
                 "native_vpn":"rasdial/Get-VpnConnection",
-                "kill_switch":"WFP ALE_AUTH_CONNECT V4/V6 via MilMitVpnService",
-                "kill_switch_elevation":"LocalSystem service; no direct UAC helper invocation from UI",
+                "privileged_networking":"MilMitVpnService LocalSystem",
+                "kill_switch":"WFP ALE_AUTH_CONNECT V4/V6",
+                "dns":"NRPT via service",
+                "split_tunnel":"all-user Windows VPN connection routes via service (vpn mode)",
                 "service_ipc":SERVICE_IPC,
-                "dns":"NRPT",
-                "split_tunnel":"Windows VPN connection routes (vpn mode)",
                 "bypass_mode":"pending hardened physical-uplink route resolver",
-                "credential_policy":"Windows Credential Manager/native profile only"
+                "credential_policy":"Windows Credential Manager/native profile only",
+                "profile_policy":"split-tunnel policy requires all-user MilMit VPN profiles"
             })
         })
     }
