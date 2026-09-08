@@ -1,8 +1,11 @@
+import 'dart:io';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../app/app_state.dart';
 import '../../app/app_strings.dart';
+import '../../core/linux_platform_controls.dart';
 import '../../core/vpn_core_providers.dart';
 
 class SettingsPage extends ConsumerStatefulWidget {
@@ -15,6 +18,7 @@ class SettingsPage extends ConsumerStatefulWidget {
 }
 
 class _SettingsPageState extends ConsumerState<SettingsPage> {
+  final _linuxControls = LinuxPlatformControls();
   bool? _credentialsSaved;
   bool _checkingCredentials = false;
 
@@ -55,12 +59,7 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
               children: [
                 const Text('Use the provider manual/service credentials. The password is sent directly to the privileged helper and is not stored in Flutter preferences.'),
                 const SizedBox(height: 16),
-                TextField(
-                  controller: username,
-                  autocorrect: false,
-                  enableSuggestions: false,
-                  decoration: const InputDecoration(labelText: 'Service username', border: OutlineInputBorder()),
-                ),
+                TextField(controller: username, autocorrect: false, enableSuggestions: false, decoration: const InputDecoration(labelText: 'Service username', border: OutlineInputBorder())),
                 const SizedBox(height: 12),
                 TextField(
                   controller: password,
@@ -70,10 +69,7 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
                   decoration: InputDecoration(
                     labelText: 'Service password',
                     border: const OutlineInputBorder(),
-                    suffixIcon: IconButton(
-                      onPressed: () => setDialogState(() => obscure = !obscure),
-                      icon: Icon(obscure ? Icons.visibility : Icons.visibility_off),
-                    ),
+                    suffixIcon: IconButton(onPressed: () => setDialogState(() => obscure = !obscure), icon: Icon(obscure ? Icons.visibility : Icons.visibility_off)),
                   ),
                 ),
               ],
@@ -90,9 +86,7 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
                   await ref.read(vpnCoreProvider).saveCredentials(username: user, password: pass);
                   if (dialogContext.mounted) Navigator.pop(dialogContext, true);
                 } catch (error) {
-                  if (dialogContext.mounted) {
-                    ScaffoldMessenger.of(dialogContext).showSnackBar(SnackBar(content: Text(error.toString())));
-                  }
+                  if (dialogContext.mounted) ScaffoldMessenger.of(dialogContext).showSnackBar(SnackBar(content: Text(error.toString())));
                 }
               },
               child: const Text('Save securely'),
@@ -109,10 +103,35 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
     }
   }
 
+  Future<void> _setDnsProtection(bool value) async {
+    try {
+      if (Platform.isLinux) {
+        await _linuxControls.setDnsProtection(value);
+      } else {
+        await ref.read(vpnCoreProvider).setDnsProtection(value);
+      }
+      await appState.setDnsProtection(value);
+    } catch (error) {
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(error.toString())));
+    }
+  }
+
+  Future<void> _setIpv6Protection(bool value) async {
+    try {
+      if (Platform.isLinux) {
+        await _linuxControls.setIpv6Protection(value);
+      } else {
+        await ref.read(vpnCoreProvider).setIpv6Protection(value);
+      }
+      await appState.setIpv6Protection(value);
+    } catch (error) {
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(error.toString())));
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     final strings = AppStrings(appState.locale.languageCode);
-
     return SafeArea(
       child: SingleChildScrollView(
         padding: const EdgeInsets.all(24),
@@ -130,41 +149,22 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
                     ListTile(
                       leading: Icon(_credentialsSaved == true ? Icons.verified_user_outlined : Icons.key_outlined),
                       title: const Text('VPN service credentials'),
-                      subtitle: Text(_checkingCredentials
-                          ? 'Checking secure storage…'
-                          : _credentialsSaved == true
-                              ? 'Saved in the privileged system store'
-                              : 'Required before the first connection'),
-                      trailing: FilledButton.tonal(
-                        onPressed: _showCredentialsDialog,
-                        child: Text(_credentialsSaved == true ? 'Replace' : 'Add'),
-                      ),
+                      subtitle: Text(_checkingCredentials ? 'Checking secure storage…' : _credentialsSaved == true ? 'Saved in the privileged system store' : 'Required before the first connection'),
+                      trailing: FilledButton.tonal(onPressed: _showCredentialsDialog, child: Text(_credentialsSaved == true ? 'Replace' : 'Add')),
                     ),
-                    SwitchListTile(
-                      title: Text(strings.autoConnect),
-                      subtitle: Text(strings.autoConnectSubtitle),
-                      value: appState.autoConnect,
-                      onChanged: appState.setAutoConnect,
-                    ),
+                    SwitchListTile(title: Text(strings.autoConnect), subtitle: Text(strings.autoConnectSubtitle), value: appState.autoConnect, onChanged: appState.setAutoConnect),
                     SwitchListTile(
                       title: Text(strings.killSwitch),
                       subtitle: Text(strings.killSwitchSubtitle),
                       value: appState.killSwitch,
-                      onChanged: (value) async {
-                        await ref.read(vpnCoreProvider).setKillSwitch(value);
-                        await appState.setKillSwitch(value);
-                      },
+                      onChanged: (value) async { await ref.read(vpnCoreProvider).setKillSwitch(value); await appState.setKillSwitch(value); },
                     ),
                     ListTile(
                       title: Text(strings.protocol),
                       trailing: DropdownButton<String>(
                         value: appState.protocol,
-                        items: const ['Auto', 'WireGuard', 'IKEv2', 'OpenVPN']
-                            .map((value) => DropdownMenuItem(value: value, child: Text(value)))
-                            .toList(),
-                        onChanged: (value) {
-                          if (value != null) appState.setProtocol(value);
-                        },
+                        items: const ['Auto', 'WireGuard', 'IKEv2', 'OpenVPN'].map((value) => DropdownMenuItem(value: value, child: Text(value))).toList(),
+                        onChanged: (value) { if (value != null) appState.setProtocol(value); },
                       ),
                     ),
                     ListTile(
@@ -172,12 +172,8 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
                       subtitle: Text(strings.providerSeparated),
                       trailing: DropdownButton<String>(
                         value: appState.provider,
-                        items: const ['Surfshark']
-                            .map((value) => DropdownMenuItem(value: value, child: Text(value)))
-                            .toList(),
-                        onChanged: (value) {
-                          if (value != null) appState.setProvider(value);
-                        },
+                        items: const ['Surfshark'].map((value) => DropdownMenuItem(value: value, child: Text(value))).toList(),
+                        onChanged: (value) { if (value != null) appState.setProvider(value); },
                       ),
                     ),
                   ],
@@ -186,22 +182,8 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
                 _Section(
                   title: strings.privacy,
                   children: [
-                    SwitchListTile(
-                      title: Text(strings.dnsLeakProtection),
-                      value: appState.dnsProtection,
-                      onChanged: (value) async {
-                        await ref.read(vpnCoreProvider).setDnsProtection(value);
-                        await appState.setDnsProtection(value);
-                      },
-                    ),
-                    SwitchListTile(
-                      title: Text(strings.ipv6LeakProtection),
-                      value: appState.ipv6Protection,
-                      onChanged: (value) async {
-                        await ref.read(vpnCoreProvider).setIpv6Protection(value);
-                        await appState.setIpv6Protection(value);
-                      },
-                    ),
+                    SwitchListTile(title: Text(strings.dnsLeakProtection), value: appState.dnsProtection, onChanged: _setDnsProtection),
+                    SwitchListTile(title: Text(strings.ipv6LeakProtection), value: appState.ipv6Protection, onChanged: _setIpv6Protection),
                   ],
                 ),
                 const SizedBox(height: 16),
@@ -221,30 +203,19 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
     );
   }
 
-  void _setTheme(ThemeMode? value) {
-    if (value != null) appState.setThemeMode(value);
-  }
+  void _setTheme(ThemeMode? value) { if (value != null) appState.setThemeMode(value); }
 }
 
 class _Section extends StatelessWidget {
   const _Section({required this.title, required this.children});
   final String title;
   final List<Widget> children;
-
   @override
-  Widget build(BuildContext context) {
-    return Card(
-      clipBehavior: Clip.antiAlias,
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: [
-          Padding(
-            padding: const EdgeInsets.fromLTRB(16, 16, 16, 8),
-            child: Text(title, style: Theme.of(context).textTheme.titleMedium),
-          ),
-          ...children,
-        ],
-      ),
-    );
-  }
+  Widget build(BuildContext context) => Card(
+    clipBehavior: Clip.antiAlias,
+    child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+      Padding(padding: const EdgeInsets.fromLTRB(16, 16, 16, 8), child: Text(title, style: Theme.of(context).textTheme.titleMedium)),
+      ...children,
+    ]),
+  );
 }
