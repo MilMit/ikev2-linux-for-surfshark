@@ -64,5 +64,9 @@ pub trait PlatformAdapter: Send + Sync {
     fn credentials_status(&self) -> Result<bool, String>;
     fn save_credentials(&self, username: &str, password: &str) -> Result<(), String>;
     fn probe_latency(&self, location: &Location) -> Result<Option<u32>, String>;
+    fn split_tunnel_status(&self) -> Result<serde_json::Value, String>;
+    fn set_split_tunnel_enabled(&self, enabled: bool) -> Result<serde_json::Value, String>;
+    fn add_split_tunnel_rule(&self, target: &str, mode: &str) -> Result<serde_json::Value, String>;
+    fn remove_split_tunnel_rule(&self, target: &str) -> Result<serde_json::Value, String>;
     fn diagnostics(&self) -> Result<PlatformDiagnostics, String>;
 }
