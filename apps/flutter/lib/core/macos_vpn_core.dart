@@ -9,40 +9,39 @@ import 'vpn_core.dart';
 class MacOsVpnCore implements VpnCore {
   MacOsVpnCore(this._delegate);
 
+  static const List<String> autoOrder = <String>['wireguard', 'ikev2', 'openvpn'];
+
   final VpnCore _delegate;
   final MilMitVpnMacos _native = const MilMitVpnMacos();
   final StreamController<VpnConnectionState> _controller =
       StreamController<VpnConnectionState>.broadcast();
 
   Timer? _poller;
-  bool _usingPacketTunnel = false;
   VpnServer? _activeServer;
   String? _activeProtocol;
 
-  Future<VpnConnectionState> _packetTunnelState() async {
+  Future<VpnConnectionState> _nativeState() async {
     final raw = await _native.status();
-    final status = switch (raw) {
+    final status = switch (raw.state) {
       'connecting' || 'reasserting' => VpnConnectionStatus.connecting,
       'connected' => VpnConnectionStatus.connected,
       'disconnecting' => VpnConnectionStatus.disconnecting,
-      'invalid' => VpnConnectionStatus.error,
+      'invalid' || 'error' => VpnConnectionStatus.error,
       _ => VpnConnectionStatus.disconnected,
     };
     return VpnConnectionState(
       status: status,
-      server: _activeServer,
-      protocol: _activeProtocol,
-      errorMessage: raw == 'invalid' ? 'macOS PacketTunnel configuration is invalid.' : null,
+      server: status == VpnConnectionStatus.disconnected ? null : _activeServer,
+      protocol: status == VpnConnectionStatus.disconnected ? null : (raw.protocol ?? _activeProtocol),
+      errorMessage: status == VpnConnectionStatus.error ? (raw.message ?? raw.state) : null,
     );
   }
 
   @override
   Stream<VpnConnectionState> watchConnection() {
     _poller ??= Timer.periodic(const Duration(seconds: 1), (_) async {
-      if (!_usingPacketTunnel) return;
-      try {
-        _controller.add(await _packetTunnelState());
-      } catch (error) {
+      try { _controller.add(await _nativeState()); }
+      catch (error) {
         _controller.add(VpnConnectionState(
           status: VpnConnectionStatus.error,
           server: _activeServer,
@@ -51,115 +50,135 @@ class MacOsVpnCore implements VpnCore {
         ));
       }
     });
+    scheduleMicrotask(() async => _controller.add(await _nativeState()));
+    return _controller.stream;
+  }
 
-    final delegate = _delegate.watchConnection();
-    return Stream.multi((output) {
-      final nativeSub = _controller.stream.listen(output.add, onError: output.addError);
-      final delegateSub = delegate.listen((state) {
-        if (!_usingPacketTunnel) output.add(state);
-      }, onError: output.addError);
-      output.onCancel = () async {
-        await nativeSub.cancel();
-        await delegateSub.cancel();
-      };
-    });
+  String _normalize(String value) {
+    final p = value.trim().toLowerCase().replaceAll('-', '');
+    return switch (p) {
+      'wg' || 'wireguard' => 'wireguard',
+      'ike' || 'ikev2' => 'ikev2',
+      'ovpn' || 'openvpn' => 'openvpn',
+      'auto' || '' => 'auto',
+      _ => throw UnsupportedError('Unsupported VPN protocol: $value'),
+    };
+  }
+
+  Future<File?> _profile(String directory, VpnServer server, String ext) async {
+    final support = await getApplicationSupportDirectory();
+    final root = Directory('${support.path}${Platform.pathSeparator}$directory');
+    for (final name in <String>[server.id, server.hostname]) {
+      final file = File('${root.path}${Platform.pathSeparator}$name.$ext');
+      if (await file.exists() && await file.length() > 0) return file;
+    }
+    return null;
+  }
+
+  Future<void> _connectOne(VpnServer server, String protocol) async {
+    String? wgQuick;
+    String? ovpn;
+    if (protocol == 'wireguard') {
+      final file = await _profile('wireguard', server, 'conf');
+      if (file == null) throw StateError('WireGuard profile is missing for ${server.id}.');
+      wgQuick = await file.readAsString();
+      if (!wgQuick.contains('[Interface]') || !wgQuick.contains('[Peer]')) {
+        throw StateError('WireGuard profile is invalid.');
+      }
+    } else if (protocol == 'openvpn') {
+      final file = await _profile('openvpn', server, 'ovpn');
+      if (file == null) throw StateError('OpenVPN profile is missing for ${server.id}.');
+      ovpn = await file.readAsString();
+      if (!ovpn.contains('remote ')) throw StateError('OpenVPN profile is invalid.');
+    }
+
+    _activeServer = server;
+    _activeProtocol = protocol;
+    _controller.add(VpnConnectionState(
+      status: VpnConnectionStatus.connecting,
+      server: server,
+      protocol: protocol,
+    ));
+    await _native.start(
+      serverAddress: server.hostname,
+      endpoint: server.hostname,
+      protocol: protocol,
+      wireGuardQuickConfig: wgQuick,
+      openVpnConfig: ovpn,
+    );
+
+    final deadline = DateTime.now().add(const Duration(seconds: 25));
+    while (DateTime.now().isBefore(deadline)) {
+      await Future<void>.delayed(const Duration(milliseconds: 750));
+      final state = await _native.status();
+      if (state.state == 'connected') return;
+      if (state.state == 'invalid' || state.state == 'error') {
+        throw StateError(state.message ?? state.state);
+      }
+    }
+    throw TimeoutException('$protocol did not reach connected state in time.');
   }
 
   @override
   Future<void> connect({required String providerId, VpnServer? server, required String protocol}) async {
-    if (protocol.toLowerCase() != 'wireguard') {
-      _usingPacketTunnel = false;
-      return _delegate.connect(providerId: providerId, server: server, protocol: protocol);
-    }
-
     final selected = server ?? (await _delegate.listServers(providerId: providerId)).firstOrNull;
     if (selected == null) throw StateError('No VPN server is available.');
+    final requested = _normalize(protocol);
+    final supported = (await _native.supportedProtocols()).toSet();
+    final candidates = requested == 'auto' ? autoOrder : <String>[requested];
+    final errors = <String>[];
 
-    final support = await getApplicationSupportDirectory();
-    final profile = File('${support.path}${Platform.pathSeparator}wireguard${Platform.pathSeparator}${selected.hostname}.conf');
-    if (!await profile.exists()) {
-      throw StateError('WireGuard profile is missing: ${profile.path}');
+    for (final candidate in candidates) {
+      if (!supported.contains(candidate)) { errors.add('$candidate: unavailable'); continue; }
+      try {
+        await _connectOne(selected, candidate);
+        return;
+      } catch (error) {
+        errors.add('$candidate: $error');
+        try { await _native.stop(); } catch (_) {}
+      }
     }
-    final wgQuick = await profile.readAsString();
-    if (!wgQuick.contains('[Interface]') || !wgQuick.contains('[Peer]')) {
-      throw StateError('WireGuard profile is invalid: ${profile.path}');
-    }
-
-    _usingPacketTunnel = true;
-    _activeServer = selected;
-    _activeProtocol = 'wireguard';
-    _controller.add(VpnConnectionState(
-      status: VpnConnectionStatus.connecting,
-      server: selected,
-      protocol: 'wireguard',
-    ));
-
-    try {
-      await _native.start(
-        serverAddress: selected.hostname,
-        endpoint: selected.hostname,
-        wireGuardQuickConfig: wgQuick,
-      );
-    } catch (_) {
-      _usingPacketTunnel = false;
-      rethrow;
-    }
+    _activeServer = null;
+    _activeProtocol = null;
+    throw StateError('All macOS VPN protocols failed: ${errors.join(' | ')}');
   }
 
   @override
   Future<void> disconnect() async {
-    if (_usingPacketTunnel) {
-      await _native.stop();
-      _usingPacketTunnel = false;
-      _controller.add(VpnConnectionState(
-        status: VpnConnectionStatus.disconnected,
-        server: _activeServer,
-        protocol: _activeProtocol,
-      ));
-      _activeServer = null;
-      _activeProtocol = null;
-      return;
-    }
-    await _delegate.disconnect();
+    await _native.stop();
+    _activeServer = null;
+    _activeProtocol = null;
+    _controller.add(const VpnConnectionState(status: VpnConnectionStatus.disconnected));
   }
 
   @override
-  Future<List<VpnServer>> listServers({required String providerId}) =>
-      _delegate.listServers(providerId: providerId);
-
+  Future<List<VpnServer>> listServers({required String providerId}) => _delegate.listServers(providerId: providerId);
   @override
-  Future<void> refreshServers({required String providerId}) =>
-      _delegate.refreshServers(providerId: providerId);
-
+  Future<void> refreshServers({required String providerId}) => _delegate.refreshServers(providerId: providerId);
   @override
-  Future<int?> probeServer({required String providerId, required String serverId}) =>
-      _delegate.probeServer(providerId: providerId, serverId: serverId);
-
+  Future<int?> probeServer({required String providerId, required String serverId}) => _delegate.probeServer(providerId: providerId, serverId: serverId);
   @override
   Future<void> setKillSwitch(bool enabled) => _delegate.setKillSwitch(enabled);
-
   @override
   Future<void> setDnsProtection(bool enabled) => _delegate.setDnsProtection(enabled);
-
   @override
   Future<void> setIpv6Protection(bool enabled) => _delegate.setIpv6Protection(enabled);
-
   @override
-  Future<bool> credentialsSaved() => _delegate.credentialsSaved();
-
+  Future<bool> credentialsSaved() => _native.credentialsSaved();
   @override
-  Future<void> saveCredentials({required String username, required String password}) =>
-      _delegate.saveCredentials(username: username, password: password);
+  Future<void> saveCredentials({required String username, required String password}) => _native.saveCredentials(username: username, password: password);
 
   @override
   Future<Map<String, Object?>> runDiagnostics() async {
     final result = await _delegate.runDiagnostics();
     try {
-      result['packet_tunnel_status'] = await _native.status();
-      result['packet_tunnel_bridge'] = true;
+      final status = await _native.status();
+      result['native_vpn_state'] = status.state;
+      result['native_vpn_protocol'] = status.protocol;
+      result['native_supported_protocols'] = await _native.supportedProtocols();
+      result['native_auto_order'] = autoOrder;
     } catch (error) {
-      result['packet_tunnel_bridge'] = false;
-      result['packet_tunnel_error'] = error.toString();
+      result['native_bridge_error'] = error.toString();
     }
     return result;
   }
