@@ -116,7 +116,7 @@ class RustFfiVpnCore implements VpnCore {
       request.headers.set(HttpHeaders.acceptHeader, 'application/json');
       final response = await request.close().timeout(const Duration(seconds: 12));
       if (response.statusCode != HttpStatus.ok) throw HttpException('Catalog update HTTP ${response.statusCode}', uri: uri);
-      return response.transform(utf8.decoder).join().timeout(const Duration(seconds: 12));
+      return await response.transform(utf8.decoder).join().timeout(const Duration(seconds: 12));
     } finally {
       client.close(force: true);
     }
