@@ -16,6 +16,8 @@ dependencies:
   path_provider: ^2.1.4
   freezed_annotation: ^2.4.4
   json_annotation: ^4.9.0
+  milmit_vpn_macos:
+    path: ../../packages/milmit_vpn_macos
 
 dev_dependencies:
   flutter_test:
