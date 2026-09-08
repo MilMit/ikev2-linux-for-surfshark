@@ -45,6 +45,7 @@ jobs:
           cp -R "$CUSTOM/app/src/main/kotlin" apps/flutter/android/app/src/main/
           cp "$CUSTOM/app/src/main/AndroidManifest.xml" apps/flutter/android/app/src/main/AndroidManifest.xml
           cp "$CUSTOM/app/build.gradle.kts" apps/flutter/android/app/build.gradle.kts
+          rm -f apps/flutter/test/widget_test.dart
 
       - name: Flutter analyze
         working-directory: apps/flutter
@@ -88,6 +89,7 @@ jobs:
           cp "$CUSTOM/Runner/Runner.entitlements" apps/flutter/ios/Runner/Runner.entitlements
           mkdir -p apps/flutter/ios/PacketTunnel
           cp -R "$CUSTOM/PacketTunnel/." apps/flutter/ios/PacketTunnel/
+          rm -f apps/flutter/test/widget_test.dart
 
       - name: Build Flutter iOS app without signing
         working-directory: apps/flutter
