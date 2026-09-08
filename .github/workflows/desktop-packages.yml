@@ -7,6 +7,7 @@ on:
       - phase-1-flutter-foundation
     paths:
       - 'apps/flutter/**'
+      - 'packages/milmit_vpn_macos/**'
       - 'crates/core/**'
       - 'crates/flutter-ffi/**'
       - 'crates/platform-windows/**'
@@ -16,6 +17,7 @@ on:
       - 'packaging/windows/**'
       - 'scripts/package-flutter-windows.ps1'
       - 'scripts/package-flutter-macos.sh'
+      - 'scripts/build-macos-packet-tunnel.sh'
       - '.github/workflows/desktop-packages.yml'
 
 jobs:
@@ -58,19 +60,27 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
       - uses: subosito/flutter-action@v2
         with:
           channel: stable
           cache: true
-      - name: Package macOS
+      - name: Install XcodeGen
+        run: brew install xcodegen
+      - name: Package macOS with PacketTunnel
         env:
           VERSION: 0.1.0
         run: bash scripts/package-flutter-macos.sh
-      - name: Verify macOS artifacts
+      - name: Verify macOS artifacts and extension
         run: |
           test -d 'dist/macos/MilMit VPN.app'
+          test -d 'dist/macos/MilMit VPN.app/Contents/PlugIns/PacketTunnel.appex'
           test -f 'dist/macos/MilMit-VPN-0.1.0.dmg'
+          codesign --verify --strict 'dist/macos/MilMit VPN.app/Contents/PlugIns/PacketTunnel.appex'
           codesign --verify --deep --strict 'dist/macos/MilMit VPN.app'
+          /usr/libexec/PlistBuddy -c 'Print :NSExtension:NSExtensionPointIdentifier' 'dist/macos/MilMit VPN.app/Contents/PlugIns/PacketTunnel.appex/Contents/Info.plist' | grep -q 'com.apple.networkextension.packet-tunnel'
       - uses: actions/upload-artifact@v4
         with:
           name: milmit-vpn-macos
