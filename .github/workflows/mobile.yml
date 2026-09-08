@@ -20,17 +20,14 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
-
       - uses: subosito/flutter-action@v2
         with:
           channel: stable
           cache: true
-
       - name: Generate Android scaffold and overlay mobile adapter
         shell: bash
         run: |
@@ -46,19 +43,14 @@ jobs:
           cp "$CUSTOM/app/src/main/AndroidManifest.xml" apps/flutter/android/app/src/main/AndroidManifest.xml
           cp "$CUSTOM/app/build.gradle.kts" apps/flutter/android/app/build.gradle.kts
           rm -f apps/flutter/test/widget_test.dart
-
       - name: Flutter analyze
         working-directory: apps/flutter
         run: |
           flutter pub get
-          # Keep analyzer errors fatal, but do not block mobile packaging on
-          # deprecation/info diagnostics from Flutter's evolving widget APIs.
           flutter analyze --no-fatal-infos
-
       - name: Build Android APK
         working-directory: apps/flutter
         run: flutter build apk --debug
-
       - uses: actions/upload-artifact@v4
         with:
           name: milmit-vpn-android-debug
@@ -68,15 +60,12 @@ jobs:
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
-
       - uses: subosito/flutter-action@v2
         with:
           channel: stable
           cache: true
-
       - name: Install native build tools
         run: brew install xcodegen go
-
       - name: Generate iOS Flutter scaffold and overlay bridge
         shell: bash
         run: |
@@ -92,17 +81,32 @@ jobs:
           mkdir -p apps/flutter/ios/PacketTunnel
           cp -R "$CUSTOM/PacketTunnel/." apps/flutter/ios/PacketTunnel/
           rm -f apps/flutter/test/widget_test.dart
-
       - name: Build Flutter iOS app without signing
         working-directory: apps/flutter
         run: |
           flutter pub get
           flutter build ios --debug --no-codesign
-
+      - name: Prepare pinned WireGuardKit checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p native/ios/vendor
+          git clone https://github.com/WireGuard/wireguard-apple.git native/ios/vendor/wireguard-apple
+          git -C native/ios/vendor/wireguard-apple checkout 2fec12a6e1f6e3460b6ee483aa00ad29cddadab1
+          # The pinned upstream manifest declares Swift tools 5.3 while using
+          # iOS 15/macOS 12 platform constants introduced in PackageDescription 5.5.
+          # Patch only the tools-version declaration; source remains pinned.
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('native/ios/vendor/wireguard-apple/Package.swift')
+          text = p.read_text()
+          if not text.startswith('// swift-tools-version:5.3'):
+              raise SystemExit('unexpected WireGuardKit Package.swift header')
+          p.write_text(text.replace('// swift-tools-version:5.3', '// swift-tools-version:5.5', 1))
+          PY
       - name: Generate PacketTunnel project
         working-directory: native/ios
         run: xcodegen generate
-
       - name: Build WireGuard PacketTunnel without signing
         working-directory: native/ios
         run: |
@@ -115,7 +119,6 @@ jobs:
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             build
-
       - name: Verify PacketTunnel extension
         shell: bash
         run: |
