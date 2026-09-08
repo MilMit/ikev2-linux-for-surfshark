@@ -1,5 +1,6 @@
 pub mod catalog;
 pub mod health;
+pub mod platform;
 
 use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
