@@ -1,4 +1,7 @@
 use crate::{Location, ProviderManifest};
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine;
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs;
@@ -9,12 +12,21 @@ use thiserror::Error;
 pub const CATALOG_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CatalogSignature {
+    pub key_id: String,
+    pub algorithm: String,
+    pub signature_base64: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CatalogEnvelope {
     pub schema_version: u32,
     pub revision: u64,
     pub generated_at: String,
     pub provider: ProviderManifest,
     pub payload_sha256: String,
+    #[serde(default)]
+    pub signature: Option<CatalogSignature>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -30,6 +42,13 @@ pub struct CatalogSnapshot {
     pub revision: u64,
     pub provider_id: String,
     pub location_count: usize,
+    pub signed: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct TrustedCatalogKey {
+    pub key_id: String,
+    pub public_key: [u8; 32],
 }
 
 #[derive(Debug, Error)]
@@ -48,6 +67,18 @@ pub enum CatalogError {
     InvalidLocation(String),
     #[error("catalog checksum mismatch")]
     ChecksumMismatch,
+    #[error("catalog signature is required")]
+    SignatureRequired,
+    #[error("unsupported signature algorithm: {0}")]
+    UnsupportedSignatureAlgorithm(String),
+    #[error("unknown catalog signing key: {0}")]
+    UnknownSigningKey(String),
+    #[error("invalid Ed25519 public key")]
+    InvalidPublicKey,
+    #[error("invalid catalog signature encoding")]
+    InvalidSignatureEncoding,
+    #[error("catalog signature verification failed")]
+    SignatureVerificationFailed,
     #[error("catalog revision is not newer")]
     StaleRevision,
     #[error("catalog I/O error: {0}")]
@@ -111,6 +142,26 @@ pub fn validate_catalog(catalog: &CatalogEnvelope, expected_provider: Option<&st
     Ok(())
 }
 
+pub fn verify_catalog_signature(catalog: &CatalogEnvelope, trusted_keys: &[TrustedCatalogKey]) -> Result<(), CatalogError> {
+    let signature = catalog.signature.as_ref().ok_or(CatalogError::SignatureRequired)?;
+    if !signature.algorithm.eq_ignore_ascii_case("ed25519") {
+        return Err(CatalogError::UnsupportedSignatureAlgorithm(signature.algorithm.clone()));
+    }
+    let trusted = trusted_keys
+        .iter()
+        .find(|key| key.key_id == signature.key_id)
+        .ok_or_else(|| CatalogError::UnknownSigningKey(signature.key_id.clone()))?;
+    let verifying_key = VerifyingKey::from_bytes(&trusted.public_key).map_err(|_| CatalogError::InvalidPublicKey)?;
+    let raw_signature = BASE64
+        .decode(signature.signature_base64.as_bytes())
+        .map_err(|_| CatalogError::InvalidSignatureEncoding)?;
+    let signature = Signature::try_from(raw_signature.as_slice()).map_err(|_| CatalogError::InvalidSignatureEncoding)?;
+    let payload = normalized_payload(&catalog.provider, catalog.revision, &catalog.generated_at)?;
+    verifying_key
+        .verify(&payload, &signature)
+        .map_err(|_| CatalogError::SignatureVerificationFailed)
+}
+
 pub fn parse_and_validate_catalog(json: &str, expected_provider: Option<&str>) -> Result<CatalogEnvelope, CatalogError> {
     let catalog: CatalogEnvelope = serde_json::from_str(json)?;
     validate_catalog(&catalog, expected_provider)?;
@@ -143,8 +194,15 @@ impl CatalogStore {
         }
     }
 
-    pub fn apply_remote(&self, json: &str, current_revision: u64, expected_provider: &str) -> Result<CatalogEnvelope, CatalogError> {
+    pub fn apply_remote_signed(
+        &self,
+        json: &str,
+        current_revision: u64,
+        expected_provider: &str,
+        trusted_keys: &[TrustedCatalogKey],
+    ) -> Result<CatalogEnvelope, CatalogError> {
         let catalog = parse_and_validate_catalog(json, Some(expected_provider))?;
+        verify_catalog_signature(&catalog, trusted_keys)?;
         if catalog.revision <= current_revision {
             return Err(CatalogError::StaleRevision);
         }
@@ -177,6 +235,7 @@ pub fn snapshot(catalog: &CatalogEnvelope, source: CatalogSource) -> CatalogSnap
         revision: catalog.revision,
         provider_id: catalog.provider.id.clone(),
         location_count: catalog.provider.locations.len(),
+        signed: catalog.signature.is_some(),
     }
 }
 
@@ -200,7 +259,7 @@ mod tests {
         let revision = 1;
         let generated_at = "2026-09-08T00:00:00Z".to_string();
         let payload_sha256 = compute_payload_sha256(&provider, revision, &generated_at).unwrap();
-        CatalogEnvelope { schema_version: 1, revision, generated_at, provider, payload_sha256 }
+        CatalogEnvelope { schema_version: 1, revision, generated_at, provider, payload_sha256, signature: None }
     }
 
     #[test]
@@ -214,5 +273,10 @@ mod tests {
         let mut catalog = sample();
         catalog.provider.locations[0].city = "Berlin".into();
         assert!(matches!(validate_catalog(&catalog, None), Err(CatalogError::ChecksumMismatch)));
+    }
+
+    #[test]
+    fn unsigned_remote_is_rejected() {
+        assert!(matches!(verify_catalog_signature(&sample(), &[]), Err(CatalogError::SignatureRequired)));
     }
 }
