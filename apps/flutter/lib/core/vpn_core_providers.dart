@@ -3,13 +3,17 @@ import 'dart:io';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import 'macos_vpn_core.dart';
+import 'mobile_vpn_core.dart';
 import 'rust_ffi_vpn_core.dart';
 import 'vpn_core.dart';
 
 final vpnCoreProvider = Provider<VpnCore>((ref) {
   try {
-    final core = RustFfiVpnCore.open();
-    return Platform.isMacOS ? MacOsVpnCore(core) : core;
+    final sharedCore = RustFfiVpnCore.open();
+    if (Platform.isAndroid || Platform.isIOS) {
+      return MobileVpnCore(sharedCore);
+    }
+    return Platform.isMacOS ? MacOsVpnCore(sharedCore) : sharedCore;
   } catch (_) {
     return const UnsupportedVpnCore();
   }
