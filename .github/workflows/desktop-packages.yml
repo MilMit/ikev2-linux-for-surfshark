@@ -1,0 +1,77 @@
+name: Desktop packages
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - phase-1-flutter-foundation
+    paths:
+      - 'apps/flutter/**'
+      - 'crates/core/**'
+      - 'crates/flutter-ffi/**'
+      - 'crates/platform-windows/**'
+      - 'crates/platform-macos/**'
+      - 'native/windows/**'
+      - 'native/macos/**'
+      - 'packaging/windows/**'
+      - 'scripts/package-flutter-windows.ps1'
+      - 'scripts/package-flutter-macos.sh'
+      - '.github/workflows/desktop-packages.yml'
+
+jobs:
+  windows-msi:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - name: Install WiX Toolset 3
+        shell: powershell
+        run: choco install wixtoolset --no-progress -y
+      - name: Package Windows
+        shell: powershell
+        env:
+          VERSION: 0.1.0
+        run: ./scripts/package-flutter-windows.ps1
+      - name: Verify Windows artifacts
+        shell: powershell
+        run: |
+          if (-not (Test-Path 'dist/windows/MilMit-VPN-0.1.0-windows-x64.zip')) { throw 'portable ZIP missing' }
+          if (-not (Test-Path 'dist/windows/MilMit-VPN-0.1.0-x64.msi')) { throw 'MSI missing' }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: milmit-vpn-windows
+          path: |
+            dist/windows/*.msi
+            dist/windows/*.zip
+            dist/windows/SHA256SUMS.txt
+          if-no-files-found: error
+
+  macos-dmg:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - name: Package macOS
+        env:
+          VERSION: 0.1.0
+        run: bash scripts/package-flutter-macos.sh
+      - name: Verify macOS artifacts
+        run: |
+          test -d 'dist/macos/MilMit VPN.app'
+          test -f 'dist/macos/MilMit-VPN-0.1.0.dmg'
+          codesign --verify --deep --strict 'dist/macos/MilMit VPN.app'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: milmit-vpn-macos
+          path: |
+            dist/macos/*.dmg
+            dist/macos/SHA256SUMS.txt
+          if-no-files-found: error
