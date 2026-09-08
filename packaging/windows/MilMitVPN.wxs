@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Product Id="*" Name="MilMit VPN" Language="1033" Version="$(var.ProductVersion)" Manufacturer="MilMit" UpgradeCode="A91E471A-9637-4FEA-BB89-0FDDF522AB64">
+    <Package InstallerVersion="500" Compressed="yes" InstallScope="perMachine" />
+    <MajorUpgrade DowngradeErrorMessage="A newer version of MilMit VPN is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <Directory Id="TARGETDIR" Name="SourceDir">
+      <Directory Id="ProgramFiles64Folder">
+        <Directory Id="INSTALLFOLDER" Name="MilMit VPN">
+          <Directory Id="SERVICEFOLDER" Name="service" />
+        </Directory>
+      </Directory>
+    </Directory>
+
+    <DirectoryRef Id="SERVICEFOLDER">
+      <Component Id="WindowsServiceComponent" Guid="*" Win64="yes">
+        <File Id="WindowsServiceExe" Source="$(var.ServiceExe)" KeyPath="yes" />
+        <ServiceInstall
+          Id="InstallMilMitVpnService"
+          Type="ownProcess"
+          Name="MilMitVpnService"
+          DisplayName="MilMit VPN Service"
+          Description="Privileged networking service for MilMit VPN"
+          Start="auto"
+          Account="LocalSystem"
+          ErrorControl="normal"
+          Vital="yes" />
+        <ServiceControl
+          Id="ControlMilMitVpnService"
+          Name="MilMitVpnService"
+          Start="install"
+          Stop="both"
+          Remove="uninstall"
+          Wait="yes" />
+      </Component>
+    </DirectoryRef>
+
+    <Feature Id="MainFeature" Title="MilMit VPN" Level="1">
+      <ComponentGroupRef Id="FlutterAppFiles" />
+      <ComponentRef Id="WindowsServiceComponent" />
+    </Feature>
+  </Product>
+</Wix>
