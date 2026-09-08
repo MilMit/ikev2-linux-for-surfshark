@@ -1,11 +1,15 @@
+import 'dart:io';
+
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import 'macos_vpn_core.dart';
 import 'rust_ffi_vpn_core.dart';
 import 'vpn_core.dart';
 
 final vpnCoreProvider = Provider<VpnCore>((ref) {
   try {
-    return RustFfiVpnCore.open();
+    final core = RustFfiVpnCore.open();
+    return Platform.isMacOS ? MacOsVpnCore(core) : core;
   } catch (_) {
     return const UnsupportedVpnCore();
   }
