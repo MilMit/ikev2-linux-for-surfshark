@@ -8,11 +8,13 @@ on:
     paths:
       - 'apps/flutter/**'
       - 'native/ios/**'
+      - 'scripts/**'
       - '.github/workflows/mobile.yml'
   pull_request:
     paths:
       - 'apps/flutter/**'
       - 'native/ios/**'
+      - 'scripts/**'
       - '.github/workflows/mobile.yml'
 
 jobs:
@@ -20,7 +22,7 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '17'
@@ -51,10 +53,16 @@ jobs:
       - name: Build Android APK
         working-directory: apps/flutter
         run: flutter build apk --debug
+      - name: Build Android App Bundle
+        working-directory: apps/flutter
+        run: flutter build appbundle --debug
       - uses: actions/upload-artifact@v4
         with:
           name: milmit-vpn-android-debug
-          path: apps/flutter/build/app/outputs/flutter-apk/app-debug.apk
+          if-no-files-found: error
+          path: |
+            apps/flutter/build/app/outputs/flutter-apk/app-debug.apk
+            apps/flutter/build/app/outputs/bundle/debug/app-debug.aab
 
   ios:
     runs-on: macos-15
@@ -91,18 +99,17 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p native/ios/vendor
-          git clone https://github.com/WireGuard/wireguard-apple.git native/ios/vendor/wireguard-apple
+          git clone --filter=blob:none https://github.com/WireGuard/wireguard-apple.git native/ios/vendor/wireguard-apple
           git -C native/ios/vendor/wireguard-apple checkout 2fec12a6e1f6e3460b6ee483aa00ad29cddadab1
-          # The pinned upstream manifest declares Swift tools 5.3 while using
-          # iOS 15/macOS 12 platform constants introduced in PackageDescription 5.5.
-          # Patch only the tools-version declaration; source remains pinned.
           python3 - <<'PY'
           from pathlib import Path
           p = Path('native/ios/vendor/wireguard-apple/Package.swift')
           text = p.read_text()
-          if not text.startswith('// swift-tools-version:5.3'):
+          if text.startswith('// swift-tools-version:5.3'):
+              text = text.replace('// swift-tools-version:5.3', '// swift-tools-version:5.5', 1)
+              p.write_text(text)
+          elif not text.startswith('// swift-tools-version:5.5'):
               raise SystemExit('unexpected WireGuardKit Package.swift header')
-          p.write_text(text.replace('// swift-tools-version:5.3', '// swift-tools-version:5.5', 1))
           PY
       - name: Generate PacketTunnel project
         working-directory: native/ios
@@ -119,8 +126,19 @@ jobs:
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             build
-      - name: Verify PacketTunnel extension
+      - name: Collect PacketTunnel extension
         shell: bash
         run: |
           set -euo pipefail
-          find "$HOME/Library/Developer/Xcode/DerivedData" -path '*PacketTunnel.appex' -type d -print -quit | grep -q PacketTunnel.appex
+          APPEX="$(find "$HOME/Library/Developer/Xcode/DerivedData" -path '*PacketTunnel.appex' -type d -print -quit)"
+          test -n "$APPEX"
+          rm -rf native/ios/out
+          mkdir -p native/ios/out
+          cp -R "$APPEX" native/ios/out/PacketTunnel.appex
+      - uses: actions/upload-artifact@v4
+        with:
+          name: milmit-vpn-ios-nosign-debug
+          if-no-files-found: error
+          path: |
+            apps/flutter/build/ios/iphoneos/Runner.app
+            native/ios/out/PacketTunnel.appex
