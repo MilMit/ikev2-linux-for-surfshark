@@ -137,7 +137,7 @@ fn refresh_linux_state() {
 }
 
 #[no_mangle]
-pub extern "C" fn milmit_vpn_version() -> *mut c_char { into_c_string("0.5.0".into()) }
+pub extern "C" fn milmit_vpn_version() -> *mut c_char { into_c_string("0.6.0".into()) }
 
 #[no_mangle]
 pub unsafe extern "C" fn milmit_vpn_init(cache_root: *const c_char) -> *mut c_char {
@@ -167,6 +167,27 @@ pub unsafe extern "C" fn milmit_vpn_list_servers(provider_id: *const c_char) -> 
         }
     }).collect();
     json(&servers)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn milmit_vpn_probe_server(provider_id: *const c_char, location_id: *const c_char) -> *mut c_char {
+    let Some(provider_id) = cstr(provider_id) else { return into_c_string("{\"ok\":false,\"error\":\"provider_required\"}".into()); };
+    let Some(location_id) = cstr(location_id) else { return into_c_string("{\"ok\":false,\"error\":\"location_required\"}".into()); };
+    let Some(provider) = active_provider(&provider_id) else { return into_c_string("{\"ok\":false,\"error\":\"unknown_provider\"}".into()); };
+    let Some(location) = provider.location(&location_id).cloned() else { return into_c_string("{\"ok\":false,\"error\":\"unknown_location\"}".into()); };
+    #[cfg(target_os = "linux")]
+    {
+        match LinuxPlatformAdapter::new().probe_latency(&location) {
+            Ok(Some(ms)) => {
+                HEALTH.lock().expect("health mutex poisoned").report_latency(location_id, ms);
+                return json(&serde_json::json!({"ok": true, "latency_ms": ms}));
+            }
+            Ok(None) => return json(&serde_json::json!({"ok": true, "latency_ms": null})),
+            Err(error) => return json(&serde_json::json!({"ok": false, "error": error})),
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    json(&serde_json::json!({"ok": false, "error": "platform_adapter_not_implemented"}))
 }
 
 #[no_mangle]
@@ -228,7 +249,7 @@ pub unsafe extern "C" fn milmit_vpn_connect(provider_id: *const c_char, location
                 state.provider = provider_id;
                 state.protocol = platform.protocol.unwrap_or(protocol_name);
                 state.location_id = Some(location_id);
-                return json(&serde_json::json!({"ok": true, "platform": "linux-helper-v1"}));
+                return json(&serde_json::json!({"ok": true, "platform": "linux-helper-v2"}));
             }
             Err(error) => {
                 HEALTH.lock().expect("health mutex poisoned").report_failure(location_id);
@@ -268,9 +289,7 @@ pub extern "C" fn milmit_vpn_set_kill_switch(enabled: bool) -> *mut c_char {
     #[cfg(target_os = "linux")]
     {
         let adapter = LinuxPlatformAdapter::new();
-        if let Err(error) = adapter.set_kill_switch(enabled) {
-            return json(&serde_json::json!({"ok": false, "error": error}));
-        }
+        if let Err(error) = adapter.set_kill_switch(enabled) { return json(&serde_json::json!({"ok": false, "error": error})); }
     }
     #[cfg(not(target_os = "linux"))]
     { let _ = enabled; return json(&serde_json::json!({"ok": false, "error": "platform_adapter_not_implemented"})); }
@@ -280,14 +299,42 @@ pub extern "C" fn milmit_vpn_set_kill_switch(enabled: bool) -> *mut c_char {
 
 #[no_mangle]
 pub extern "C" fn milmit_vpn_set_dns_protection(enabled: bool) -> *mut c_char {
+    #[cfg(target_os = "linux")]
+    if let Err(error) = LinuxPlatformAdapter::new().set_dns_protection(enabled) { return json(&serde_json::json!({"ok": false, "error": error})); }
     STATE.lock().expect("state mutex poisoned").dns_protection = enabled;
     into_c_string("{\"ok\":true,\"managed_by\":\"linux_connection_engine\"}".into())
 }
 
 #[no_mangle]
 pub extern "C" fn milmit_vpn_set_ipv6_protection(enabled: bool) -> *mut c_char {
+    #[cfg(target_os = "linux")]
+    if let Err(error) = LinuxPlatformAdapter::new().set_ipv6_protection(enabled) { return json(&serde_json::json!({"ok": false, "error": error})); }
     STATE.lock().expect("state mutex poisoned").ipv6_protection = enabled;
     into_c_string("{\"ok\":true,\"managed_by\":\"linux_connection_engine\"}".into())
+}
+
+#[no_mangle]
+pub extern "C" fn milmit_vpn_credentials_status() -> *mut c_char {
+    #[cfg(target_os = "linux")]
+    return match LinuxPlatformAdapter::new().credentials_status() {
+        Ok(saved) => json(&serde_json::json!({"ok": true, "saved": saved})),
+        Err(error) => json(&serde_json::json!({"ok": false, "error": error})),
+    };
+    #[cfg(not(target_os = "linux"))]
+    json(&serde_json::json!({"ok": false, "error": "platform_adapter_not_implemented"}))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn milmit_vpn_save_credentials(username: *const c_char, password: *const c_char) -> *mut c_char {
+    let Some(username) = cstr(username) else { return into_c_string("{\"ok\":false,\"error\":\"username_required\"}".into()); };
+    let Some(password) = cstr(password) else { return into_c_string("{\"ok\":false,\"error\":\"password_required\"}".into()); };
+    #[cfg(target_os = "linux")]
+    return match LinuxPlatformAdapter::new().save_credentials(&username, &password) {
+        Ok(()) => into_c_string("{\"ok\":true}".into()),
+        Err(error) => json(&serde_json::json!({"ok": false, "error": error})),
+    };
+    #[cfg(not(target_os = "linux"))]
+    { let _ = (username, password); json(&serde_json::json!({"ok": false, "error": "platform_adapter_not_implemented"})) }
 }
 
 #[no_mangle]
@@ -301,7 +348,7 @@ pub extern "C" fn milmit_vpn_diagnostics() -> *mut c_char {
     let platform: Option<serde_json::Value> = None;
 
     json(&serde_json::json!({
-        "core": "rust-ffi", "version": "0.5.0", "providers": catalogs.len(), "provider": state.provider,
+        "core": "rust-ffi", "version": "0.6.0", "providers": catalogs.len(), "provider": state.provider,
         "catalog_revision": catalog.map(|c| c.catalog.revision).unwrap_or(0),
         "catalog_source": catalog.map(|c| format!("{:?}", c.source)).unwrap_or_else(|| "Unknown".into()),
         "catalog_signed": catalog.and_then(|c| c.catalog.signature.as_ref()).is_some(),
@@ -309,7 +356,7 @@ pub extern "C" fn milmit_vpn_diagnostics() -> *mut c_char {
         "locations": catalog.map(|c| c.catalog.provider.locations.len()).unwrap_or(0),
         "cache_configured": CACHE_ROOT.lock().map(|p| p.is_some()).unwrap_or(false),
         "kill_switch": state.kill_switch, "dns_protection": state.dns_protection, "ipv6_protection": state.ipv6_protection,
-        "network_adapter": if cfg!(target_os = "linux") { "linux-helper-v1" } else { "pending-platform-adapter" },
+        "network_adapter": if cfg!(target_os = "linux") { "linux-helper-v2" } else { "pending-platform-adapter" },
         "platform": platform
     }))
 }
