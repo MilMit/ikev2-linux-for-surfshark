@@ -7,8 +7,7 @@ options:
 
 packages:
   WireGuardKit:
-    url: https://github.com/WireGuard/wireguard-apple.git
-    revision: 2fec12a6e1f6e3460b6ee483aa00ad29cddadab1
+    path: vendor/wireguard-apple
 
 targets:
   PacketTunnel:
@@ -40,7 +39,7 @@ targets:
         basedOnDependencyAnalysis: false
         script: |
           set -euo pipefail
-          WG_GO="${BUILD_DIR%Build/*}SourcePackages/checkouts/wireguard-apple/Sources/WireGuardKitGo"
+          WG_GO="$SRCROOT/vendor/wireguard-apple/Sources/WireGuardKitGo"
           if [ ! -d "$WG_GO" ]; then
             echo "WireGuardKitGo checkout not found at $WG_GO" >&2
             exit 1
