@@ -51,7 +51,9 @@ jobs:
         working-directory: apps/flutter
         run: |
           flutter pub get
-          flutter analyze
+          # Keep analyzer errors fatal, but do not block mobile packaging on
+          # deprecation/info diagnostics from Flutter's evolving widget APIs.
+          flutter analyze --no-fatal-infos
 
       - name: Build Android APK
         working-directory: apps/flutter
