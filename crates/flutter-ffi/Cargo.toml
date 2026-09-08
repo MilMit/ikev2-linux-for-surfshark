@@ -1,6 +1,6 @@
 [package]
 name = "milmit-vpn-flutter-ffi"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2021"
 
 [lib]
@@ -15,3 +15,9 @@ hex = "0.4"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 milmit-vpn-platform-linux = { path = "../platform-linux" }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+milmit-vpn-platform-windows = { path = "../platform-windows" }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+milmit-vpn-platform-macos = { path = "../platform-macos" }
