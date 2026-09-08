@@ -10,6 +10,11 @@ on:
       - 'crates/flutter-ffi/**'
       - 'crates/platform-windows/**'
       - 'crates/platform-macos/**'
+      - 'native/windows/**'
+      - 'native/macos/**'
+      - 'packaging/windows/**'
+      - 'scripts/package-flutter-windows.ps1'
+      - 'scripts/package-flutter-macos.sh'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - '.github/workflows/desktop-platforms.yml'
@@ -19,6 +24,11 @@ on:
       - 'crates/flutter-ffi/**'
       - 'crates/platform-windows/**'
       - 'crates/platform-macos/**'
+      - 'native/windows/**'
+      - 'native/macos/**'
+      - 'packaging/windows/**'
+      - 'scripts/package-flutter-windows.ps1'
+      - 'scripts/package-flutter-macos.sh'
       - 'Cargo.toml'
       - 'Cargo.lock'
 
@@ -31,6 +41,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Check Windows adapter
         run: cargo check -p milmit-vpn-platform-windows
+      - name: Check Windows privileged service
+        run: cargo check --manifest-path native/windows/service/Cargo.toml
       - name: Test core
         run: cargo test -p surfshark-ikev2-core
       - name: Check Flutter FFI on Windows
@@ -44,6 +56,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Check macOS adapter
         run: cargo check -p milmit-vpn-platform-macos
+      - name: Type-check Packet Tunnel extension
+        run: xcrun swiftc -typecheck native/macos/PacketTunnel/PacketTunnelProvider.swift
       - name: Test core
         run: cargo test -p surfshark-ikev2-core
       - name: Check Flutter FFI on macOS
