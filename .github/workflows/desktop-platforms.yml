@@ -5,7 +5,10 @@ on:
   push:
     branches:
       - phase-1-flutter-foundation
+      - phase-6-protocol-parity
     paths:
+      - 'apps/flutter/**'
+      - 'packages/milmit_vpn_macos/**'
       - 'crates/core/**'
       - 'crates/flutter-ffi/**'
       - 'crates/platform-windows/**'
@@ -15,11 +18,14 @@ on:
       - 'packaging/windows/**'
       - 'scripts/package-flutter-windows.ps1'
       - 'scripts/package-flutter-macos.sh'
+      - 'scripts/build-macos-packet-tunnel.sh'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - '.github/workflows/desktop-platforms.yml'
   pull_request:
     paths:
+      - 'apps/flutter/**'
+      - 'packages/milmit_vpn_macos/**'
       - 'crates/core/**'
       - 'crates/flutter-ffi/**'
       - 'crates/platform-windows/**'
@@ -29,6 +35,7 @@ on:
       - 'packaging/windows/**'
       - 'scripts/package-flutter-windows.ps1'
       - 'scripts/package-flutter-macos.sh'
+      - 'scripts/build-macos-packet-tunnel.sh'
       - 'Cargo.toml'
       - 'Cargo.lock'
 
@@ -53,18 +60,25 @@ jobs:
         run: cargo check -p milmit-vpn-flutter-ffi
 
   macos:
-    runs-on: macos-latest
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Install native build tools
+        run: brew install xcodegen go
       - name: Check macOS adapter
         run: cargo check -p milmit-vpn-platform-macos
-      - name: Type-check Packet Tunnel extension
-        run: xcrun swiftc -typecheck native/macos/PacketTunnel/TunnelConfiguration.swift native/macos/PacketTunnel/WireGuardKitEngine.swift native/macos/PacketTunnel/PacketTunnelProvider.swift
-      - name: Type-check host NetworkExtension manager
-        run: xcrun swiftc -typecheck native/macos/AppBridge/HostTunnelManager.swift
       - name: Test core
         run: cargo test -p surfshark-ikev2-core
       - name: Check Flutter FFI on macOS
         run: cargo check -p milmit-vpn-flutter-ffi
+      - name: Build WireGuard and OpenVPN NetworkExtensions
+        run: bash scripts/build-macos-packet-tunnel.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: milmit-vpn-macos-network-extensions
+          if-no-files-found: error
+          path: |
+            native/macos/out/PacketTunnel.appex
+            native/macos/out/OpenVPNPacketTunnel.appex
