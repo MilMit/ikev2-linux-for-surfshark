@@ -1,17 +1,23 @@
 {
-  "id": "surfshark",
-  "display_name": "Surfshark",
-  "locations": [
-    {
-      "id": "tr-istanbul-example",
-      "country": "Türkiye",
-      "city": "Istanbul",
-      "endpoint": {
-        "hostname": "replace-with-current-surfshark-hostname.invalid",
-        "fallback_ips": [],
-        "ike_port": 4500
-      },
-      "certificate_id": "surfshark-ikev2-ca"
-    }
-  ]
+  "schema_version": 1,
+  "revision": 1,
+  "generated_at": "2026-09-08T00:00:00Z",
+  "provider": {
+    "id": "surfshark",
+    "display_name": "Surfshark",
+    "locations": [
+      {
+        "id": "tr-istanbul-example",
+        "country": "Türkiye",
+        "city": "Istanbul",
+        "endpoint": {
+          "hostname": "replace-with-current-surfshark-hostname.invalid",
+          "fallback_ips": [],
+          "ike_port": 4500
+        },
+        "certificate_id": "surfshark-ikev2-ca"
+      }
+    ]
+  },
+  "payload_sha256": "7f196cc6ea3ec7b0de231c63f96bd6aacd7f75c990a2e659862b5c1ae83dbc33"
 }
