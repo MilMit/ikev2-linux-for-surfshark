@@ -9,15 +9,33 @@ on:
       - 'apps/flutter/**'
       - 'native/ios/**'
       - 'scripts/**'
+      - 'docs/PHASE5_MOBILE_HANDOFF.md'
       - '.github/workflows/mobile.yml'
   pull_request:
     paths:
       - 'apps/flutter/**'
       - 'native/ios/**'
       - 'scripts/**'
+      - 'docs/PHASE5_MOBILE_HANDOFF.md'
       - '.github/workflows/mobile.yml'
 
 jobs:
+  source-package:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build Phase 5 source ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          git archive --format=zip --output=dist/milmit-vpn-phase-5-mobile.zip HEAD
+      - uses: actions/upload-artifact@v4
+        with:
+          name: milmit-vpn-phase-5-source
+          if-no-files-found: error
+          path: dist/milmit-vpn-phase-5-mobile.zip
+
   android:
     runs-on: ubuntu-22.04
     steps:
