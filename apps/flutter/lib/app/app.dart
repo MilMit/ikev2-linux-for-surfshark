@@ -6,56 +6,60 @@ import '../features/locations/locations_page.dart';
 import '../features/settings/settings_page.dart';
 import '../features/split_tunnel/split_tunnel_page.dart';
 import '../features/statistics/statistics_page.dart';
+import 'app_state.dart';
 import 'app_strings.dart';
 
 class VpnClientApp extends StatefulWidget {
-  const VpnClientApp({super.key});
+  const VpnClientApp({super.key, required this.appState});
+
+  final AppState appState;
 
   @override
   State<VpnClientApp> createState() => _VpnClientAppState();
 }
 
 class _VpnClientAppState extends State<VpnClientApp> {
-  ThemeMode _themeMode = ThemeMode.system;
-  Locale _locale = const Locale('en');
+  @override
+  void initState() {
+    super.initState();
+    widget.appState.addListener(_refresh);
+  }
+
+  @override
+  void dispose() {
+    widget.appState.removeListener(_refresh);
+    super.dispose();
+  }
+
+  void _refresh() => setState(() {});
 
   @override
   Widget build(BuildContext context) {
+    final state = widget.appState;
     return MaterialApp(
       debugShowCheckedModeBanner: false,
       title: 'VPN Client',
-      themeMode: _themeMode,
-      locale: _locale,
+      themeMode: state.themeMode,
+      locale: state.locale,
       supportedLocales: const [Locale('en'), Locale('fa')],
       theme: ThemeData(useMaterial3: true, brightness: Brightness.light),
       darkTheme: ThemeData(useMaterial3: true, brightness: Brightness.dark),
       builder: (context, child) {
-        final rtl = _locale.languageCode == 'fa';
+        final rtl = state.locale.languageCode == 'fa';
         return Directionality(
           textDirection: rtl ? TextDirection.rtl : TextDirection.ltr,
           child: child ?? const SizedBox.shrink(),
         );
       },
-      home: AppShell(
-        locale: _locale,
-        onLocaleChanged: (locale) => setState(() => _locale = locale),
-        onThemeModeChanged: (mode) => setState(() => _themeMode = mode),
-      ),
+      home: AppShell(appState: state),
     );
   }
 }
 
 class AppShell extends StatefulWidget {
-  const AppShell({
-    super.key,
-    required this.locale,
-    required this.onLocaleChanged,
-    required this.onThemeModeChanged,
-  });
+  const AppShell({super.key, required this.appState});
 
-  final Locale locale;
-  final ValueChanged<Locale> onLocaleChanged;
-  final ValueChanged<ThemeMode> onThemeModeChanged;
+  final AppState appState;
 
   @override
   State<AppShell> createState() => _AppShellState();
@@ -66,14 +70,15 @@ class _AppShellState extends State<AppShell> {
 
   @override
   Widget build(BuildContext context) {
-    final strings = AppStrings(widget.locale.languageCode);
+    final state = widget.appState;
+    final strings = AppStrings(state.locale.languageCode);
     final pages = [
       const DashboardPage(),
       const LocationsPage(),
       const StatisticsPage(),
       const SplitTunnelPage(),
       const DiagnosticsPage(),
-      SettingsPage(onThemeModeChanged: widget.onThemeModeChanged),
+      SettingsPage(appState: state),
     ];
 
     final destinations = [
@@ -93,7 +98,7 @@ class _AppShellState extends State<AppShell> {
             appBar: AppBar(
               title: const Text('VPN Client'),
               actions: [
-                _LanguageButton(locale: widget.locale, onChanged: widget.onLocaleChanged),
+                _LanguageButton(locale: state.locale, onChanged: state.setLocale),
                 const SizedBox(width: 8),
               ],
             ),
@@ -122,7 +127,7 @@ class _AppShellState extends State<AppShell> {
         return Scaffold(
           appBar: AppBar(
             title: const Text('VPN Client'),
-            actions: [_LanguageButton(locale: widget.locale, onChanged: widget.onLocaleChanged)],
+            actions: [_LanguageButton(locale: state.locale, onChanged: state.setLocale)],
           ),
           body: pages[_index],
           bottomNavigationBar: NavigationBar(
