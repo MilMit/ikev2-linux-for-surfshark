@@ -36,6 +36,7 @@ abstract interface class VpnCore {
   Stream<VpnConnectionState> watchConnection();
   Future<List<VpnServer>> listServers({required String providerId});
   Future<void> refreshServers({required String providerId});
+  Future<int?> probeServer({required String providerId, required String serverId});
   Future<void> connect({
     required String providerId,
     VpnServer? server,
@@ -45,6 +46,8 @@ abstract interface class VpnCore {
   Future<void> setKillSwitch(bool enabled);
   Future<void> setDnsProtection(bool enabled);
   Future<void> setIpv6Protection(bool enabled);
+  Future<bool> credentialsSaved();
+  Future<void> saveCredentials({required String username, required String password});
   Future<Map<String, Object?>> runDiagnostics();
 }
 
@@ -61,6 +64,9 @@ class UnsupportedVpnCore implements VpnCore {
 
   @override
   Future<void> refreshServers({required String providerId}) async {}
+
+  @override
+  Future<int?> probeServer({required String providerId, required String serverId}) async => null;
 
   @override
   Future<void> connect({
@@ -82,6 +88,14 @@ class UnsupportedVpnCore implements VpnCore {
 
   @override
   Future<void> setIpv6Protection(bool enabled) async {}
+
+  @override
+  Future<bool> credentialsSaved() async => false;
+
+  @override
+  Future<void> saveCredentials({required String username, required String password}) async {
+    throw UnsupportedError('Secure credential storage is not available on this platform yet.');
+  }
 
   @override
   Future<Map<String, Object?>> runDiagnostics() async => {
