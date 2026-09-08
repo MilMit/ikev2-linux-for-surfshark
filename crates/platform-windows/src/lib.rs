@@ -1,10 +1,14 @@
 use std::env;
 use std::fs;
-use std::net::ToSocketAddrs;
+use std::io::{BufRead, BufReader, Write};
+use std::net::{TcpStream, ToSocketAddrs};
 use std::path::PathBuf;
 use std::process::Command;
+use std::time::Duration;
 use surfshark_ikev2_core::platform::{PlatformAdapter, PlatformConnectionStatus, PlatformDiagnostics, PlatformStatus, VpnProtocol};
 use surfshark_ikev2_core::Location;
+
+const SERVICE_IPC: &str = "127.0.0.1:47631";
 
 #[derive(Debug, Default, Clone)]
 pub struct WindowsPlatformAdapter;
@@ -29,7 +33,7 @@ impl WindowsPlatformAdapter {
     }
 
     fn require_admin_error(context: &str, error: String) -> String {
-        format!("{context} failed. This operation requires administrator approval: {error}")
+        format!("{context} failed. This operation must run through MilMitVpnService/administrator: {error}")
     }
 
     fn state_path() -> PathBuf { Self::program_data().join("windows-policy.json") }
@@ -120,18 +124,29 @@ impl WindowsPlatformAdapter {
         Self::save_policy_state(&state)
     }
 
-    fn wfp_helper_path() -> Result<PathBuf, String> {
-        let current = env::current_exe().map_err(|e| e.to_string())?;
-        let candidate = current.parent().unwrap_or_else(|| std::path::Path::new(".")).join("wfp-helper.exe");
-        if candidate.is_file() { Ok(candidate) } else { Err(format!("WFP helper is not installed beside the app: {}", candidate.display())) }
+    fn service_call(payload: serde_json::Value) -> Result<serde_json::Value, String> {
+        let addr = SERVICE_IPC.parse().map_err(|e| format!("invalid service IPC address: {e}"))?;
+        let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2))
+            .map_err(|e| format!("MilMitVpnService IPC unavailable: {e}"))?;
+        stream.set_read_timeout(Some(Duration::from_secs(4))).map_err(|e| e.to_string())?;
+        stream.set_write_timeout(Some(Duration::from_secs(4))).map_err(|e| e.to_string())?;
+        let mut request = serde_json::to_vec(&payload).map_err(|e| e.to_string())?;
+        request.push(b'\n');
+        stream.write_all(&request).map_err(|e| format!("service IPC write failed: {e}"))?;
+        stream.flush().map_err(|e| e.to_string())?;
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+        reader.read_line(&mut line).map_err(|e| format!("service IPC read failed: {e}"))?;
+        let response: serde_json::Value = serde_json::from_str(line.trim()).map_err(|e| format!("invalid service response: {e}"))?;
+        if response.get("ok").and_then(|v| v.as_bool()) == Some(true) {
+            Ok(response)
+        } else {
+            Err(response.get("error").and_then(|v| v.as_str()).unwrap_or("Windows service rejected request").to_string())
+        }
     }
 
-    fn run_wfp_elevated(args: &[String]) -> Result<(), String> {
-        let helper = Self::wfp_helper_path()?;
-        let helper_ps = helper.display().to_string().replace('\'', "''");
-        let arg_list = args.iter().map(|a| format!("'{}'", a.replace('\'', "''"))).collect::<Vec<_>>().join(",");
-        let script = format!("$p=Start-Process -FilePath '{helper_ps}' -ArgumentList @({arg_list}) -Verb RunAs -Wait -PassThru; if ($p.ExitCode -ne 0) {{ exit $p.ExitCode }}");
-        Self::powershell(&script).map(|_| ()).map_err(|e| Self::require_admin_error("WFP kill switch", e))
+    fn service_available() -> bool {
+        Self::service_call(serde_json::json!({"action":"ping"})).is_ok()
     }
 }
 
@@ -155,13 +170,14 @@ impl PlatformAdapter for WindowsPlatformAdapter {
 
     fn set_kill_switch(&self, enabled: bool) -> Result<(), String> {
         let mut state = Self::load_policy_state();
-        if enabled {
+        let payload = if enabled {
             let ifindex = state.get("physical_interface_index").and_then(|v| v.as_u64()).ok_or("kill-switch context has no physical interface index; connect/select a server first")?;
             let endpoint = state.get("endpoint_ip").and_then(|v| v.as_str()).ok_or("kill-switch context has no VPN endpoint IP; connect/select a server first")?;
-            Self::run_wfp_elevated(&["enable".into(), ifindex.to_string(), endpoint.to_string()])?;
+            serde_json::json!({"action":"kill_switch","enabled":true,"interface_index":ifindex,"endpoint_ip":endpoint})
         } else {
-            Self::run_wfp_elevated(&["disable".into()])?;
-        }
+            serde_json::json!({"action":"kill_switch","enabled":false})
+        };
+        Self::service_call(payload)?;
         state["kill_switch"] = serde_json::Value::Bool(enabled);
         Self::save_policy_state(&state)
     }
@@ -179,7 +195,7 @@ impl PlatformAdapter for WindowsPlatformAdapter {
     }
 
     fn set_ipv6_protection(&self, _enabled: bool) -> Result<(), String> {
-        Err("Windows IPv6 leak protection is handled by the WFP physical-uplink kill switch; a separate global ms_tcpip6 disable is intentionally not used".into())
+        Err("Windows IPv6 leak protection is provided by the WFP physical-uplink kill switch; global ms_tcpip6 disable is intentionally not used".into())
     }
 
     fn credentials_status(&self) -> Result<bool, String> { Ok(false) }
@@ -204,7 +220,7 @@ impl PlatformAdapter for WindowsPlatformAdapter {
     }
 
     fn add_split_tunnel_rule(&self, target: &str, mode: &str) -> Result<serde_json::Value, String> {
-        if mode != "vpn" { return Err("Windows bypass-CIDR requires a dedicated physical-uplink route resolver and remains fail-closed".into()); }
+        if mode != "vpn" { return Err("Windows bypass-CIDR requires dedicated physical-uplink route resolution and remains fail-closed".into()); }
         let target = target.trim();
         if target.is_empty() || target.contains('\'') || target.contains('"') || target.contains(';') { return Err("invalid_split_target".into()); }
         let body = format!("Add-VpnConnectionRoute -ConnectionName $n -DestinationPrefix '{target}' -PassThru -ErrorAction Stop | Out-Null");
@@ -230,6 +246,29 @@ impl PlatformAdapter for WindowsPlatformAdapter {
     }
 
     fn diagnostics(&self) -> Result<PlatformDiagnostics, String> {
-        Ok(PlatformDiagnostics { adapter: "windows-native-v3".into(), available: cfg!(target_os = "windows"), helper_available: Self::wfp_helper_path().is_ok(), credentials_available: false, ikev2_available: true, wireguard_available: Self::wireguard_exe().is_some(), openvpn_available: Self::openvpn_exe().is_some(), kill_switch_supported: Self::wfp_helper_path().is_ok(), dns_protection_supported: true, split_tunnel_supported: true, details: serde_json::json!({"program_data":Self::program_data(),"native_vpn":"rasdial/Get-VpnConnection","kill_switch":"WFP ALE_AUTH_CONNECT V4/V6 physical-interface policy","kill_switch_elevation":"UAC helper invocation; service IPC hardening remains","dns":"NRPT","split_tunnel":"Windows VPN connection routes (vpn mode)","bypass_mode":"pending dedicated physical-uplink route resolver","credential_policy":"Windows Credential Manager/native profile only"}) })
+        let service_available = Self::service_available();
+        Ok(PlatformDiagnostics {
+            adapter: "windows-native-v4".into(),
+            available: cfg!(target_os = "windows"),
+            helper_available: service_available,
+            credentials_available: false,
+            ikev2_available: true,
+            wireguard_available: Self::wireguard_exe().is_some(),
+            openvpn_available: Self::openvpn_exe().is_some(),
+            kill_switch_supported: service_available,
+            dns_protection_supported: true,
+            split_tunnel_supported: true,
+            details: serde_json::json!({
+                "program_data":Self::program_data(),
+                "native_vpn":"rasdial/Get-VpnConnection",
+                "kill_switch":"WFP ALE_AUTH_CONNECT V4/V6 via MilMitVpnService",
+                "kill_switch_elevation":"LocalSystem service; no direct UAC helper invocation from UI",
+                "service_ipc":SERVICE_IPC,
+                "dns":"NRPT",
+                "split_tunnel":"Windows VPN connection routes (vpn mode)",
+                "bypass_mode":"pending hardened physical-uplink route resolver",
+                "credential_policy":"Windows Credential Manager/native profile only"
+            })
+        })
     }
 }
