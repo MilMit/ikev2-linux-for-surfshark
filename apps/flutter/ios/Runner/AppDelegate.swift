@@ -104,9 +104,9 @@ final class MobileVpnBridge: NSObject {
                     }
                     do {
                         try vpnManager.connection.startVPNTunnel(options: [
-                            "serverId" as NSString: serverId as NSString,
-                            "providerId" as NSString: providerId as NSString,
-                            "wgQuickConfig" as NSString: wgQuickConfig as NSString
+                            "serverId": serverId as NSString,
+                            "providerId": providerId as NSString,
+                            "wgQuickConfig": wgQuickConfig as NSString
                         ])
                         result(nil)
                     } catch {
