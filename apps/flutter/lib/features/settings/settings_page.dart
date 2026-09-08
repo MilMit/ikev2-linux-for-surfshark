@@ -1,25 +1,17 @@
 import 'package:flutter/material.dart';
 
-class SettingsPage extends StatefulWidget {
-  const SettingsPage({super.key, required this.onThemeModeChanged});
+import '../../app/app_state.dart';
+import '../../app/app_strings.dart';
 
-  final ValueChanged<ThemeMode> onThemeModeChanged;
+class SettingsPage extends StatelessWidget {
+  const SettingsPage({super.key, required this.appState});
 
-  @override
-  State<SettingsPage> createState() => _SettingsPageState();
-}
-
-class _SettingsPageState extends State<SettingsPage> {
-  ThemeMode themeMode = ThemeMode.system;
-  bool autoConnect = true;
-  bool killSwitch = true;
-  bool dnsProtection = true;
-  bool ipv6Protection = true;
-  String protocol = 'Auto';
-  String provider = 'Surfshark';
+  final AppState appState;
 
   @override
   Widget build(BuildContext context) {
+    final strings = AppStrings(appState.locale.languageCode);
+
     return SafeArea(
       child: SingleChildScrollView(
         padding: const EdgeInsets.all(24),
@@ -29,82 +21,86 @@ class _SettingsPageState extends State<SettingsPage> {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.stretch,
               children: [
-                Text('Settings', style: Theme.of(context).textTheme.headlineMedium),
+                Text(strings.settings, style: Theme.of(context).textTheme.headlineMedium),
                 const SizedBox(height: 20),
                 _Section(
-                  title: 'Connection',
+                  title: strings.connection,
                   children: [
                     SwitchListTile(
-                      title: const Text('Auto-connect'),
-                      subtitle: const Text('Connect automatically on supported networks'),
-                      value: autoConnect,
-                      onChanged: (value) => setState(() => autoConnect = value),
+                      title: Text(strings.autoConnect),
+                      subtitle: Text(strings.autoConnectSubtitle),
+                      value: appState.autoConnect,
+                      onChanged: appState.setAutoConnect,
                     ),
                     SwitchListTile(
-                      title: const Text('Kill switch'),
-                      subtitle: const Text('Block traffic if the VPN connection drops'),
-                      value: killSwitch,
-                      onChanged: (value) => setState(() => killSwitch = value),
+                      title: Text(strings.killSwitch),
+                      subtitle: Text(strings.killSwitchSubtitle),
+                      value: appState.killSwitch,
+                      onChanged: appState.setKillSwitch,
                     ),
                     ListTile(
-                      title: const Text('Protocol'),
+                      title: Text(strings.protocol),
                       trailing: DropdownButton<String>(
-                        value: protocol,
+                        value: appState.protocol,
                         items: const ['Auto', 'WireGuard', 'IKEv2', 'OpenVPN']
                             .map((value) => DropdownMenuItem(value: value, child: Text(value)))
                             .toList(),
-                        onChanged: (value) => setState(() => protocol = value ?? protocol),
+                        onChanged: (value) {
+                          if (value != null) appState.setProtocol(value);
+                        },
                       ),
                     ),
                     ListTile(
-                      title: const Text('VPN provider'),
-                      subtitle: const Text('Provider layer is intentionally separated from the app UI'),
+                      title: Text(strings.vpnProvider),
+                      subtitle: Text(strings.providerSeparated),
                       trailing: DropdownButton<String>(
-                        value: provider,
+                        value: appState.provider,
                         items: const ['Surfshark']
                             .map((value) => DropdownMenuItem(value: value, child: Text(value)))
                             .toList(),
-                        onChanged: (value) => setState(() => provider = value ?? provider),
+                        onChanged: (value) {
+                          if (value != null) appState.setProvider(value);
+                        },
                       ),
                     ),
                   ],
                 ),
                 const SizedBox(height: 16),
                 _Section(
-                  title: 'Privacy',
+                  title: strings.privacy,
                   children: [
                     SwitchListTile(
-                      title: const Text('DNS leak protection'),
-                      value: dnsProtection,
-                      onChanged: (value) => setState(() => dnsProtection = value),
+                      title: Text(strings.dnsLeakProtection),
+                      value: appState.dnsProtection,
+                      onChanged: appState.setDnsProtection,
                     ),
                     SwitchListTile(
-                      title: const Text('IPv6 leak protection'),
-                      value: ipv6Protection,
-                      onChanged: (value) => setState(() => ipv6Protection = value),
+                      title: Text(strings.ipv6LeakProtection),
+                      value: appState.ipv6Protection,
+                      onChanged: appState.setIpv6Protection,
                     ),
                   ],
                 ),
                 const SizedBox(height: 16),
                 _Section(
-                  title: 'Appearance',
+                  title: strings.appearance,
                   children: [
                     RadioListTile<ThemeMode>(
-                      title: const Text('System'),
+                      title: Text(strings.system),
                       value: ThemeMode.system,
-                      groupValue: themeMode,
+                      groupValue: appState.themeMode,
                       onChanged: _setTheme,
                     ),
                     RadioListTile<ThemeMode>(
-                      title: const Text('Light'),
+                      title: Text(strings.light),
                       value: ThemeMode.light,
-                      groupValue: themeMode,
+                      groupValue: appState.themeMode,
                       onChanged: _setTheme,
                     ),
                     RadioListTile<ThemeMode>(
-                      title: const Text('Dark'),
+                      title: Text(strings.dark),
                       value: ThemeMode.dark,
-                      groupValue: themeMode,
+                      groupValue: appState.themeMode,
                       onChanged: _setTheme,
                     ),
                   ],
@@ -118,9 +114,7 @@ class _SettingsPageState extends State<SettingsPage> {
   }
 
   void _setTheme(ThemeMode? value) {
-    if (value == null) return;
-    setState(() => themeMode = value);
-    widget.onThemeModeChanged(value);
+    if (value != null) appState.setThemeMode(value);
   }
 }
 
