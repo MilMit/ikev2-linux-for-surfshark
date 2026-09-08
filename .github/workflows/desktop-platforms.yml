@@ -61,7 +61,7 @@ jobs:
       - name: Check macOS adapter
         run: cargo check -p milmit-vpn-platform-macos
       - name: Type-check Packet Tunnel extension
-        run: xcrun swiftc -typecheck native/macos/PacketTunnel/TunnelConfiguration.swift native/macos/PacketTunnel/PacketTunnelProvider.swift
+        run: xcrun swiftc -typecheck native/macos/PacketTunnel/TunnelConfiguration.swift native/macos/PacketTunnel/WireGuardKitEngine.swift native/macos/PacketTunnel/PacketTunnelProvider.swift
       - name: Type-check host NetworkExtension manager
         run: xcrun swiftc -typecheck native/macos/AppBridge/HostTunnelManager.swift
       - name: Test core
