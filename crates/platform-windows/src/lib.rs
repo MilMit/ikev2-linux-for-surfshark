@@ -1,5 +1,6 @@
 use std::env;
 use std::fs;
+use std::net::ToSocketAddrs;
 use std::path::PathBuf;
 use std::process::Command;
 use surfshark_ikev2_core::platform::{PlatformAdapter, PlatformConnectionStatus, PlatformDiagnostics, PlatformStatus, VpnProtocol};
@@ -28,7 +29,7 @@ impl WindowsPlatformAdapter {
     }
 
     fn require_admin_error(context: &str, error: String) -> String {
-        format!("{context} failed. This operation must be executed by MilMitVpnService/administrator: {error}")
+        format!("{context} failed. This operation requires administrator approval: {error}")
     }
 
     fn state_path() -> PathBuf { Self::program_data().join("windows-policy.json") }
@@ -36,7 +37,7 @@ impl WindowsPlatformAdapter {
     fn load_policy_state() -> serde_json::Value {
         fs::read_to_string(Self::state_path()).ok()
             .and_then(|v| serde_json::from_str(&v).ok())
-            .unwrap_or_else(|| serde_json::json!({"dns":false,"split_enabled":false,"rules":[]}))
+            .unwrap_or_else(|| serde_json::json!({"dns":false,"kill_switch":false,"split_enabled":false,"rules":[]}))
     }
 
     fn save_policy_state(state: &serde_json::Value) -> Result<(), String> {
@@ -98,10 +99,45 @@ impl WindowsPlatformAdapter {
     fn managed_profile_script(body: &str) -> String {
         format!("$profiles=Get-VpnConnection -ErrorAction SilentlyContinue | Where-Object {{$_.Name -like 'MilMit *'}}; foreach($p in $profiles){{ $n=$p.Name; {body} }}")
     }
+
+    fn resolve_endpoint_ip(location: &Location) -> Result<String, String> {
+        if let Some(ip) = location.endpoint.fallback_ips.first() { return Ok(ip.to_string()); }
+        (location.endpoint.hostname.as_str(), 443).to_socket_addrs()
+            .map_err(|e| format!("failed to resolve VPN endpoint: {e}"))?
+            .next().map(|v| v.ip().to_string()).ok_or_else(|| "VPN endpoint resolved to no address".into())
+    }
+
+    fn physical_interface_index() -> Result<u32, String> {
+        let text = Self::powershell("$r=Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -ErrorAction Stop | Sort-Object RouteMetric,InterfaceMetric | Select-Object -First 1 -ExpandProperty InterfaceIndex; [int]$r")?;
+        text.lines().last().and_then(|v| v.trim().parse::<u32>().ok()).filter(|v| *v > 0)
+            .ok_or_else(|| format!("could not determine physical interface index: {text}"))
+    }
+
+    fn remember_kill_switch_context(location: &Location) -> Result<(), String> {
+        let mut state = Self::load_policy_state();
+        state["endpoint_ip"] = serde_json::Value::String(Self::resolve_endpoint_ip(location)?);
+        state["physical_interface_index"] = serde_json::Value::from(Self::physical_interface_index()?);
+        Self::save_policy_state(&state)
+    }
+
+    fn wfp_helper_path() -> Result<PathBuf, String> {
+        let current = env::current_exe().map_err(|e| e.to_string())?;
+        let candidate = current.parent().unwrap_or_else(|| std::path::Path::new(".")).join("wfp-helper.exe");
+        if candidate.is_file() { Ok(candidate) } else { Err(format!("WFP helper is not installed beside the app: {}", candidate.display())) }
+    }
+
+    fn run_wfp_elevated(args: &[String]) -> Result<(), String> {
+        let helper = Self::wfp_helper_path()?;
+        let helper_ps = helper.display().to_string().replace('\'', "''");
+        let arg_list = args.iter().map(|a| format!("'{}'", a.replace('\'', "''"))).collect::<Vec<_>>().join(",");
+        let script = format!("$p=Start-Process -FilePath '{helper_ps}' -ArgumentList @({arg_list}) -Verb RunAs -Wait -PassThru; if ($p.ExitCode -ne 0) {{ exit $p.ExitCode }}");
+        Self::powershell(&script).map(|_| ()).map_err(|e| Self::require_admin_error("WFP kill switch", e))
+    }
 }
 
 impl PlatformAdapter for WindowsPlatformAdapter {
     fn connect(&self, location: &Location, protocol: VpnProtocol) -> Result<PlatformStatus, String> {
+        let _ = Self::remember_kill_switch_context(location);
         match protocol {
             VpnProtocol::Auto | VpnProtocol::Ikev2 => Self::connect_ikev2(location)?,
             VpnProtocol::WireGuard => Self::connect_wireguard(location)?,
@@ -117,8 +153,17 @@ impl PlatformAdapter for WindowsPlatformAdapter {
 
     fn status(&self) -> Result<PlatformStatus, String> { Ok(Self::ras_status()) }
 
-    fn set_kill_switch(&self, _enabled: bool) -> Result<(), String> {
-        Err("Windows kill switch remains fail-closed until the WFP provider is installed in MilMitVpnService".into())
+    fn set_kill_switch(&self, enabled: bool) -> Result<(), String> {
+        let mut state = Self::load_policy_state();
+        if enabled {
+            let ifindex = state.get("physical_interface_index").and_then(|v| v.as_u64()).ok_or("kill-switch context has no physical interface index; connect/select a server first")?;
+            let endpoint = state.get("endpoint_ip").and_then(|v| v.as_str()).ok_or("kill-switch context has no VPN endpoint IP; connect/select a server first")?;
+            Self::run_wfp_elevated(&["enable".into(), ifindex.to_string(), endpoint.to_string()])?;
+        } else {
+            Self::run_wfp_elevated(&["disable".into()])?;
+        }
+        state["kill_switch"] = serde_json::Value::Bool(enabled);
+        Self::save_policy_state(&state)
     }
 
     fn set_dns_protection(&self, enabled: bool) -> Result<(), String> {
@@ -134,7 +179,7 @@ impl PlatformAdapter for WindowsPlatformAdapter {
     }
 
     fn set_ipv6_protection(&self, _enabled: bool) -> Result<(), String> {
-        Err("Windows IPv6 protection is intentionally not implemented by disabling ms_tcpip6 globally; it requires the WFP/service route policy".into())
+        Err("Windows IPv6 leak protection is handled by the WFP physical-uplink kill switch; a separate global ms_tcpip6 disable is intentionally not used".into())
     }
 
     fn credentials_status(&self) -> Result<bool, String> { Ok(false) }
@@ -146,9 +191,7 @@ impl PlatformAdapter for WindowsPlatformAdapter {
         Ok(text.lines().last().and_then(|v| v.trim().parse::<u32>().ok()))
     }
 
-    fn split_tunnel_status(&self) -> Result<serde_json::Value, String> {
-        Ok(Self::load_policy_state())
-    }
+    fn split_tunnel_status(&self) -> Result<serde_json::Value, String> { Ok(Self::load_policy_state()) }
 
     fn set_split_tunnel_enabled(&self, enabled: bool) -> Result<serde_json::Value, String> {
         let value = if enabled { "$true" } else { "$false" };
@@ -161,16 +204,14 @@ impl PlatformAdapter for WindowsPlatformAdapter {
     }
 
     fn add_split_tunnel_rule(&self, target: &str, mode: &str) -> Result<serde_json::Value, String> {
-        if mode != "vpn" { return Err("Windows bypass-CIDR requires physical-uplink resolution in MilMitVpnService and remains fail-closed".into()); }
+        if mode != "vpn" { return Err("Windows bypass-CIDR requires a dedicated physical-uplink route resolver and remains fail-closed".into()); }
         let target = target.trim();
         if target.is_empty() || target.contains('\'') || target.contains('"') || target.contains(';') { return Err("invalid_split_target".into()); }
         let body = format!("Add-VpnConnectionRoute -ConnectionName $n -DestinationPrefix '{target}' -PassThru -ErrorAction Stop | Out-Null");
         Self::powershell(&Self::managed_profile_script(&body)).map_err(|e| Self::require_admin_error("Windows VPN route", e))?;
         let mut state = Self::load_policy_state();
         let mut rules = state.get("rules").and_then(|v| v.as_array()).cloned().unwrap_or_default();
-        if !rules.iter().any(|r| r.get("target").and_then(|v| v.as_str()) == Some(target)) {
-            rules.push(serde_json::json!({"target":target,"mode":"vpn"}));
-        }
+        if !rules.iter().any(|r| r.get("target").and_then(|v| v.as_str()) == Some(target)) { rules.push(serde_json::json!({"target":target,"mode":"vpn"})); }
         state["rules"] = serde_json::Value::Array(rules);
         Self::save_policy_state(&state)?;
         Ok(state)
@@ -182,14 +223,13 @@ impl PlatformAdapter for WindowsPlatformAdapter {
         let body = format!("Remove-VpnConnectionRoute -ConnectionName $n -DestinationPrefix '{target}' -PassThru -ErrorAction SilentlyContinue | Out-Null");
         Self::powershell(&Self::managed_profile_script(&body)).map_err(|e| Self::require_admin_error("Windows VPN route removal", e))?;
         let mut state = Self::load_policy_state();
-        let rules = state.get("rules").and_then(|v| v.as_array()).cloned().unwrap_or_default().into_iter()
-            .filter(|r| r.get("target").and_then(|v| v.as_str()) != Some(target)).collect();
+        let rules = state.get("rules").and_then(|v| v.as_array()).cloned().unwrap_or_default().into_iter().filter(|r| r.get("target").and_then(|v| v.as_str()) != Some(target)).collect();
         state["rules"] = serde_json::Value::Array(rules);
         Self::save_policy_state(&state)?;
         Ok(state)
     }
 
     fn diagnostics(&self) -> Result<PlatformDiagnostics, String> {
-        Ok(PlatformDiagnostics { adapter: "windows-native-v2".into(), available: cfg!(target_os = "windows"), helper_available: Self::powershell("if (Get-Service MilMitVpnService -ErrorAction SilentlyContinue) { 'yes' }").map(|v| v.contains("yes")).unwrap_or(false), credentials_available: false, ikev2_available: true, wireguard_available: Self::wireguard_exe().is_some(), openvpn_available: Self::openvpn_exe().is_some(), kill_switch_supported: false, dns_protection_supported: true, split_tunnel_supported: true, details: serde_json::json!({"program_data":Self::program_data(),"native_vpn":"rasdial/Get-VpnConnection","dns":"NRPT","split_tunnel":"Windows VPN connection routes (vpn mode)","bypass_mode":"pending service physical-uplink resolver","kill_switch":"pending WFP provider","credential_policy":"Windows Credential Manager/native profile only"}) })
+        Ok(PlatformDiagnostics { adapter: "windows-native-v3".into(), available: cfg!(target_os = "windows"), helper_available: Self::wfp_helper_path().is_ok(), credentials_available: false, ikev2_available: true, wireguard_available: Self::wireguard_exe().is_some(), openvpn_available: Self::openvpn_exe().is_some(), kill_switch_supported: Self::wfp_helper_path().is_ok(), dns_protection_supported: true, split_tunnel_supported: true, details: serde_json::json!({"program_data":Self::program_data(),"native_vpn":"rasdial/Get-VpnConnection","kill_switch":"WFP ALE_AUTH_CONNECT V4/V6 physical-interface policy","kill_switch_elevation":"UAC helper invocation; service IPC hardening remains","dns":"NRPT","split_tunnel":"Windows VPN connection routes (vpn mode)","bypass_mode":"pending dedicated physical-uplink route resolver","credential_policy":"Windows Credential Manager/native profile only"}) })
     }
 }
