@@ -42,10 +42,10 @@ impl LinuxPlatformAdapter {
     }
 
     fn save_credentials_root(&self, username: &str, password: &str) -> Result<(), String> {
-        if username.is_empty() || username.len() > 128 || username.contains(['\n', '\r']) {
+        if username.is_empty() || username.len() > 128 || username.contains('\n') || username.contains('\r') {
             return Err("invalid service username".into());
         }
-        if password.is_empty() || password.len() > 512 || password.contains(['\n', '\r']) {
+        if password.is_empty() || password.len() > 512 || password.contains('\n') || password.contains('\r') {
             return Err("invalid service password".into());
         }
         let mut child = Command::new("pkexec")
@@ -112,9 +112,11 @@ impl LinuxPlatformAdapter {
     fn spawn_engine_connect(&self, identity: String, candidates: String) -> Result<(), String> {
         if !Path::new(HELPER).is_file() { return Err(format!("privileged helper is not installed at {HELPER}")); }
         std::thread::spawn(move || {
-            let _ = Command::new("timeout")
-                .args(["--signal=TERM", "--kill-after=3s", "170s", "pkexec", HELPER, "engine-connect", &identity, &candidates])
-                .output();
+            let mut cmd = Command::new("timeout");
+            cmd.args(["--signal=TERM", "--kill-after=3s", "170s", "pkexec", HELPER, "engine-connect"])
+                .arg(identity)
+                .arg(candidates);
+            let _ = cmd.output();
         });
         Ok(())
     }
@@ -126,9 +128,11 @@ impl LinuxPlatformAdapter {
         let protocol = protocol.to_string();
         let identity = identity.to_string();
         std::thread::spawn(move || {
-            let _ = Command::new("timeout")
-                .args(["--signal=TERM", "--kill-after=3s", "90s", "pkexec", "/usr/bin/python3", PROTOCOL_CONNECTOR, &protocol, &identity])
-                .output();
+            let mut cmd = Command::new("timeout");
+            cmd.args(["--signal=TERM", "--kill-after=3s", "90s", "pkexec", "/usr/bin/python3", PROTOCOL_CONNECTOR])
+                .arg(protocol)
+                .arg(identity);
+            let _ = cmd.output();
         });
         Ok(())
     }
