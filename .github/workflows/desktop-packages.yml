@@ -28,6 +28,9 @@ jobs:
         with:
           channel: stable
           cache: true
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
       - name: Install WiX Toolset 3
         shell: powershell
         run: choco install wixtoolset --no-progress -y
