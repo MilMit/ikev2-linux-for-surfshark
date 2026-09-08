@@ -4,14 +4,16 @@ import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
+import android.app.Service
 import android.content.Intent
 import android.net.VpnService
 import android.os.Build
+import android.os.IBinder
 import androidx.core.app.NotificationCompat
 import java.io.File
 import java.util.concurrent.atomic.AtomicReference
 
-class MilMitVpnService : VpnService() {
+class MilMitVpnService : Service() {
     companion object {
         const val ACTION_CONNECT = "net.milmit.vpn.CONNECT"
         const val ACTION_DISCONNECT = "net.milmit.vpn.DISCONNECT"
@@ -26,6 +28,8 @@ class MilMitVpnService : VpnService() {
     }
 
     private val wireGuardBackend: WireGuardBackend = WireGuardAndroidBackend()
+
+    override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -107,11 +111,6 @@ class MilMitVpnService : VpnService() {
         state.set("disconnected")
         stopForegroundCompat()
         stopSelf()
-    }
-
-    override fun onRevoke() {
-        stopTunnel()
-        super.onRevoke()
     }
 
     private fun createNotificationChannel() {
