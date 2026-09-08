@@ -1,23 +1,49 @@
 package net.milmit.vpn
 
 import android.content.Context
-import android.os.ParcelFileDescriptor
+import com.wireguard.android.backend.GoBackend
+import com.wireguard.android.backend.State
+import com.wireguard.android.backend.Tunnel
+import com.wireguard.config.Config
 import java.io.File
 
-/**
- * Narrow Android WireGuard backend boundary.
- *
- * Phase 5 deliberately fails closed until the native WireGuard engine is linked.
- * A TUN descriptor alone is never treated as a working VPN connection.
- */
 interface WireGuardBackend {
-    fun start(context: Context, tun: ParcelFileDescriptor, profile: File): Result<Unit>
-    fun stop()
+    fun start(context: Context, tunnelName: String, profile: File): Result<Unit>
+    fun stop(): Result<Unit>
+    fun state(): String
 }
 
-class UnavailableWireGuardBackend : WireGuardBackend {
-    override fun start(context: Context, tun: ParcelFileDescriptor, profile: File): Result<Unit> =
-        Result.failure(IllegalStateException("wireguard_backend_not_linked"))
+class WireGuardAndroidBackend : WireGuardBackend {
+    private var backend: GoBackend? = null
+    private var tunnel: Tunnel? = null
 
-    override fun stop() = Unit
+    override fun start(context: Context, tunnelName: String, profile: File): Result<Unit> = runCatching {
+        require(Tunnel.isNameInvalid(tunnelName).not()) { "invalid_tunnel_name" }
+        val config = profile.inputStream().use(Config::parse)
+        val goBackend = backend ?: GoBackend(context.applicationContext).also { backend = it }
+        val target = object : Tunnel {
+            override fun getName(): String = tunnelName
+            override fun onStateChange(newState: State) = Unit
+        }
+        val newState = goBackend.setState(target, State.UP, config)
+        check(newState == State.UP) { "wireguard_backend_not_up" }
+        tunnel = target
+    }
+
+    override fun stop(): Result<Unit> = runCatching {
+        val goBackend = backend ?: return@runCatching
+        val target = tunnel ?: return@runCatching
+        goBackend.setState(target, State.DOWN, null)
+        tunnel = null
+    }
+
+    override fun state(): String {
+        val goBackend = backend ?: return "disconnected"
+        val target = tunnel ?: return "disconnected"
+        return when (goBackend.getState(target)) {
+            State.UP -> "connected"
+            State.DOWN -> "disconnected"
+            State.TOGGLE -> "error"
+        }
+    }
 }
