@@ -2,6 +2,7 @@ import 'dart:io';
 
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import 'desktop_protocol_parity_vpn_core.dart';
 import 'macos_vpn_core.dart';
 import 'mobile_vpn_core.dart';
 import 'rust_ffi_vpn_core.dart';
@@ -13,7 +14,13 @@ final vpnCoreProvider = Provider<VpnCore>((ref) {
     if (Platform.isAndroid || Platform.isIOS) {
       return MobileVpnCore(sharedCore);
     }
-    return Platform.isMacOS ? MacOsVpnCore(sharedCore) : sharedCore;
+    if (Platform.isMacOS) {
+      return MacOsVpnCore(sharedCore);
+    }
+    if (Platform.isLinux || Platform.isWindows) {
+      return DesktopProtocolParityVpnCore(sharedCore);
+    }
+    return sharedCore;
   } catch (_) {
     return const UnsupportedVpnCore();
   }
