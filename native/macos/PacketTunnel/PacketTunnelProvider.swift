@@ -28,12 +28,16 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
 
         self.engine = engine
         setTunnelNetworkSettings(configuration.baseNetworkSettings()) { [weak self] error in
+            guard let self else {
+                completionHandler(NSError(domain: "net.milmit.vpn", code: 4, userInfo: [NSLocalizedDescriptionKey: "Packet tunnel provider was released during startup"]))
+                return
+            }
             if let error {
-                self?.engine = nil
+                self.engine = nil
                 completionHandler(error)
                 return
             }
-            engine.start(configuration: configuration, packetFlow: self?.packetFlow ?? NEPacketTunnelFlow()) { startError in
+            engine.start(configuration: configuration, packetFlow: self.packetFlow) { [weak self] startError in
                 if startError != nil { self?.engine = nil }
                 completionHandler(startError)
             }
