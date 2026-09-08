@@ -14,6 +14,7 @@ function Require-Command([string]$Name) {
 
 Require-Command flutter
 Require-Command cargo
+Require-Command cl.exe
 
 if (-not (Test-Path (Join-Path $App 'windows'))) {
     Push-Location $App
@@ -30,6 +31,8 @@ Push-Location $Root
 try {
     cargo build -p milmit-vpn-flutter-ffi --release
     cargo build --manifest-path native\windows\service\Cargo.toml --release
+    & cl.exe /nologo /O2 /W4 /DUNICODE /D_UNICODE native\windows\wfp-helper\wfp_helper.c /Fe:native\windows\wfp-helper\wfp-helper.exe /link Fwpuclnt.lib Rpcrt4.lib Ws2_32.lib
+    if ($LASTEXITCODE -ne 0) { throw 'WFP helper compilation failed' }
 } finally { Pop-Location }
 
 $Bundle = Join-Path $App 'build\windows\x64\runner\Release'
@@ -39,6 +42,7 @@ Remove-Item $Dist -Recurse -Force -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Path $Stage -Force | Out-Null
 Copy-Item (Join-Path $Bundle '*') $Stage -Recurse -Force
 Copy-Item (Join-Path $Root 'target\release\milmit_vpn_flutter_ffi.dll') $Stage -Force
+Copy-Item (Join-Path $Root 'native\windows\wfp-helper\wfp-helper.exe') $Stage -Force
 
 $ServiceExe = Join-Path $Root 'native\windows\service\target\release\milmit-vpn-windows-service.exe'
 if (-not (Test-Path $ServiceExe)) {
