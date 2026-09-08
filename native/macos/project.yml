@@ -1,0 +1,57 @@
+name: MilMitVPNNative
+options:
+  minimumXcodeGenVersion: 2.38.0
+  deploymentTarget:
+    macOS: "12.0"
+  createIntermediateGroups: true
+
+packages:
+  WireGuardKit:
+    url: https://github.com/WireGuard/wireguard-apple.git
+    revision: 2fec12a6e1f6e3460b6ee483aa00ad29cddadab1
+
+targets:
+  PacketTunnel:
+    type: app-extension
+    platform: macOS
+    deploymentTarget: "12.0"
+    sources:
+      - path: PacketTunnel
+        excludes:
+          - Info.plist
+          - PacketTunnel.entitlements
+    info:
+      path: PacketTunnel/Info.plist
+    dependencies:
+      - package: WireGuardKit
+        product: WireGuardKit
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: net.milmit.vpn.PacketTunnel
+        PRODUCT_NAME: PacketTunnel
+        SWIFT_VERSION: 5.0
+        CODE_SIGN_ENTITLEMENTS: PacketTunnel/PacketTunnel.entitlements
+        SKIP_INSTALL: YES
+        GENERATE_INFOPLIST_FILE: NO
+        LD_RUNPATH_SEARCH_PATHS: "$(inherited) @executable_path/../Frameworks @executable_path/../../../../Frameworks"
+    preBuildScripts:
+      - name: Build WireGuard Go bridge
+        basedOnDependencyAnalysis: false
+        script: |
+          set -euo pipefail
+          WG_GO="${BUILD_DIR%Build/*}SourcePackages/checkouts/wireguard-apple/Sources/WireGuardKitGo"
+          if [ ! -d "$WG_GO" ]; then
+            echo "WireGuardKitGo checkout not found at $WG_GO" >&2
+            exit 1
+          fi
+          /usr/bin/make -C "$WG_GO"
+
+schemes:
+  PacketTunnel:
+    build:
+      targets:
+        PacketTunnel: all
+    run:
+      config: Debug
+    archive:
+      config: Release
