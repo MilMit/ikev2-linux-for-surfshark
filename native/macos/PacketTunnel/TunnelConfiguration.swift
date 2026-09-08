@@ -7,8 +7,9 @@ struct MilMitTunnelConfiguration {
     let dnsServers: [String]
     let includedRoutes: [String]
     let excludedRoutes: [String]
+    let wireGuardQuickConfig: String?
 
-    init(providerConfiguration: [String: Any]) throws {
+    init(providerConfiguration: [String: Any], runtimeOptions: [String: NSObject]? = nil) throws {
         guard let engine = providerConfiguration["engine"] as? String, !engine.isEmpty else {
             throw NSError(domain: "net.milmit.vpn", code: 20, userInfo: [NSLocalizedDescriptionKey: "Missing packet tunnel engine"])
         }
@@ -23,6 +24,7 @@ struct MilMitTunnelConfiguration {
         self.dnsServers = providerConfiguration["dnsServers"] as? [String] ?? []
         self.includedRoutes = providerConfiguration["includedRoutes"] as? [String] ?? []
         self.excludedRoutes = providerConfiguration["excludedRoutes"] as? [String] ?? []
+        self.wireGuardQuickConfig = runtimeOptions?["wireGuardQuickConfig"] as? String
     }
 
     func baseNetworkSettings() -> NEPacketTunnelNetworkSettings {
@@ -41,9 +43,12 @@ protocol MilMitPacketTunnelEngine: AnyObject {
 }
 
 enum MilMitPacketTunnelEngineFactory {
-    static func make(engine: String) -> MilMitPacketTunnelEngine? {
-        // WireGuard/OpenVPN engines must be linked into the signed extension target.
-        // Returning nil is intentional until a reviewed engine dependency is integrated.
+    static func make(engine: String, provider: NEPacketTunnelProvider) -> MilMitPacketTunnelEngine? {
+        #if canImport(WireGuardKit)
+        if engine.lowercased() == "wireguard" {
+            return WireGuardKitPacketTunnelEngine(provider: provider)
+        }
+        #endif
         return nil
     }
 }
