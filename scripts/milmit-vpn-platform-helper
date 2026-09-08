@@ -5,6 +5,7 @@ STATE_DIR = pathlib.Path('/var/lib/milmit-surfshark/platform')
 DNS_STATE = STATE_DIR / 'dns.json'
 IPV6_STATE = STATE_DIR / 'ipv6.json'
 SPLIT_STATE = STATE_DIR / 'split-tunnel.json'
+DESKTOP_FEATURES = '/usr/lib/milmit-surfshark/desktop-features.py'
 VPN_DNS = ['162.252.172.57', '149.154.159.92']
 RULE_PREF = 18180
 TABLE_BYPASS = 181
@@ -86,48 +87,57 @@ def split_load():
     return load(SPLIT_STATE, {'enabled':False,'rules':[]})
 
 def valid_target(value):
-    try:
-        return str(ipaddress.ip_network(value, strict=False))
-    except ValueError:
-        raise RuntimeError('only IPv4/IPv6 CIDR targets are accepted by the Linux native split-tunnel engine')
+    try: return str(ipaddress.ip_network(value, strict=False))
+    except ValueError: raise RuntimeError('only IPv4/IPv6 CIDR targets are accepted by the Linux native split-tunnel engine')
 
 def split_apply_state(state):
-    # Rebuild only our dedicated rule preference range.
-    for pref in range(RULE_PREF, RULE_PREF + 256):
-        run(['ip','rule','del','pref',str(pref)], check=False)
+    for pref in range(RULE_PREF, RULE_PREF + 256): run(['ip','rule','del','pref',str(pref)], check=False)
     if not state.get('enabled'):
-        run(['ip','route','flush','table',str(TABLE_BYPASS)], check=False)
-        return
-    ensure_table_route()
-    idx=0
+        run(['ip','route','flush','table',str(TABLE_BYPASS)], check=False); return
+    ensure_table_route(); idx=0
     for rule in state.get('rules',[]):
         target=rule['target']; mode=rule['mode']
         if mode == 'bypass':
-            run(['ip','rule','add','pref',str(RULE_PREF+idx),'to',target,'lookup',str(TABLE_BYPASS)])
-            idx += 1
-        elif mode == 'vpn':
-            # Explicit VPN rules rely on the active VPN default/policy; they are persisted for UI and future per-app marks.
-            continue
+            run(['ip','rule','add','pref',str(RULE_PREF+idx),'to',target,'lookup',str(TABLE_BYPASS)]); idx += 1
 
 def split_set_enabled(enabled):
-    state=split_load(); state['enabled']=enabled
-    split_apply_state(state); atomic(SPLIT_STATE,state)
-    return {'ok':True,**state}
+    state=split_load(); state['enabled']=enabled; split_apply_state(state); atomic(SPLIT_STATE,state); return {'ok':True,**state}
 
 def split_add(target, mode):
     if mode not in ('bypass','vpn'): raise RuntimeError('mode must be bypass or vpn')
-    target=valid_target(target)
-    state=split_load()
-    state['rules']=[r for r in state.get('rules',[]) if r.get('target')!=target]
-    state['rules'].append({'target':target,'mode':mode})
-    split_apply_state(state); atomic(SPLIT_STATE,state)
-    return {'ok':True,**state}
+    target=valid_target(target); state=split_load(); state['rules']=[r for r in state.get('rules',[]) if r.get('target')!=target]
+    state['rules'].append({'target':target,'mode':mode}); split_apply_state(state); atomic(SPLIT_STATE,state); return {'ok':True,**state}
 
 def split_remove(target):
-    target=valid_target(target)
-    state=split_load(); state['rules']=[r for r in state.get('rules',[]) if r.get('target')!=target]
-    split_apply_state(state); atomic(SPLIT_STATE,state)
-    return {'ok':True,**state}
+    target=valid_target(target); state=split_load(); state['rules']=[r for r in state.get('rules',[]) if r.get('target')!=target]
+    split_apply_state(state); atomic(SPLIT_STATE,state); return {'ok':True,**state}
+
+def desktop_apps():
+    roots=[pathlib.Path('/usr/share/applications'),pathlib.Path('/usr/local/share/applications')]
+    apps=[]; seen=set()
+    for root in roots:
+        if not root.is_dir(): continue
+        for path in sorted(root.glob('*.desktop')):
+            if path.name in seen: continue
+            name=path.stem; exec_line=''
+            try:
+                for line in path.read_text(errors='replace').splitlines():
+                    if line.startswith('Name=') and name==path.stem: name=line[5:].strip() or name
+                    elif line.startswith('Exec=') and not exec_line: exec_line=line[5:].strip()
+                    elif line.strip()=='NoDisplay=true': exec_line=''; break
+            except OSError: continue
+            if exec_line:
+                apps.append({'desktop_id':path.name,'name':name}); seen.add(path.name)
+    return {'ok':True,'apps':apps[:500]}
+
+def app_direct_launch(desktop_id):
+    if not re.fullmatch(r'[A-Za-z0-9_.+-]+\.desktop', desktop_id): raise RuntimeError('invalid desktop application id')
+    if not pathlib.Path(DESKTOP_FEATURES).is_file(): raise RuntimeError('desktop feature engine is unavailable')
+    raw=run(['/usr/bin/python3',DESKTOP_FEATURES,'app-direct-launch',desktop_id])
+    try: result=json.loads(raw)
+    except Exception: raise RuntimeError(raw or 'direct app launch failed')
+    if result.get('ok') is not True: raise RuntimeError(result.get('error','direct app launch failed'))
+    return result
 
 def main():
     if os.geteuid()!=0: raise RuntimeError('platform helper must run as root')
@@ -138,11 +148,12 @@ def main():
     elif cmd=='split-enable': result=split_set_enabled(sys.argv[2]=='1')
     elif cmd=='split-add': result=split_add(sys.argv[2],sys.argv[3])
     elif cmd=='split-remove': result=split_remove(sys.argv[2])
+    elif cmd=='apps-list': result=desktop_apps()
+    elif cmd=='app-direct-launch': result=app_direct_launch(sys.argv[2])
     else: raise RuntimeError('unsupported platform helper command')
     print(json.dumps(result,separators=(',',':')))
 
 if __name__=='__main__':
     try: main()
     except Exception as e:
-        print(json.dumps({'ok':False,'error':str(e)},separators=(',',':')), file=sys.stderr)
-        raise SystemExit(1)
+        print(json.dumps({'ok':False,'error':str(e)},separators=(',',':')), file=sys.stderr); raise SystemExit(1)
