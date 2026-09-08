@@ -31,7 +31,7 @@ Push-Location $Root
 try {
     cargo build -p milmit-vpn-flutter-ffi --release
     cargo build --manifest-path native\windows\service\Cargo.toml --release
-    & cl.exe /nologo /O2 /W4 /DUNICODE /D_UNICODE native\windows\wfp-helper\wfp_helper.c /Fe:native\windows\wfp-helper\wfp-helper.exe /link Fwpuclnt.lib Rpcrt4.lib Ws2_32.lib
+    & cl.exe /nologo /O2 /W4 native\windows\wfp-helper\wfp_helper.c /Fe:native\windows\wfp-helper\wfp-helper.exe /link Fwpuclnt.lib Rpcrt4.lib Ws2_32.lib
     if ($LASTEXITCODE -ne 0) { throw 'WFP helper compilation failed' }
 } finally { Pop-Location }
 
@@ -42,7 +42,6 @@ Remove-Item $Dist -Recurse -Force -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Path $Stage -Force | Out-Null
 Copy-Item (Join-Path $Bundle '*') $Stage -Recurse -Force
 Copy-Item (Join-Path $Root 'target\release\milmit_vpn_flutter_ffi.dll') $Stage -Force
-Copy-Item (Join-Path $Root 'native\windows\wfp-helper\wfp-helper.exe') $Stage -Force
 
 $ServiceExe = Join-Path $Root 'native\windows\service\target\release\milmit-vpn-windows-service.exe'
 if (-not (Test-Path $ServiceExe)) {
@@ -50,7 +49,11 @@ if (-not (Test-Path $ServiceExe)) {
 }
 if (-not (Test-Path $ServiceExe)) { throw 'Windows service executable was not produced' }
 
+$WfpHelper = Join-Path $Root 'native\windows\wfp-helper\wfp-helper.exe'
+if (-not (Test-Path $WfpHelper)) { throw 'WFP helper executable was not produced' }
+
 $PortableZip = Join-Path $Dist "MilMit-VPN-$Version-windows-x64.zip"
+Copy-Item $WfpHelper $Stage -Force
 Compress-Archive -Path (Join-Path $Stage '*') -DestinationPath $PortableZip -Force
 
 $Heat = Get-Command heat.exe -ErrorAction SilentlyContinue
@@ -67,8 +70,8 @@ $Harvest = Join-Path $Dist 'FlutterAppFiles.wxs'
 $MainWxs = Join-Path $Root 'packaging\windows\MilMitVPN.wxs'
 $HarvestObj = Join-Path $Dist 'FlutterAppFiles.wixobj'
 $MainObj = Join-Path $Dist 'MilMitVPN.wixobj'
-& $Candle.Path -arch x64 -dSourceDir="$Stage" -dServiceExe="$ServiceExe" -dProductVersion="$Version" -out $HarvestObj $Harvest
-& $Candle.Path -arch x64 -dSourceDir="$Stage" -dServiceExe="$ServiceExe" -dProductVersion="$Version" -out $MainObj $MainWxs
+& $Candle.Path -arch x64 -dSourceDir="$Stage" -dServiceExe="$ServiceExe" -dWfpHelper="$WfpHelper" -dProductVersion="$Version" -out $HarvestObj $Harvest
+& $Candle.Path -arch x64 -dSourceDir="$Stage" -dServiceExe="$ServiceExe" -dWfpHelper="$WfpHelper" -dProductVersion="$Version" -out $MainObj $MainWxs
 
 $Msi = Join-Path $Dist "MilMit-VPN-$Version-x64.msi"
 & $Light.Path -ext WixUIExtension -out $Msi $MainObj $HarvestObj
