@@ -30,4 +30,14 @@ class LinuxPlatformControls {
   Future<Map<String, dynamic>> setSplitEnabled(bool enabled) => _run('split-enable', [enabled ? '1' : '0']);
   Future<Map<String, dynamic>> addSplitRule(String target, String mode) => _run('split-add', [target, mode]);
   Future<Map<String, dynamic>> removeSplitRule(String target) => _run('split-remove', [target]);
+
+  Future<List<Map<String, dynamic>>> listDesktopApps() async {
+    final result = await _run('apps-list');
+    return (result['apps'] as List? ?? const [])
+        .map((item) => Map<String, dynamic>.from(item as Map))
+        .toList(growable: false);
+  }
+
+  Future<Map<String, dynamic>> launchAppDirect(String desktopId) =>
+      _run('app-direct-launch', [desktopId]);
 }
