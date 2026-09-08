@@ -58,6 +58,8 @@ jobs:
         run: cargo check -p milmit-vpn-platform-macos
       - name: Type-check Packet Tunnel extension
         run: xcrun swiftc -typecheck native/macos/PacketTunnel/TunnelConfiguration.swift native/macos/PacketTunnel/PacketTunnelProvider.swift
+      - name: Type-check host NetworkExtension manager
+        run: xcrun swiftc -typecheck native/macos/AppBridge/HostTunnelManager.swift
       - name: Test core
         run: cargo test -p surfshark-ikev2-core
       - name: Check Flutter FFI on macOS
