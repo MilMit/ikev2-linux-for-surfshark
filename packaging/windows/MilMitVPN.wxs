@@ -16,6 +16,7 @@
     <DirectoryRef Id="SERVICEFOLDER">
       <Component Id="WindowsServiceComponent" Guid="*" Win64="yes">
         <File Id="WindowsServiceExe" Source="$(var.ServiceExe)" KeyPath="yes" />
+        <File Id="WfpHelperExe" Source="$(var.WfpHelper)" />
         <ServiceInstall
           Id="InstallMilMitVpnService"
           Type="ownProcess"
