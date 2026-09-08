@@ -44,6 +44,19 @@ enum IpcRequest {
         interface_index: Option<u32>,
         endpoint_ip: Option<String>,
     },
+    DnsProtection {
+        enabled: bool,
+        servers: Option<Vec<String>>,
+    },
+    SplitTunnel {
+        enabled: bool,
+    },
+    SplitRouteAdd {
+        target: String,
+    },
+    SplitRouteRemove {
+        target: String,
+    },
 }
 
 #[cfg(windows)]
@@ -113,14 +126,98 @@ fn run_wfp(enable: bool, interface_index: Option<u32>, endpoint_ip: Option<&str>
 }
 
 #[cfg(windows)]
+fn powershell(script: &str) -> Result<String, String> {
+    let output = Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script])
+        .output()
+        .map_err(|e| format!("failed to launch PowerShell: {e}"))?;
+    let mut text = String::from_utf8_lossy(&output.stdout).to_string();
+    text.push_str(&String::from_utf8_lossy(&output.stderr));
+    if output.status.success() {
+        Ok(text.trim().to_string())
+    } else {
+        Err(text.trim().to_string())
+    }
+}
+
+#[cfg(windows)]
+fn validate_dns_servers(servers: Option<Vec<String>>) -> Result<Vec<String>, String> {
+    let values = servers.unwrap_or_else(|| vec!["162.252.172.57".into(), "149.154.159.92".into()]);
+    if values.is_empty() || values.len() > 4 {
+        return Err("DNS server list must contain between 1 and 4 IP addresses".into());
+    }
+    values
+        .into_iter()
+        .map(|value| {
+            value
+                .parse::<IpAddr>()
+                .map(|ip| ip.to_string())
+                .map_err(|_| format!("invalid DNS server IP: {value}"))
+        })
+        .collect()
+}
+
+#[cfg(windows)]
+fn set_dns_protection(enabled: bool, servers: Option<Vec<String>>) -> Result<(), String> {
+    let remove = "Get-DnsClientNrptRule -ErrorAction SilentlyContinue | Where-Object {$_.Comment -eq 'MilMit VPN DNS'} | Remove-DnsClientNrptRule -Force -ErrorAction SilentlyContinue;";
+    if !enabled {
+        return powershell(remove).map(|_| ());
+    }
+    let servers = validate_dns_servers(servers)?;
+    let quoted = servers.iter().map(|v| format!("'{}'", v)).collect::<Vec<_>>().join(",");
+    let script = format!("{remove} Add-DnsClientNrptRule -Namespace '.' -NameServers @({quoted}) -Comment 'MilMit VPN DNS' -ErrorAction Stop | Out-Null");
+    powershell(&script).map(|_| ())
+}
+
+#[cfg(windows)]
+fn validate_cidr(target: &str) -> Result<String, String> {
+    if target.len() > 64 || target.chars().any(|c| !(c.is_ascii_hexdigit() || matches!(c, '.' | ':' | '/'))) {
+        return Err("invalid split-tunnel CIDR".into());
+    }
+    let (ip_text, prefix_text) = target.split_once('/').ok_or_else(|| "split target must be CIDR".to_string())?;
+    let ip: IpAddr = ip_text.parse().map_err(|_| "invalid split-tunnel IP".to_string())?;
+    let prefix: u8 = prefix_text.parse().map_err(|_| "invalid split-tunnel prefix".to_string())?;
+    let max = if ip.is_ipv4() { 32 } else { 128 };
+    if prefix > max {
+        return Err("split-tunnel prefix is out of range".into());
+    }
+    Ok(format!("{ip}/{prefix}"))
+}
+
+#[cfg(windows)]
+fn managed_all_user_profiles(body: &str) -> String {
+    format!("$profiles=Get-VpnConnection -AllUserConnection -ErrorAction SilentlyContinue | Where-Object {{$_.Name -like 'MilMit *'}}; if(-not $profiles){{ throw 'No all-user MilMit VPN profile is installed' }}; foreach($p in $profiles){{ $n=$p.Name; {body} }}")
+}
+
+#[cfg(windows)]
+fn set_split_tunnel(enabled: bool) -> Result<(), String> {
+    let value = if enabled { "$true" } else { "$false" };
+    powershell(&managed_all_user_profiles(&format!("Set-VpnConnection -Name $n -AllUserConnection -SplitTunneling {value} -Force -ErrorAction Stop | Out-Null"))).map(|_| ())
+}
+
+#[cfg(windows)]
+fn add_split_route(target: &str) -> Result<(), String> {
+    let target = validate_cidr(target)?;
+    powershell(&managed_all_user_profiles(&format!("Add-VpnConnectionRoute -ConnectionName $n -AllUserConnection -DestinationPrefix '{target}' -PassThru -ErrorAction Stop | Out-Null"))).map(|_| ())
+}
+
+#[cfg(windows)]
+fn remove_split_route(target: &str) -> Result<(), String> {
+    let target = validate_cidr(target)?;
+    powershell(&managed_all_user_profiles(&format!("Remove-VpnConnectionRoute -ConnectionName $n -AllUserConnection -DestinationPrefix '{target}' -PassThru -ErrorAction SilentlyContinue | Out-Null"))).map(|_| ())
+}
+
+#[cfg(windows)]
 fn handle_request(request: IpcRequest) -> IpcResponse {
     let result = match request {
         IpcRequest::Ping => Ok(()),
-        IpcRequest::KillSwitch {
-            enabled,
-            interface_index,
-            endpoint_ip,
-        } => run_wfp(enabled, interface_index, endpoint_ip.as_deref()),
+        IpcRequest::KillSwitch { enabled, interface_index, endpoint_ip } => {
+            run_wfp(enabled, interface_index, endpoint_ip.as_deref())
+        }
+        IpcRequest::DnsProtection { enabled, servers } => set_dns_protection(enabled, servers),
+        IpcRequest::SplitTunnel { enabled } => set_split_tunnel(enabled),
+        IpcRequest::SplitRouteAdd { target } => add_split_route(&target),
+        IpcRequest::SplitRouteRemove { target } => remove_split_route(&target),
     };
     match result {
         Ok(()) => IpcResponse { ok: true, error: None },
